@@ -97,7 +97,7 @@ static SPECS: LazyLock<Vec<Specification>> = LazyLock::new(|| {
     vec![
         // Separators
         spec(r"(^( +))", TokenType::Separator),
-        spec(r"(^(\\)\n$)", TokenType::LineContinuation),
+        spec(r"(^(\\)\r?\n$)", TokenType::LineContinuation),
         // Subshell
         spec(r"(^(\())", TokenType::OpenRound),
         spec(r"(^(\)))", TokenType::CloseRound),
@@ -113,7 +113,7 @@ static SPECS: LazyLock<Vec<Specification>> = LazyLock::new(|| {
         spec(r"(^(\|\|))", TokenType::OrOr),
         spec(r"(^(&))", TokenType::Andper),
         // New line
-        spec(r"(^(\n))", TokenType::NewLine),
+        spec(r"(^(\r?\n))", TokenType::NewLine),
         // IO Number:
         // This number must attached to the redirect operators beginning.
         // Must have greater precedence than number otherwise it will be

@@ -6,6 +6,7 @@ mod job;
 mod nix;
 mod syntax;
 mod tokenizer;
+mod waiter;
 
 fn main() {
     let mut executor = Executor::default();

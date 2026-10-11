@@ -13,10 +13,12 @@ pub struct JobBuilder {
  * https://www.gnu.org/software/libc/manual/html_node/Implementing-a-Shell.html
  *
  */
+#[derive(Debug, Clone, Default)]
 pub struct Job {
     pub pgid: Pid,
     pub jobs: HashMap<Pid, process::Child>,
     pub job_master_pid: Pid,
+    job_status: HashMap<Pid, process::ExitStatus>,
 }
 
 impl JobBuilder {
@@ -41,6 +43,7 @@ impl JobBuilder {
             pgid,
             jobs,
             job_master_pid,
+            ..Self::default()
         }
     }
 }
