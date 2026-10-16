@@ -1,7 +1,23 @@
 use std::{collections::HashMap, process};
 
-use crate::nix::Pid;
+use crate::nix::{Pid, Signal};
 
+/// State of a single process inside a [`Job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcStatus {
+    Running,
+    Stopped(Signal),
+    Exited(i32),
+    Signaled(Signal),
+}
+
+impl ProcStatus {
+    pub fn is_completed(self) -> bool {
+        matches!(self, ProcStatus::Exited(_) | ProcStatus::Signaled(_))
+    }
+}
+
+#[derive(Debug)]
 pub struct JobBuilder {
     jobs: HashMap<Pid, process::Child>,
 }
@@ -13,12 +29,14 @@ pub struct JobBuilder {
  * https://www.gnu.org/software/libc/manual/html_node/Implementing-a-Shell.html
  *
  */
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct Job {
     pub pgid: Pid,
     pub jobs: HashMap<Pid, process::Child>,
     pub job_master_pid: Pid,
-    job_status: HashMap<Pid, process::ExitStatus>,
+    pub job_status: HashMap<Pid, ProcStatus>,
+    /// Terminal modes of the job, saved when it gets stopped.
+    pub tmodes: Option<libc::termios>,
 }
 
 impl JobBuilder {
@@ -39,13 +57,38 @@ impl JobBuilder {
 
         jobs.insert(job_master_pid, job_master);
 
+        let job_status = jobs
+            .keys()
+            .map(|&pid| (pid, ProcStatus::Running))
+            .collect();
+
         Job {
             pgid,
             jobs,
             job_master_pid,
-            ..Self::default()
+            job_status,
+            tmodes: None,
         }
     }
 }
 
-impl Job {}
+impl Job {
+    pub fn completed(&self) -> bool {
+        self.job_status.values().all(|s| s.is_completed())
+    }
+
+    /// A job is stopped when every process is either completed or stopped.
+    pub fn stopped(&self) -> bool {
+        self.job_status
+            .values()
+            .all(|s| s.is_completed() || matches!(s, ProcStatus::Stopped(_)))
+    }
+
+    pub fn mark_running(&mut self) {
+        for s in self.job_status.values_mut() {
+            if matches!(s, ProcStatus::Stopped(_)) {
+                *s = ProcStatus::Running;
+            }
+        }
+    }
+}

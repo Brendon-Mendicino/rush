@@ -33,63 +33,64 @@ pub struct Pid(pid_t);
 // this is not (yet) possible.
 #[repr(i32)]
 #[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Signal {
     /// Hangup
-    SIGHUP,
+    SIGHUP = libc::SIGHUP,
     /// Interrupt
-    SIGINT,
+    SIGINT = libc::SIGINT,
     /// Quit
-    SIGQUIT,
+    SIGQUIT = libc::SIGQUIT,
     /// Illegal instruction (not reset when caught)
-    SIGILL,
+    SIGILL = libc::SIGILL,
     /// Trace trap (not reset when caught)
-    SIGTRAP,
+    SIGTRAP = libc::SIGTRAP,
     /// Abort
-    SIGABRT,
+    SIGABRT = libc::SIGABRT,
     /// Bus error
-    SIGBUS,
+    SIGBUS = libc::SIGBUS,
     /// Floating point exception
-    SIGFPE,
+    SIGFPE = libc::SIGFPE,
     /// Kill (cannot be caught or ignored)
-    SIGKILL,
+    SIGKILL = libc::SIGKILL,
     /// User defined signal 1
-    SIGUSR1,
+    SIGUSR1 = libc::SIGUSR1,
     /// Segmentation violation
-    SIGSEGV,
+    SIGSEGV = libc::SIGSEGV,
     /// User defined signal 2
-    SIGUSR2,
+    SIGUSR2 = libc::SIGUSR2,
     /// Write on a pipe with no one to read it
-    SIGPIPE,
+    SIGPIPE = libc::SIGPIPE,
     /// Alarm clock
-    SIGALRM,
+    SIGALRM = libc::SIGALRM,
     /// Software termination signal from kill
-    SIGTERM,
+    SIGTERM = libc::SIGTERM,
     /// To parent on child stop or exit
-    SIGCHLD,
+    SIGCHLD = libc::SIGCHLD,
     /// Continue a stopped process
-    SIGCONT,
+    SIGCONT = libc::SIGCONT,
     /// Sendable stop signal not from tty
-    SIGSTOP,
+    SIGSTOP = libc::SIGSTOP,
     /// Stop signal from tty
-    SIGTSTP,
+    SIGTSTP = libc::SIGTSTP,
     /// To readers pgrp upon background tty read
-    SIGTTIN,
+    SIGTTIN = libc::SIGTTIN,
     /// Like TTIN if (tp->t_local&LTOSTOP)
-    SIGTTOU,
+    SIGTTOU = libc::SIGTTOU,
     /// Urgent condition on IO channel
-    SIGURG,
+    SIGURG = libc::SIGURG,
     /// Exceeded CPU time limit
-    SIGXCPU,
+    SIGXCPU = libc::SIGXCPU,
     /// Exceeded file size limit
-    SIGXFSZ,
+    SIGXFSZ = libc::SIGXFSZ,
     /// Virtual time alarm
-    SIGVTALRM,
+    SIGVTALRM = libc::SIGVTALRM,
     /// Profiling time alarm
-    SIGPROF,
+    SIGPROF = libc::SIGPROF,
     /// Window size changes
-    SIGWINCH,
+    SIGWINCH = libc::SIGWINCH,
     /// Bad system call
-    SIGSYS,
+    SIGSYS = libc::SIGSYS,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +177,48 @@ impl From<Pid> for pid_t {
     }
 }
 
+impl TryFrom<libc::c_int> for Signal {
+    type Error = io::Error;
+
+    fn try_from(signum: libc::c_int) -> Result<Self, Self::Error> {
+        use Signal::*;
+
+        let signal = match signum {
+            libc::SIGHUP => SIGHUP,
+            libc::SIGINT => SIGINT,
+            libc::SIGQUIT => SIGQUIT,
+            libc::SIGILL => SIGILL,
+            libc::SIGTRAP => SIGTRAP,
+            libc::SIGABRT => SIGABRT,
+            libc::SIGBUS => SIGBUS,
+            libc::SIGFPE => SIGFPE,
+            libc::SIGKILL => SIGKILL,
+            libc::SIGUSR1 => SIGUSR1,
+            libc::SIGSEGV => SIGSEGV,
+            libc::SIGUSR2 => SIGUSR2,
+            libc::SIGPIPE => SIGPIPE,
+            libc::SIGALRM => SIGALRM,
+            libc::SIGTERM => SIGTERM,
+            libc::SIGCHLD => SIGCHLD,
+            libc::SIGCONT => SIGCONT,
+            libc::SIGSTOP => SIGSTOP,
+            libc::SIGTSTP => SIGTSTP,
+            libc::SIGTTIN => SIGTTIN,
+            libc::SIGTTOU => SIGTTOU,
+            libc::SIGURG => SIGURG,
+            libc::SIGXCPU => SIGXCPU,
+            libc::SIGXFSZ => SIGXFSZ,
+            libc::SIGVTALRM => SIGVTALRM,
+            libc::SIGPROF => SIGPROF,
+            libc::SIGWINCH => SIGWINCH,
+            libc::SIGSYS => SIGSYS,
+            _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+
+        Ok(signal)
+    }
+}
+
 /// Converts native return values to Result using the *-1 means error is in `errno`*  convention.
 /// Non-error values are `Ok`-wrapped.
 fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
@@ -197,7 +240,36 @@ pub fn dup2_raw<Fd: AsRawFd>(oldfd: Fd, newfd: Fd) -> io::Result<RawFd> {
     cvt(res)
 }
 
-pub fn waitpid(pid: WaitPid) {
+pub fn tcsetpgrp<Fd: AsRawFd>(fd: Fd, pgid: Pid) -> io::Result<()> {
+    let res = unsafe { libc::tcsetpgrp(fd.as_raw_fd(), pgid.as_raw()) };
+    cvt(res)?;
+    Ok(())
+}
+
+pub fn tcgetattr<Fd: AsRawFd>(fd: Fd) -> io::Result<libc::termios> {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let res = unsafe { libc::tcgetattr(fd.as_raw_fd(), termios.as_mut_ptr()) };
+    cvt(res)?;
+    Ok(unsafe { termios.assume_init() })
+}
+
+pub fn tcsetattr<Fd: AsRawFd>(
+    fd: Fd,
+    action: libc::c_int,
+    termios: &libc::termios,
+) -> io::Result<()> {
+    let res = unsafe { libc::tcsetattr(fd.as_raw_fd(), action, termios) };
+    cvt(res)?;
+    Ok(())
+}
+
+pub fn kill(pid: Pid, sig: Signal) -> io::Result<()> {
+    let res = unsafe { libc::kill(pid.as_raw(), sig as libc::c_int) };
+    cvt(res)?;
+    Ok(())
+}
+
+pub fn waitpid(pid: WaitPid, options: libc::c_int) -> io::Result<WaitRes> {
     let w_pid = match pid {
         WaitPid::Any => Pid(-1),
         WaitPid::CallerGroup => Pid(0),
@@ -206,37 +278,25 @@ pub fn waitpid(pid: WaitPid) {
     };
 
     let mut wstatus: i32 = 0;
-    let res = unsafe { libc::waitpid(w_pid.as_raw(), &mut wstatus, libc::WUNTRACED) };
-    let pid = cvt(res)?;
+    let res: pid_t = unsafe { libc::waitpid(w_pid.as_raw(), &mut wstatus, options) };
+    let res = cvt(res)?;
+    if res == 0 {
+        return Ok(WaitRes::StillAlive);
+    }
+    let pid = Pid::from_raw(res);
 
     let wait_res = if libc::WIFEXITED(wstatus) {
         WaitRes::Exited(pid, libc::WEXITSTATUS(wstatus))
     } else if libc::WIFSIGNALED(wstatus) {
-        WaitRes::Signaled(pid, term_signal(status)?, dumped_core(status))
-    } else if stopped(status) {
-        cfg_if! {
-            if #[cfg(linux_android)] {
-                fn decode_stopped(pid: Pid, status: i32) -> Result<WaitStatus> {
-                    let status_additional = stop_additional(status);
-                    Ok(if syscall_stop(status) {
-                        WaitStatus::PtraceSyscall(pid)
-                    } else if status_additional == 0 {
-                        WaitStatus::Stopped(pid, stop_signal(status)?)
-                    } else {
-                        WaitStatus::PtraceEvent(pid, stop_signal(status)?,
-                                                stop_additional(status))
-                    })
-                }
-            } else {
-                fn decode_stopped(pid: Pid, status: i32) -> Result<WaitStatus> {
-                    Ok(WaitStatus::Stopped(pid, stop_signal(status)?))
-                }
-            }
-        }
-        return decode_stopped(pid, status);
+        let termsig = Signal::try_from(libc::WTERMSIG(wstatus))?;
+        let coredump = libc::WCOREDUMP(wstatus);
+        WaitRes::Signaled(pid, termsig, coredump)
+    } else if libc::WIFSTOPPED(wstatus) {
+        let stopsig = Signal::try_from(libc::WSTOPSIG(wstatus))?;
+        WaitRes::Stopped(pid, stopsig)
     } else {
-        assert!(continued(status));
-        WaitStatus::Continued(pid)
+        assert!(libc::WIFCONTINUED(wstatus));
+        WaitRes::Continued(pid)
     };
 
     Ok(wait_res)
