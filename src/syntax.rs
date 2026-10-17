@@ -893,7 +893,7 @@ impl SyntaxTree {
 
         tok.merge(sub_tok);
 
-        None
+        Some(redirect)
     }
 
     /// BNF
@@ -917,7 +917,7 @@ impl SyntaxTree {
         let redirect_token = sub_tok.next_token()?;
 
         // TODO: error handling
-        let filename = Self::filename(tok)?;
+        let filename = Self::filename(&sub_tok)?;
 
         let redirect = match redirect_token.t_type {
             TokenType::Less => Redirect::FileRedirect(FileRedirect {
@@ -1109,7 +1109,7 @@ impl SyntaxTree {
     }
 
     pub fn convert_and_redirect<'a>(default_fd: i32, filename: Token<'a>) -> Redirect<'a> {
-        assert!(filename.value.is_empty(), "filename must not be empty!");
+        assert!(!filename.value.is_empty(), "filename must not be empty!");
 
         if let Ok(fd) = filename.value.parse::<i32>() {
             Redirect::FdRedirect(FdRedirect {

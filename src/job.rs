@@ -55,14 +55,6 @@ impl JobExit {
             _ => None,
         }
     }
-
-    /// Value for `$?`, following the shell convention of `128 + signum` for signals.
-    pub fn code(self) -> i32 {
-        match self {
-            JobExit::Exited(code) => code,
-            JobExit::Signaled(sig) => 128 + sig as i32,
-        }
-    }
 }
 
 impl JobBuilder {
@@ -115,6 +107,14 @@ impl Job {
         self.job_status
             .values()
             .all(|s| s.is_completed() || matches!(s, ProcStatus::Stopped(_)))
+    }
+
+    /// Signal that stopped the job, taken from the first stopped process.
+    pub fn stop_signal(&self) -> Option<Signal> {
+        self.job_status.values().find_map(|status| match status {
+            ProcStatus::Stopped(sig) => Some(*sig),
+            _ => None,
+        })
     }
 
     pub fn mark_running(&mut self) {

@@ -96,29 +96,29 @@ pub trait Tokenizer<'a>: Iterator<Item = Token<'a>> + Clone {
 static SPECS: LazyLock<Vec<Specification>> = LazyLock::new(|| {
     vec![
         // Separators
-        spec(r"(^( +))", TokenType::Separator),
-        spec(r"(^(\\)\r?\n$)", TokenType::LineContinuation),
+        spec(r"^( +)", TokenType::Separator),
+        spec(r"^(\\)\r?\n$", TokenType::LineContinuation),
         // Subshell
-        spec(r"(^(\())", TokenType::OpenRound),
-        spec(r"(^(\)))", TokenType::CloseRound),
+        spec(r"^(\()", TokenType::OpenRound),
+        spec(r"^(\))", TokenType::CloseRound),
         // Command substitution
-        spec(r"(^(\$\())", TokenType::Andopen),
+        spec(r"^(\$\()", TokenType::Andopen),
         spec(
-            r"(^(\$((?:[\w\-\/.=]+)|(?:\$)|(?:!)|(?:\?))))",
+            r"^(\$((?:[\w\-\/.=]+)|(?:\$)|(?:!)|(?:\?)))",
             TokenType::DollWord,
         ),
         // List separators
-        spec(r"(^(;))", TokenType::Semicolon),
-        spec(r"(^(&&))", TokenType::AndAnd),
-        spec(r"(^(\|\|))", TokenType::OrOr),
-        spec(r"(^(&))", TokenType::Andper),
+        spec(r"^(;)", TokenType::Semicolon),
+        spec(r"^(&&)", TokenType::AndAnd),
+        spec(r"^(\|\|)", TokenType::OrOr),
+        spec(r"^(&)", TokenType::Andper),
         // New line
-        spec(r"(^(\r?\n))", TokenType::NewLine),
+        spec(r"^(\r?\n)", TokenType::NewLine),
         // IO Number:
         // This number must attached to the redirect operators beginning.
         // Must have greater precedence than number otherwise it will be
         // matched before this one.
-        spec(r"(^(\d+)(?:<|>))", TokenType::IoNumber),
+        spec(r"^(\d+)(?:<|>)", TokenType::IoNumber),
         // Word kinds
         // Match any normal character + any quoted character
         //
@@ -129,24 +129,24 @@ static SPECS: LazyLock<Vec<Specification>> = LazyLock::new(|| {
         // - L: match unicode literal
         // - Nd: match unicode numbers
         // - So: other symbol
-        spec(r"(^((?:[\p{L}\p{Nd}\p{So}=\-\/.]|\\.)+))", TokenType::Word),
+        spec(r"^((?:[\p{L}\p{Nd}\p{So}=\-\/.]|\\.)+)", TokenType::Word),
         // Quoatations
-        spec(r"(^('[^']*'))", TokenType::QuotedWord),
-        // Sepcification::new(r"(^("[^']"))", TokenType::string),
+        spec(r"^('[^']*')", TokenType::QuotedWord),
+        // Sepcification::new(r"^("[^']")", TokenType::string),
 
         // Bang
-        spec(r"(^(!))", TokenType::Bang),
+        spec(r"^(!)", TokenType::Bang),
         // Redirections
-        spec(r"(^(\|))", TokenType::Pipe),
-        spec(r"(^(<>))", TokenType::Lessgreat),
-        spec(r"(^(<&))", TokenType::Lessand),
-        spec(r"(^(>&))", TokenType::Greatand),
-        spec(r"(^(>>))", TokenType::Dgreat),
-        spec(r"(^(>))", TokenType::Great),
-        spec(r"(^(<<))", TokenType::Dless),
-        spec(r"(^(<))", TokenType::Less),
+        spec(r"^(\|)", TokenType::Pipe),
+        spec(r"^(<>)", TokenType::Lessgreat),
+        spec(r"^(<&)", TokenType::Lessand),
+        spec(r"^(>&)", TokenType::Greatand),
+        spec(r"^(>>)", TokenType::Dgreat),
+        spec(r"^(>)", TokenType::Great),
+        spec(r"^(<<)", TokenType::Dless),
+        spec(r"^(<)", TokenType::Less),
         // EOF
-        spec(r"(^(\z))", TokenType::Eof),
+        spec(r"^(\z)", TokenType::Eof),
     ]
 });
 
@@ -211,7 +211,7 @@ impl<'a> Tokenizer<'a> for UnbufferedTokenizer<'a> {
 
     fn merge(&self, tok: Self) {
         self.string_offset.set(tok.string_offset.get());
-        self.input.set(self.input.get());
+        self.input.set(tok.input.get());
     }
 }
 

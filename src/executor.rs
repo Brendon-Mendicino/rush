@@ -1,9 +1,10 @@
 use crate::{
-    job::{Job, JobBuilder},
-    nix::{Pid, close, dup2_raw},
+    job::{Job, JobBuilder, JobExit},
+    nix::{Pid, Signal, close, dup2_raw},
     shell::Shell,
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
+    waiter::{WaitResult, Waiter},
 };
 use std::{
     fs::File,
@@ -25,10 +26,50 @@ pub struct TerminalState {
     exit_code: i32,
 }
 
+/// Outcome of running a piece of the syntax tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStatus {
+    Exited(i32),
+    Signaled(Signal),
+    /// The job got stopped and was moved to the background jobs.
+    Stopped(Signal),
+}
+
+impl ExecStatus {
+    pub const SUCCESS: Self = Self::Exited(0);
+    pub const FAILURE: Self = Self::Exited(1);
+    /// Status of input that could not be parsed, same as other shells.
+    pub const SYNTAX_ERROR: Self = Self::Exited(2);
+
+    /// Value for `$?`, following the shell convention of `128 + signum` for signals.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Exited(code) => code,
+            Self::Signaled(sig) | Self::Stopped(sig) => 128 + sig as i32,
+        }
+    }
+}
+
+impl From<JobExit> for ExecStatus {
+    fn from(exit: JobExit) -> Self {
+        match exit {
+            JobExit::Exited(code) => Self::Exited(code),
+            JobExit::Signaled(sig) => Self::Signaled(sig),
+        }
+    }
+}
+
+fn not_implemented(what: &str) -> ExecStatus {
+    eprintln!("rush: {what} is not implemented yet");
+    ExecStatus::FAILURE
+}
+
 #[derive(Debug)]
 pub struct Executor {
     input_buffer: Vec<String>,
     shell: Shell,
+    /// Jobs that got stopped or that are running in background.
+    bg_jobs: Vec<Job>,
 }
 
 struct PipelineState<'child> {
@@ -49,6 +90,13 @@ struct RedirectionApplyer {
     file_redirects: Vec<(i32, i32)>,
     duplications: Vec<(i32, i32)>,
     fd_to_close: Vec<i32>,
+}
+
+/// A spawned command and the process group it ended up in.
+#[derive(Debug)]
+struct Spawned {
+    child: Child,
+    pgid: Pid,
 }
 
 #[derive(Clone)]
@@ -89,7 +137,8 @@ impl RedirectController {
         let file_redirects = self
             .file_redirects
             .iter()
-            .map(|(f, fd)| (f.as_raw_fd(), *fd))
+            // (to_replace, replacer): the redirected fd gets replaced by the file
+            .map(|(f, fd)| (*fd, f.as_raw_fd()))
             .collect::<Vec<_>>();
 
         RedirectionApplyer {
@@ -141,15 +190,18 @@ impl Executor {
         Self {
             input_buffer: Vec::new(),
             shell: Shell::new(),
+            bg_jobs: Vec::new(),
         }
     }
 
-    fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> Child {
+    fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> Spawned {
         let mut redirect_controller = RedirectController::default();
 
         redirect_controller.add_redirects(&cmd.redirections);
 
         let mut command = process::Command::new(&cmd.program);
+        command.args(&cmd.arguments);
+
         let applyer = Box::new(redirect_controller.get_applyer());
 
         let applyer_ptr = ApplyerPtr(Box::into_raw(applyer));
@@ -160,6 +212,14 @@ impl Executor {
                 ptr_clone.apply()?;
                 Ok(())
             });
+        }
+
+        // An interactive shell puts every job in its own process group, the first
+        // command of the pipeline becomes the leader (0 = use its own pid).
+        // `spawn()` returns only after the child exec'd, so the group is already
+        // set when the parent continues: no setpgid race with the child.
+        if self.shell.is_interactive {
+            command.process_group(state.pipeline_pgid.map_or(0, Pid::as_raw));
         }
 
         if let Some(prev_child) = state.prev_child {
@@ -181,10 +241,23 @@ impl Executor {
             drop(Box::from_raw(applyer_ptr.0 as *mut RedirectionApplyer));
         }
 
-        spawn_result.unwrap()
+        let child = spawn_result.unwrap();
+
+        // A non-interactive shell does no job control: the children stay in the
+        // shell's process group. Otherwise the first child of the pipeline leads
+        // the group with its pid.
+        let pgid = if self.shell.is_interactive {
+            state
+                .pipeline_pgid
+                .unwrap_or_else(|| Pid::from_raw(child.id() as i32))
+        } else {
+            self.shell.pgid
+        };
+
+        Spawned { child, pgid }
     }
 
-    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> Child {
+    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> Spawned {
         let program = match &cmd.program {
             Word::Token(token) => token.text(),
             Word::Substitution(sub) => todo!(),
@@ -209,7 +282,7 @@ impl Executor {
         self.simple_command(&expanded, state)
     }
 
-    fn command(&self, command: &Command, state: PipelineState) -> Child {
+    fn command(&self, command: &Command, state: PipelineState) -> Spawned {
         match command {
             Command::SimpleAssignment(assignment) => todo!(),
             Command::UnsubCommand(command) => self.unsub_command(command, state),
@@ -223,14 +296,15 @@ impl Executor {
             "A pipeline must always contain something"
         );
 
+        // Decided by the first spawned command, the others join its group.
         let mut pipeline_pgid = None;
         let mut last_child = None;
-        let mut job = JobBuilder::new();
+        let mut job_builder = JobBuilder::new();
 
         let (last_cmd, inner_cmds) = pipeline.cmds.split_last().unwrap();
 
         for cmd in inner_cmds {
-            let child = self.command(
+            let Spawned { child, pgid } = self.command(
                 cmd,
                 PipelineState {
                     prev_child: last_child.as_mut(),
@@ -238,10 +312,7 @@ impl Executor {
                     pipeline_pgid,
                 },
             );
-
-            if pipeline_pgid.is_none() {
-                pipeline_pgid = Some(Pid::from_raw(child.id() as i32));
-            }
+            pipeline_pgid = Some(pgid);
 
             match last_child {
                 None => {
@@ -249,12 +320,12 @@ impl Executor {
                 }
                 Some(to_add) => {
                     last_child = Some(child);
-                    job.add_job(to_add);
+                    job_builder.add_job(to_add);
                 }
             }
         }
 
-        let child = self.command(
+        let Spawned { child, pgid } = self.command(
             last_cmd,
             PipelineState {
                 prev_child: last_child.as_mut(),
@@ -264,64 +335,63 @@ impl Executor {
         );
 
         if let Some(last_child) = last_child {
-            job.add_job(last_child);
+            job_builder.add_job(last_child);
         }
 
-        let pgid = match pipeline_pgid {
-            Some(pgid) => pgid,
-            None => Pid::from_raw(child.id() as i32),
-        };
-
-        job.build(pgid, child)
+        job_builder.build(pgid, child)
     }
 
-    fn wait_pipeline(&self, pipeline: &Pipeline) {
+    fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
         let job = self.pipeline(pipeline);
+
+        match Waiter::new(&self.shell).wait(job) {
+            Ok(WaitResult::Completed(exit)) => exit.into(),
+            Ok(WaitResult::Stopped(job)) => {
+                // If a job was stopped while waiting for it, put it in the
+                // background jobs.
+                let sig = job.stop_signal().unwrap_or(Signal::SIGTSTP);
+                self.bg_jobs.push(job);
+                ExecStatus::Stopped(sig)
+            }
+            Err(e) => {
+                eprintln!("rush: wait: {e}");
+                ExecStatus::FAILURE
+            }
+        }
     }
 
-    fn op_list(&self, op: &OpList) {
+    fn op_list(&mut self, op: &OpList) -> ExecStatus {
         match op {
-            OpList::AndList(and) => {}
-            OpList::OrList(or) => {}
+            OpList::AndList(_) => not_implemented("`&&`"),
+            OpList::OrList(_) => not_implemented("`||`"),
             OpList::Pipeline(pipeline) => self.wait_pipeline(pipeline),
         }
     }
 
-    fn sequential_list(&self, seq: &SequentialList) {
-        /*
-                ListStats stats{};
-
-                if (sequential_list.left.has_value()) {
-                    stats = this->list(**sequential_list.left, state);
-                }
-
-                stats.last_stats = this->op_list(*sequential_list.right, state);
-
-                return stats;
-        */
+    fn sequential_list(&mut self, seq: &SequentialList) -> ExecStatus {
         if let Some(left) = &seq.left {
             self.list(left);
         }
 
-        self.op_list(&seq.right);
+        self.op_list(&seq.right)
     }
 
-    fn list(&self, list: &List) {
+    fn list(&mut self, list: &List) -> ExecStatus {
         match list {
             List::SequentialList(s) => self.sequential_list(s),
-            List::AsyncList(a) => {}
+            List::AsyncList(_) => not_implemented("`&`"),
         }
     }
 
-    fn program(&self, program: &ThisProgram) {
-        if program.child.commands.is_empty() {
-            return;
+    /// Run every complete command, the status is the one of the last command.
+    fn program(&mut self, program: &ThisProgram) -> ExecStatus {
+        let mut status = ExecStatus::SUCCESS;
+
+        for complete_command in &program.child.commands {
+            status = self.list(complete_command);
         }
 
-        // TODO: riveder
-        for complete_command in &program.child.commands {
-            self.list(complete_command);
-        }
+        status
     }
 
     fn line_has_continuation(&self) -> bool {
@@ -367,37 +437,53 @@ impl Executor {
     fn process_input(&self) -> Vec<String> {
         let mut lines = Vec::<String>::new();
 
+        // Lines keep their newline: a continuation line ends with "\\\n" (or "\\\r\n").
+        // Cut it and paste the next line on it.
         for line in &self.input_buffer {
-            match lines.last_mut() {
-                Some(previous) if previous.ends_with('\\') => {
-                    previous.pop(); // remove trailing '\'
+            let continued = lines.last_mut().and_then(|previous| {
+                let cut = previous
+                    .strip_suffix("\\\n")
+                    .or_else(|| previous.strip_suffix("\\\r\n"))?
+                    .len();
+                Some((previous, cut))
+            });
+
+            match continued {
+                Some((previous, cut)) => {
+                    previous.truncate(cut);
                     previous.push_str(line);
                 }
-                _ => lines.push(line.clone()),
+                None => lines.push(line.clone()),
             }
         }
 
         lines
     }
 
-    fn execute(&mut self) {
+    fn execute(&mut self) -> ExecStatus {
         let input = self.process_input();
 
-        let mut tokenizer = BufTokenizer::from_buffer(&input);
+        let tokenizer = BufTokenizer::from_buffer(&input);
 
-        // if tokenizer.next_is_eof() {
-        //     return Ok(ExecStats::default());
-        // }
+        if tokenizer.next_is_eof() {
+            return ExecStatus::SUCCESS;
+        }
 
-        let program = SyntaxTree::program(&mut tokenizer);
+        // The whole input must be consumed, otherwise there is some garbage the
+        // grammar could not match.
+        let program = SyntaxTree::program(&tokenizer).filter(|_| tokenizer.next_is_eof());
+
+        let Some(program) = program else {
+            eprintln!("rush: syntax error");
+            return ExecStatus::SYNTAX_ERROR;
+        };
 
         eprintln!("=== SYNTAX TREE ===");
         eprintln!("{program:#?}");
 
         eprintln!("=== COMMAND BEGIN ===");
 
-        self.program(todo!());
-        //Ok(self.program(program)?)
+        self.program(&program)
     }
 
     fn update(&mut self) -> Result<TerminalState, io::Error> {
@@ -415,25 +501,23 @@ impl Executor {
             });
         }
 
-        let exec_stats = self.execute();
+        let status = self.execute();
 
         self.input_buffer.clear();
 
-        // Ok(TerminalState {
-        //     exit_code: exec_stats.exit_code,
-        //     ..Default::default()
-        // })
-        Ok(TerminalState::default())
+        Ok(TerminalState {
+            exit_code: status.code(),
+            ..Default::default()
+        })
     }
 
     pub fn run(&mut self) {
         let mut state = TerminalState::default();
 
         while !state.terminate_session {
-            // if self.shell.is_interactive {
-            //     self.render_prompt(&state)?;
-            // }
-            self.render_prompt(&state).unwrap();
+            if self.shell.is_interactive {
+                self.render_prompt(&state).unwrap();
+            }
 
             state = self.update().unwrap();
         }
@@ -447,7 +531,7 @@ impl Executor {
         if state.needs_more {
             print!("> ");
         } else {
-            // self.reap_completed_jobs();
+            self.reap_bg_jobs();
 
             print!("$ ");
         }
@@ -457,15 +541,41 @@ impl Executor {
         io::stdout().flush()
     }
 
-    // fn reap_completed_jobs(&mut self) {
-    //     for job in &mut self.bg_jobs {
-    //         Waiter::update_status(job);
-    //
-    //         if job.completed() {
-    //             eprintln!("{}: Completed stats={:?}", job.job_master, job.exec_stats());
-    //         }
-    //     }
-    //
-    //     self.bg_jobs.retain(|job| !job.completed());
-    // }
+    /// Update the state of the background jobs and drop the completed ones.
+    fn reap_bg_jobs(&mut self) {
+        for job in &mut self.bg_jobs {
+            if let Err(e) = Waiter::update_status(job) {
+                eprintln!("rush: wait: {e}");
+            }
+
+            if let Some(exit) = job.completed_status() {
+                eprintln!("{}: Completed {exit:?}", job.job_master_pid.as_raw());
+            }
+        }
+
+        self.bg_jobs.retain(|job| !job.completed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_status_code() {
+        assert_eq!(ExecStatus::SUCCESS.code(), 0);
+        assert_eq!(ExecStatus::Exited(42).code(), 42);
+        assert_eq!(
+            ExecStatus::Signaled(Signal::SIGINT).code(),
+            128 + libc::SIGINT
+        );
+        assert_eq!(
+            ExecStatus::Stopped(Signal::SIGTSTP).code(),
+            128 + libc::SIGTSTP
+        );
+        assert_eq!(
+            ExecStatus::from(JobExit::Signaled(Signal::SIGKILL)),
+            ExecStatus::Signaled(Signal::SIGKILL)
+        );
+    }
 }

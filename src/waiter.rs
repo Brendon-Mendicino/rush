@@ -73,6 +73,24 @@ impl<'s> Waiter<'s> {
         }
     }
 
+    /// Collect, without blocking, the state changes of a background job.
+    pub fn update_status(job: &mut Job) -> io::Result<()> {
+        debug_assert!(
+            job.pgid.as_raw() != 0 || job.completed(),
+            "A job with a pgid unitialized must be completed."
+        );
+
+        loop {
+            match waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED | libc::WNOHANG) {
+                // No processes ready to report.
+                Ok(WaitRes::StillAlive) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
+                Err(e) => return Err(e),
+                Ok(res) => Self::process_status(job, res)?,
+            }
+        }
+    }
+
     /// Wait for a foreground job until it either completes or gets stopped.
     pub fn wait(&self, job: Job) -> io::Result<WaitResult> {
         let mut res = Self::wait_job(job);

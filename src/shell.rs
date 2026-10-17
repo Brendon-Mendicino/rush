@@ -173,3 +173,34 @@ impl Shell {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_keeps_attributes_when_none() {
+        let mut vars = ShellVars::default();
+
+        vars.upsert("A", "1", Some(VarAttr { external: true }));
+        vars.upsert("A", "2", None);
+        vars.upsert("B", "3", None);
+
+        assert_eq!(vars.get("A"), Some("2"));
+        assert_eq!(vars.get("B"), Some("3"));
+        assert_eq!(vars.get("C"), None);
+
+        let attr = |name| vars.iter().find(|(n, _)| *n == name).unwrap().1.attr;
+        assert!(attr("A").external);
+        assert!(!attr("B").external);
+    }
+
+    #[test]
+    fn env_vars_are_external() {
+        let vars = ShellVars::from_env();
+        let path = env::var("PATH").expect("PATH is set in the test environment");
+
+        assert_eq!(vars.get("PATH"), Some(path.as_str()));
+        assert!(vars.iter().all(|(_, var)| var.attr.external));
+    }
+}

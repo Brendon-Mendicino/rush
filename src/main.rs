@@ -11,7 +11,6 @@ mod waiter;
 
 fn main() {
     let mut executor = Executor::new();
-    println!("Hello, world!");
 
     executor.run();
 }
