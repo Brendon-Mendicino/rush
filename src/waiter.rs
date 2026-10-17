@@ -153,9 +153,17 @@ void Waiter::fg(Job &job) const {
 use std::{io, os::fd::RawFd};
 
 use crate::{
-    job::{Job, ProcStatus},
+    job::{Job, JobExit, ProcStatus},
     nix::{self, Pid, Signal, WaitPid, WaitRes, waitpid},
 };
+
+#[derive(Debug)]
+pub enum WaitResult {
+    /// Everty process finished; the job no longer exists
+    Completed(JobExit),
+    /// The job was stopped (e.g. Ctrl-Z); hand it back so it can go in the job table.
+    Stopped(Job),
+}
 
 pub struct Waiter {
     is_interactive: bool,
@@ -194,7 +202,7 @@ impl Waiter {
         Ok(())
     }
 
-    fn wait_job(job: &mut Job) -> io::Result<()> {
+    fn wait_job(mut job: Job) -> io::Result<WaitResult> {
         // TODO: this pgid, when executing in non-interctive shell, should be
         // equal for all the jobs
         debug_assert!(
@@ -202,61 +210,73 @@ impl Waiter {
             "A job with a pgid unitialized must be completed."
         );
 
-        while !job.completed() && !job.stopped() {
-            let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
-            Self::process_status(job, res)?;
-        }
-
-        Ok(())
-    }
-
-    pub fn update_status(job: &mut Job) -> io::Result<()> {
-        debug_assert!(
-            job.pgid.as_raw() != 0 || job.completed(),
-            "A job with a pgid unitialized must be completed."
-        );
-
         loop {
-            match waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED | libc::WNOHANG) {
-                // No processes ready to report.
-                Ok(WaitRes::StillAlive) => break,
-                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => break,
-                Err(e) => return Err(e),
-                Ok(res) => Self::process_status(job, res)?,
+            if let Some(job_exit) = job.completed_status() {
+                return Ok(WaitResult::Completed(job_exit));
             }
-        }
+            if job.stopped() {
+                return Ok(WaitResult::Stopped(job));
+            }
 
-        Ok(())
+            let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
+            Self::process_status(&mut job, res)?;
+        }
     }
 
-    pub fn wait(&self, job: &mut Job) -> io::Result<()> {
-        Self::wait_job(job)?;
+    /// Wait for a foreground job until it either completes or gets stopped.
+    pub fn wait(&self, job: Job) -> io::Result<WaitResult> {
+        let mut res = Self::wait_job(job);
 
         if self.is_interactive {
-            // Put the shell back in the foreground.
-            if let Err(e) = nix::tcsetpgrp(self.terminal, self.pgid) {
-                eprintln!("tcsetpgrp({}, {}): {e}", self.terminal, self.pgid.as_raw());
-            }
-
-            // Save the job's terminal modes and restore the shell's ones.
-            // TODO: this is not fine when calling `stty`. Decide how do handle this
-            job.tmodes = Some(nix::tcgetattr(self.terminal)?);
-            nix::tcsetattr(self.terminal, libc::TCSADRAIN, &self.tmodes)?;
+            // The terminal must go back to the shell on every path, even when
+            // waiting failed, otherwise the shell is left without a usable tty.
+            let stopped = match &mut res {
+                Ok(WaitResult::Stopped(job)) => Some(job),
+                _ => None,
+            };
+            self.reclaim_terminal(stopped);
         }
 
-        Ok(())
+        res
     }
 
-    pub fn wait_inside_async(job: &mut Job) -> io::Result<()> {
+    /// Put the shell back in the foreground and restore its terminal modes.
+    ///
+    /// When the job got stopped its current modes are saved, so that [`Waiter::fg`]
+    /// can restore them. A completed job is dropped, there is nothing to save.
+    fn reclaim_terminal(&self, stopped: Option<&mut Job>) {
+        if let Err(e) = nix::tcsetpgrp(self.terminal, self.pgid) {
+            eprintln!("tcsetpgrp({}, {}): {e}", self.terminal, self.pgid.as_raw());
+        }
+
+        if let Some(job) = stopped {
+            job.tmodes = match nix::tcgetattr(self.terminal) {
+                Ok(tmodes) => Some(tmodes),
+                Err(e) => {
+                    eprintln!("tcgetattr({}): {e}", self.terminal);
+                    None
+                }
+            };
+        }
+
+        // TODO: this is not fine when calling `stty`. Decide how do handle this
+        if let Err(e) = nix::tcsetattr(self.terminal, libc::TCSADRAIN, &self.tmodes) {
+            eprintln!("tcsetattr({}): {e}", self.terminal);
+        }
+    }
+
+    pub fn wait_inside_async(mut job: Job) -> io::Result<JobExit> {
         // Don't check for stopped jobs. An async list will terminate only when all
         // the children are completed. Some of them might get stopped by the tty. We
         // don't want to lose them before exiting the async list.
-        while !job.completed() {
-            let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
-            Self::process_status(job, res)?;
-        }
+        loop {
+            if let Some(job_exit) = job.completed_status() {
+                return Ok(job_exit);
+            }
 
-        Ok(())
+            let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
+            Self::process_status(&mut job, res)?;
+        }
     }
 
     pub fn bg(&self, job: &mut Job) {
@@ -269,16 +289,22 @@ impl Waiter {
         job.mark_running();
     }
 
-    pub fn fg(&self, job: &mut Job) -> io::Result<()> {
+    pub fn fg(&self, mut job: Job) -> io::Result<WaitResult> {
         // Put the job in foreground
-        nix::tcsetpgrp(self.terminal, job.pgid)?;
-
-        // Restore the tmodes on the terminal before sending SIGCONT
-        if let Some(tmodes) = &job.tmodes {
-            nix::tcsetattr(self.terminal, libc::TCSADRAIN, tmodes)?;
+        if let Err(e) = nix::tcsetpgrp(self.terminal, job.pgid) {
+            eprintln!("tcsetpgrp({}, {}): {e}", self.terminal, job.pgid.as_raw());
         }
 
-        self.bg(job);
+        // Restore the tmodes on the terminal before sending SIGCONT. They are taken
+        // out of the job: once it runs again they are stale, and a fresh copy is
+        // saved if it gets stopped again.
+        if let Some(tmodes) = job.tmodes.take() {
+            if let Err(e) = nix::tcsetattr(self.terminal, libc::TCSADRAIN, &tmodes) {
+                eprintln!("tcsetattr({}): {e}", self.terminal);
+            }
+        }
+
+        self.bg(&mut job);
         self.wait(job)
     }
 }
