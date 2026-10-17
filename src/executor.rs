@@ -1,6 +1,7 @@
 use crate::{
     job::{Job, JobBuilder},
     nix::{Pid, close, dup2_raw},
+    shell::Shell,
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
 };
@@ -24,9 +25,10 @@ pub struct TerminalState {
     exit_code: i32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct Executor {
     input_buffer: Vec<String>,
+    shell: Shell,
 }
 
 struct PipelineState<'child> {
@@ -135,6 +137,13 @@ impl ApplyerPtr {
 }
 
 impl Executor {
+    pub fn new() -> Self {
+        Self {
+            input_buffer: Vec::new(),
+            shell: Shell::new(),
+        }
+    }
+
     fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> Child {
         let mut redirect_controller = RedirectController::default();
 

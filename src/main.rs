@@ -4,12 +4,13 @@ mod cmd_runner;
 mod executor;
 mod job;
 mod nix;
+mod shell;
 mod syntax;
 mod tokenizer;
 mod waiter;
 
 fn main() {
-    let mut executor = Executor::default();
+    let mut executor = Executor::new();
     println!("Hello, world!");
 
     executor.run();

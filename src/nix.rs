@@ -263,6 +263,53 @@ pub fn tcsetattr<Fd: AsRawFd>(
     Ok(())
 }
 
+pub fn isatty<Fd: AsRawFd>(fd: Fd) -> bool {
+    unsafe { libc::isatty(fd.as_raw_fd()) == 1 }
+}
+
+pub fn getpgrp() -> Pid {
+    // getpgrp() is always successful
+    Pid(unsafe { libc::getpgrp() })
+}
+
+pub fn tcgetpgrp<Fd: AsRawFd>(fd: Fd) -> io::Result<Pid> {
+    let res = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+    Ok(Pid(cvt(res)?))
+}
+
+pub fn setpgid(pid: Pid, pgid: Pid) -> io::Result<()> {
+    let res = unsafe { libc::setpgid(pid.as_raw(), pgid.as_raw()) };
+    cvt(res)?;
+    Ok(())
+}
+
+/// Disposition of a signal, see [`signal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigHandler {
+    /// `SIG_DFL`
+    Default,
+    /// `SIG_IGN`
+    Ignore,
+}
+
+/// Set the disposition of `sig` (implemented with `sigaction(2)`).
+///
+/// It is async-signal-safe, so it can be used inside a `pre_exec` closure.
+pub fn signal(sig: Signal, handler: SigHandler) -> io::Result<()> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = match handler {
+        SigHandler::Default => libc::SIG_DFL,
+        SigHandler::Ignore => libc::SIG_IGN,
+    };
+
+    let res = unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(sig as libc::c_int, &action, std::ptr::null_mut())
+    };
+    cvt(res)?;
+    Ok(())
+}
+
 pub fn kill(pid: Pid, sig: Signal) -> io::Result<()> {
     let res = unsafe { libc::kill(pid.as_raw(), sig as libc::c_int) };
     cvt(res)?;
