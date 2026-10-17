@@ -240,6 +240,12 @@ pub fn dup2_raw<Fd: AsRawFd>(oldfd: Fd, newfd: Fd) -> io::Result<RawFd> {
     cvt(res)
 }
 
+/// Duplicate `fd` on the lowest free fd `>= min_fd`, with close-on-exec set.
+pub fn dup_cloexec<Fd: AsRawFd>(fd: Fd, min_fd: RawFd) -> io::Result<RawFd> {
+    let res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
+    cvt(res)
+}
+
 pub fn tcsetpgrp<Fd: AsRawFd>(fd: Fd, pgid: Pid) -> io::Result<()> {
     let res = unsafe { libc::tcsetpgrp(fd.as_raw_fd(), pgid.as_raw()) };
     cvt(res)?;

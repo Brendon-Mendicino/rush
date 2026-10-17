@@ -1,7 +1,7 @@
 use crate::{
     job::{Job, JobBuilder, JobExit},
-    nix::{Pid, Signal, close, dup2_raw},
-    shell::Shell,
+    nix::{self, Pid, SigHandler, Signal, close, dup2_raw},
+    shell::{JOB_CONTROL_SIGNALS, Shell},
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
     waiter::{WaitResult, Waiter},
@@ -64,6 +64,29 @@ fn not_implemented(what: &str) -> ExecStatus {
     ExecStatus::FAILURE
 }
 
+/// Report a command that could not be spawned. The status follows other shells:
+/// 127 when the program does not exist, 126 when it cannot be executed.
+fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
+    match err.kind() {
+        io::ErrorKind::NotFound if !program.contains('/') => {
+            eprintln!("rush: {program}: command not found");
+            JobExit::Exited(127)
+        }
+        io::ErrorKind::NotFound => {
+            eprintln!("rush: {program}: {err}");
+            JobExit::Exited(127)
+        }
+        io::ErrorKind::PermissionDenied => {
+            eprintln!("rush: {program}: {err}");
+            JobExit::Exited(126)
+        }
+        _ => {
+            eprintln!("rush: {program}: {err}");
+            JobExit::Exited(1)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Executor {
     input_buffer: Vec<String>,
@@ -72,9 +95,12 @@ pub struct Executor {
     bg_jobs: Vec<Job>,
 }
 
-struct PipelineState<'child> {
-    prev_child: Option<&'child mut Child>,
+struct PipelineState {
+    /// Input of the command: the output of the previous command of the pipeline.
+    stdin: Option<Stdio>,
     inside_pipeline: bool,
+    /// The job gets the terminal (interactive only).
+    is_foreground: bool,
     pipeline_pgid: Option<Pid>,
 }
 
@@ -194,13 +220,53 @@ impl Executor {
         }
     }
 
-    fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> Spawned {
+    /// Spawn an external command. When it cannot be spawned the error is reported
+    /// and the command's status is returned instead.
+    fn simple_command(
+        &self,
+        cmd: &SimpleCommand,
+        state: PipelineState,
+    ) -> Result<Spawned, JobExit> {
         let mut redirect_controller = RedirectController::default();
 
         redirect_controller.add_redirects(&cmd.redirections);
 
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
+
+        // An interactive shell puts every job in its own process group, the first
+        // command of the pipeline becomes the leader (0 = use its own pid).
+        // `spawn()` returns only after the child exec'd, so the group is already
+        // set when the parent continues: no setpgid race with the child.
+        if self.shell.is_interactive {
+            command.process_group(state.pipeline_pgid.map_or(0, Pid::as_raw));
+
+            let terminal = self.shell.terminal;
+            let is_foreground = state.is_foreground;
+
+            // Registered before the redirections, which could replace the fds.
+            // SAFETY: only async-signal-safe syscalls, no allocations.
+            unsafe {
+                command.pre_exec(move || {
+                    // std calls setpgid for `process_group` before running the
+                    // closures, so the child is already in the job's group. The
+                    // terminal is taken here, before exec: once exec'd the program
+                    // could read it before the parent hands it over, and would get
+                    // stopped by SIGTTIN. SIGTTOU is still ignored, which lets a
+                    // background group call tcsetpgrp.
+                    if is_foreground {
+                        nix::tcsetpgrp(terminal, nix::getpgrp())?;
+                    }
+
+                    // Ignored signals stay ignored across exec: undo the shell's.
+                    for sig in JOB_CONTROL_SIGNALS {
+                        nix::signal(sig, SigHandler::Default)?;
+                    }
+
+                    Ok(())
+                });
+            }
+        }
 
         let applyer = Box::new(redirect_controller.get_applyer());
 
@@ -214,17 +280,8 @@ impl Executor {
             });
         }
 
-        // An interactive shell puts every job in its own process group, the first
-        // command of the pipeline becomes the leader (0 = use its own pid).
-        // `spawn()` returns only after the child exec'd, so the group is already
-        // set when the parent continues: no setpgid race with the child.
-        if self.shell.is_interactive {
-            command.process_group(state.pipeline_pgid.map_or(0, Pid::as_raw));
-        }
-
-        if let Some(prev_child) = state.prev_child {
-            let stdout = prev_child.stdout.take().unwrap();
-            command.stdin(Stdio::from(stdout));
+        if let Some(stdin) = state.stdin {
+            command.stdin(stdin);
         }
 
         // We use this to chain the processes in a pipeline
@@ -241,7 +298,7 @@ impl Executor {
             drop(Box::from_raw(applyer_ptr.0 as *mut RedirectionApplyer));
         }
 
-        let child = spawn_result.unwrap();
+        let child = spawn_result.map_err(|e| spawn_failure(&cmd.program, &e))?;
 
         // A non-interactive shell does no job control: the children stay in the
         // shell's process group. Otherwise the first child of the pipeline leads
@@ -254,10 +311,10 @@ impl Executor {
             self.shell.pgid
         };
 
-        Spawned { child, pgid }
+        Ok(Spawned { child, pgid })
     }
 
-    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> Spawned {
+    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> Result<Spawned, JobExit> {
         let program = match &cmd.program {
             Word::Token(token) => token.text(),
             Word::Substitution(sub) => todo!(),
@@ -282,7 +339,7 @@ impl Executor {
         self.simple_command(&expanded, state)
     }
 
-    fn command(&self, command: &Command, state: PipelineState) -> Spawned {
+    fn command(&self, command: &Command, state: PipelineState) -> Result<Spawned, JobExit> {
         match command {
             Command::SimpleAssignment(assignment) => todo!(),
             Command::UnsubCommand(command) => self.unsub_command(command, state),
@@ -290,7 +347,7 @@ impl Executor {
         }
     }
 
-    fn pipeline(&self, pipeline: &Pipeline) -> Job {
+    fn pipeline(&self, pipeline: &Pipeline, is_foreground: bool) -> Job {
         assert!(
             !pipeline.cmds.is_empty(),
             "A pipeline must always contain something"
@@ -298,51 +355,51 @@ impl Executor {
 
         // Decided by the first spawned command, the others join its group.
         let mut pipeline_pgid = None;
-        let mut last_child = None;
+        let mut stdin = None;
         let mut job_builder = JobBuilder::new();
 
         let (last_cmd, inner_cmds) = pipeline.cmds.split_last().unwrap();
 
         for cmd in inner_cmds {
-            let Spawned { child, pgid } = self.command(
-                cmd,
-                PipelineState {
-                    prev_child: last_child.as_mut(),
-                    inside_pipeline: true,
-                    pipeline_pgid,
-                },
-            );
-            pipeline_pgid = Some(pgid);
+            let state = PipelineState {
+                stdin: stdin.take(),
+                inside_pipeline: true,
+                is_foreground,
+                pipeline_pgid,
+            };
 
-            match last_child {
-                None => {
-                    last_child = Some(child);
+            stdin = match self.command(cmd, state) {
+                Ok(Spawned { mut child, pgid }) => {
+                    pipeline_pgid = Some(pgid);
+                    let stdout = child.stdout.take().map(Stdio::from);
+                    job_builder.add_job(child);
+                    stdout
                 }
-                Some(to_add) => {
-                    last_child = Some(child);
-                    job_builder.add_job(to_add);
-                }
+                // The next command reads from a command that wrote nothing. It must
+                // not inherit the shell's stdin.
+                Err(_) => Some(Stdio::null()),
+            };
+        }
+
+        let state = PipelineState {
+            stdin,
+            inside_pipeline: false,
+            is_foreground,
+            pipeline_pgid,
+        };
+
+        match self.command(last_cmd, state) {
+            Ok(Spawned { child, pgid }) => job_builder.build(pgid, child),
+            // When nothing was spawned the job is already completed and its pgid
+            // is never waited on.
+            Err(exit) => {
+                job_builder.build_not_spawned(pipeline_pgid.unwrap_or(self.shell.pgid), exit)
             }
         }
-
-        let Spawned { child, pgid } = self.command(
-            last_cmd,
-            PipelineState {
-                prev_child: last_child.as_mut(),
-                inside_pipeline: false,
-                pipeline_pgid,
-            },
-        );
-
-        if let Some(last_child) = last_child {
-            job_builder.add_job(last_child);
-        }
-
-        job_builder.build(pgid, child)
     }
 
     fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
-        let job = self.pipeline(pipeline);
+        let job = self.pipeline(pipeline, true);
 
         match Waiter::new(&self.shell).wait(job) {
             Ok(WaitResult::Completed(exit)) => exit.into(),
@@ -549,7 +606,7 @@ impl Executor {
             }
 
             if let Some(exit) = job.completed_status() {
-                eprintln!("{}: Completed {exit:?}", job.job_master_pid.as_raw());
+                eprintln!("{}: Completed {exit:?}", job.pgid.as_raw());
             }
         }
 
@@ -576,6 +633,19 @@ mod tests {
         assert_eq!(
             ExecStatus::from(JobExit::Signaled(Signal::SIGKILL)),
             ExecStatus::Signaled(Signal::SIGKILL)
+        );
+    }
+
+    #[test]
+    fn spawn_failure_status() {
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+
+        assert_eq!(spawn_failure("missing", &not_found), JobExit::Exited(127));
+        assert_eq!(spawn_failure("./missing", &not_found), JobExit::Exited(127));
+        assert_eq!(
+            spawn_failure("./not-executable", &denied),
+            JobExit::Exited(126)
         );
     }
 }

@@ -39,7 +39,7 @@ pub struct Shell {
 }
 
 /// Signals ignored by an interactive shell, the children restore them to the default.
-const JOB_CONTROL_SIGNALS: [Signal; 5] = [
+pub const JOB_CONTROL_SIGNALS: [Signal; 5] = [
     Signal::SIGINT,
     Signal::SIGQUIT,
     Signal::SIGTSTP,
@@ -124,6 +124,14 @@ impl Shell {
     }
 
     fn init_job_control(&mut self) {
+        // Keep the terminal on an fd of its own: children take the terminal in
+        // `pre_exec`, when their stdin may already be a pipe or /dev/null.
+        // Close-on-exec keeps it from leaking into the programs.
+        match nix::dup_cloexec(self.terminal, 10) {
+            Ok(fd) => self.terminal = fd,
+            Err(e) => eprintln!("fcntl({}, F_DUPFD_CLOEXEC): {e}", self.terminal),
+        }
+
         // Loop until we are in the foreground.
         loop {
             self.pgid = nix::getpgrp();
@@ -148,13 +156,17 @@ impl Shell {
             }
         }
 
-        // Put ourselves in our own process group.
+        // Put ourselves in our own process group. A session leader (e.g. a shell
+        // started by `script`) already leads its group, and setpgid would fail
+        // with EPERM.
         let pid = Pid::this();
-        match nix::setpgid(pid, pid) {
-            Ok(()) => self.pgid = pid,
-            Err(e) => {
-                eprintln!("Couldn't put the shell in its own process group: {e}");
-                self.pgid = nix::getpgrp();
+        if self.pgid != pid {
+            match nix::setpgid(pid, pid) {
+                Ok(()) => self.pgid = pid,
+                Err(e) => {
+                    eprintln!("Couldn't put the shell in its own process group: {e}");
+                    self.pgid = nix::getpgrp();
+                }
             }
         }
 

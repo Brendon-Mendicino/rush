@@ -117,3 +117,33 @@ fn duplicates_file_descriptors() {
     assert!(stderr(&output).contains("to-stderr"));
     assert_eq!(stdout(&output), "ls");
 }
+
+#[test]
+fn reports_a_missing_command() {
+    let output = run_shell("nonexistent-rush-cmd\necho after\n");
+
+    assert!(stderr(&output).contains("rush: nonexistent-rush-cmd: command not found"));
+    assert_eq!(stdout(&output), "after\n");
+}
+
+#[test]
+fn pipeline_runs_around_a_missing_command() {
+    // The command after a missing one gets an empty input: if it inherited the
+    // shell's stdin, `cat` would swallow the `echo after` line.
+    let output = run_shell("echo lost | nonexistent-rush-cmd | echo x\nnonexistent-rush-cmd | cat\necho after\n");
+
+    assert_eq!(stdout(&output), "x\nafter\n");
+}
+
+#[test]
+fn non_interactive_children_stay_in_the_shell_group() {
+    let output = run_shell("cat /proc/self/stat\n");
+
+    // pid (comm) state ppid pgrp ...
+    let stat = stdout(&output);
+    let (_, rest) = stat.split_once(") ").unwrap();
+    let pgrp: i32 = rest.split_whitespace().nth(2).unwrap().parse().unwrap();
+
+    // The shell was spawned in the test's group and does no job control.
+    assert_eq!(pgrp, unsafe { libc::getpgrp() });
+}
