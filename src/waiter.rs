@@ -11,7 +11,7 @@ pub enum WaitResult {
     /// Everty process finished; the job no longer exists
     Completed(JobExit),
     /// The job was stopped (e.g. Ctrl-Z); hand it back so it can go in the job table.
-    Stopped(Job),
+    Stopped { job: Job, sig_stop: Signal },
 }
 
 pub struct Waiter<'s> {
@@ -65,7 +65,8 @@ impl<'s> Waiter<'s> {
                 return Ok(WaitResult::Completed(job_exit));
             }
             if job.stopped() {
-                return Ok(WaitResult::Stopped(job));
+                let sig_stop = job.stop_signal().unwrap_or(Signal::SIGSTOP);
+                return Ok(WaitResult::Stopped { job, sig_stop });
             }
 
             let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
@@ -99,7 +100,7 @@ impl<'s> Waiter<'s> {
             // The terminal must go back to the shell on every path, even when
             // waiting failed, otherwise the shell is left without a usable tty.
             let stopped = match &mut res {
-                Ok(WaitResult::Stopped(job)) => Some(job),
+                Ok(WaitResult::Stopped { job, .. }) => Some(job),
                 _ => None,
             };
             self.reclaim_terminal(stopped);

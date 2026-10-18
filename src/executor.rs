@@ -112,7 +112,10 @@ struct PipelineState {
 #[derive(Debug, Clone, Copy)]
 enum RedirectOp {
     /// `dup2(src, dst)`
-    Dup { src: RawFd, dst: RawFd },
+    Dup {
+        src: RawFd,
+        dst: RawFd,
+    },
     Close(RawFd),
 }
 
@@ -478,12 +481,9 @@ impl Executor {
 
         match Waiter::new(&self.shell).wait(job) {
             Ok(WaitResult::Completed(exit)) => exit.into(),
-            Ok(WaitResult::Stopped(job)) => {
-                // If a job was stopped while waiting for it, put it in the
-                // background jobs.
-                let sig = job.stop_signal().unwrap_or(Signal::SIGTSTP);
+            Ok(WaitResult::Stopped { job, sig_stop }) => {
                 self.bg_jobs.push(job);
-                ExecStatus::Stopped(sig)
+                ExecStatus::Stopped(sig_stop)
             }
             Err(e) => {
                 eprintln!("rush: wait: {e}");
