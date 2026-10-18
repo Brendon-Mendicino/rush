@@ -325,7 +325,7 @@ impl SyntaxTree {
         // Advance the tokenizer if the next token is a SEMI.
         // If the next token is a SEMI, the tokenizer will be automatically
         // advanced by the function.
-        if let Some(_) = Self::separator_op(tok) {
+        if Self::separator_op(tok).is_some() {
             return Some(List::AsyncList(list.into()));
         }
 
@@ -940,7 +940,7 @@ impl SyntaxTree {
             }),
             TokenType::Lessgreat => Redirect::FileRedirect(FileRedirect {
                 // TODO: change to handle fds
-                redirect_fd: 1,
+                redirect_fd: 0,
                 file_kind: OpenKind::Rw,
                 filename,
             }),
@@ -1022,7 +1022,7 @@ impl SyntaxTree {
             return false;
         }
 
-        while let Some(_) = tok.next_if_type(TokenType::NewLine) {}
+        while tok.next_if_type(TokenType::NewLine).is_some() {}
 
         true
     }

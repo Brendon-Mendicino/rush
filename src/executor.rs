@@ -7,11 +7,13 @@ use crate::{
     waiter::{WaitResult, Waiter},
 };
 use std::{
+    collections::HashMap,
+    fmt,
     fs::File,
     io::{self, Write},
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
-        unix::process::CommandExt,
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::{fs::OpenOptionsExt, process::CommandExt},
     },
     process::{self, Child, Stdio},
 };
@@ -67,21 +69,23 @@ fn not_implemented(what: &str) -> ExecStatus {
 /// Report a command that could not be spawned. The status follows other shells:
 /// 127 when the program does not exist, 126 when it cannot be executed.
 fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
+    let message = nix::error_message(err);
+
     match err.kind() {
         io::ErrorKind::NotFound if !program.contains('/') => {
             eprintln!("rush: {program}: command not found");
             JobExit::Exited(127)
         }
         io::ErrorKind::NotFound => {
-            eprintln!("rush: {program}: {err}");
+            eprintln!("rush: {program}: {message}");
             JobExit::Exited(127)
         }
         io::ErrorKind::PermissionDenied => {
-            eprintln!("rush: {program}: {err}");
+            eprintln!("rush: {program}: {message}");
             JobExit::Exited(126)
         }
         _ => {
-            eprintln!("rush: {program}: {err}");
+            eprintln!("rush: {program}: {message}");
             JobExit::Exited(1)
         }
     }
@@ -104,18 +108,49 @@ struct PipelineState {
     pipeline_pgid: Option<Pid>,
 }
 
+/// What a redirection does in the child.
+#[derive(Debug, Clone, Copy)]
+enum RedirectOp {
+    /// `dup2(src, dst)`
+    Dup { src: RawFd, dst: RawFd },
+    Close(RawFd),
+}
+
+/// A redirection that cannot be set up; the command is not run.
+#[derive(Debug)]
+enum RedirectError {
+    Open { filename: String, err: io::Error },
+    BadFd(RawFd),
+}
+
+impl fmt::Display for RedirectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { filename, err } => {
+                write!(f, "{filename}: {}", nix::error_message(err))
+            }
+            Self::BadFd(fd) => write!(f, "{fd}: Bad file descriptor"),
+        }
+    }
+}
+
+/// Prepares the redirections of a command in the parent: opens the files and
+/// checks the fds, so that errors are reported before spawning.
 #[derive(Debug, Default)]
 struct RedirectController {
-    file_redirects: Vec<(File, i32)>,
-    duplications: Vec<(i32, i32)>,
-    fd_to_close: Vec<i32>,
+    /// Files opened for the redirections. Dropped, and so closed in the parent,
+    /// once the child is spawned.
+    files: Vec<OwnedFd>,
+    /// The redirections in the order they are written, which is the order they
+    /// are applied in: `2>&1 >file` and `>file 2>&1` differ.
+    ops: Vec<RedirectOp>,
+    /// Fds opened (`true`) or closed (`false`) by the redirections seen so far.
+    redirected: HashMap<RawFd, bool>,
 }
 
 #[derive(Debug)]
 struct RedirectionApplyer {
-    file_redirects: Vec<(i32, i32)>,
-    duplications: Vec<(i32, i32)>,
-    fd_to_close: Vec<i32>,
+    ops: Vec<RedirectOp>,
 }
 
 /// A spawned command and the process group it ended up in.
@@ -132,73 +167,107 @@ unsafe impl Send for ApplyerPtr {}
 unsafe impl Sync for ApplyerPtr {}
 
 impl RedirectController {
-    fn add_redirect(&mut self, redirect: &Redirect) {
+    fn add_redirect(&mut self, redirect: &Redirect) -> Result<(), RedirectError> {
         match redirect {
             Redirect::FileRedirect(file_redirect) => {
-                let mut options = File::options();
+                let file = Self::open(file_redirect)?;
+                let dst = file_redirect.redirect_fd;
 
-                match file_redirect.file_kind {
-                    OpenKind::Read => options.read(true),
-                    OpenKind::Replace => options.create(true).write(true).truncate(true),
-                    OpenKind::Append => options.create(true).append(true),
-                    OpenKind::Rw => options.create(true).read(true).write(true),
-                };
-
-                let filename = file_redirect.filename.text();
-                let file = options.open(&filename).unwrap();
-
-                self.file_redirects.push((file, file_redirect.redirect_fd));
+                self.ops.push(RedirectOp::Dup {
+                    src: file.as_raw_fd(),
+                    dst,
+                });
+                self.files.push(file);
+                self.redirected.insert(dst, true);
             }
             Redirect::FdRedirect(dup_fd) => {
-                self.duplications
-                    .push((dup_fd.fd_to_replace, dup_fd.fd_replacer));
+                let src = dup_fd.fd_replacer;
+
+                // Either opened by an earlier redirection of this command, or
+                // inherited from the shell.
+                let is_open = self
+                    .redirected
+                    .get(&src)
+                    .copied()
+                    .unwrap_or_else(|| nix::is_valid_fd(src));
+                if !is_open {
+                    return Err(RedirectError::BadFd(src));
+                }
+
+                self.ops.push(RedirectOp::Dup {
+                    src,
+                    dst: dup_fd.fd_to_replace,
+                });
+                self.redirected.insert(dup_fd.fd_to_replace, true);
             }
             Redirect::CloseFd(close_fd) => {
-                self.fd_to_close.push(close_fd.fd);
+                self.ops.push(RedirectOp::Close(close_fd.fd));
+                self.redirected.insert(close_fd.fd, false);
             }
+        }
+
+        Ok(())
+    }
+
+    fn open(redirect: &FileRedirect) -> Result<OwnedFd, RedirectError> {
+        let mut options = File::options();
+
+        match redirect.file_kind {
+            OpenKind::Read => options.read(true),
+            OpenKind::Replace => options.create(true).write(true).truncate(true),
+            OpenKind::Append => options.create(true).append(true),
+            OpenKind::Rw => options.create(true).read(true).write(true),
+        };
+        // rw-rw-r--, before the umask
+        options.mode(0o664);
+
+        let filename = redirect.filename.text();
+        let file = options
+            .open(&filename)
+            .map_err(|err| RedirectError::Open { filename, err })?;
+
+        // Move the file out of the low fds that redirections usually target:
+        // otherwise a redirection could overwrite a file that a later one still
+        // has to dup (`4>a 3>b` with `a` opened on 3). The copy is close-on-exec
+        // like the original, only the dup2'd fds reach the program.
+        match nix::dup_cloexec(file.as_raw_fd(), 10) {
+            Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Err(_) => Ok(file.into()),
         }
     }
 
     fn get_applyer(&self) -> RedirectionApplyer {
-        let file_redirects = self
-            .file_redirects
-            .iter()
-            // (to_replace, replacer): the redirected fd gets replaced by the file
-            .map(|(f, fd)| (*fd, f.as_raw_fd()))
-            .collect::<Vec<_>>();
-
         RedirectionApplyer {
-            file_redirects,
-            duplications: self.duplications.clone(),
-            fd_to_close: self.fd_to_close.clone(),
+            ops: self.ops.clone(),
         }
     }
 
-    fn add_redirects(&mut self, redirections: &[Redirect]) {
+    fn add_redirects(&mut self, redirections: &[Redirect]) -> Result<(), RedirectError> {
         for redirect in redirections {
-            self.add_redirect(redirect);
+            self.add_redirect(redirect)?;
         }
+
+        Ok(())
     }
 }
 
 impl RedirectionApplyer {
+    /// Runs in the child, between fork and exec: async-signal-safe calls only.
     fn apply(&self) -> io::Result<()> {
-        // TODO: we might want to add a communication pipe with the parent to
-        // get back some more info about the failure
-
-        // close fds: leftover from the pipe() calls
-        for to_close in &self.fd_to_close {
-            close(*to_close)?;
-        }
-
-        // Duplicate fds from files
-        for (to_replace, replacer) in &self.file_redirects {
-            dup2_raw(*replacer, *to_replace)?;
-        }
-
-        // Duplicate fds from duplication syntax
-        for (to_replace, replacer) in &self.duplications {
-            dup2_raw(*replacer, *to_replace)?;
+        for op in &self.ops {
+            match *op {
+                // dup2 does nothing when the fds are the same, and the fd would
+                // keep its close-on-exec flag.
+                RedirectOp::Dup { src, dst } if src == dst => nix::set_cloexec(src, false)?,
+                RedirectOp::Dup { src, dst } => {
+                    dup2_raw(src, dst)?;
+                }
+                // Closing an fd that is not open is not an error (`3>&-`).
+                RedirectOp::Close(fd) => match close(fd) {
+                    Err(e) if e.raw_os_error() == Some(libc::EBADF) => {}
+                    res => res?,
+                },
+            }
         }
 
         Ok(())
@@ -229,7 +298,10 @@ impl Executor {
     ) -> Result<Spawned, JobExit> {
         let mut redirect_controller = RedirectController::default();
 
-        redirect_controller.add_redirects(&cmd.redirections);
+        if let Err(e) = redirect_controller.add_redirects(&cmd.redirections) {
+            eprintln!("rush: {e}");
+            return Err(JobExit::Exited(1));
+        }
 
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
@@ -297,6 +369,9 @@ impl Executor {
             // because it will execute in the child context.
             drop(Box::from_raw(applyer_ptr.0 as *mut RedirectionApplyer));
         }
+
+        // The child has its own copies of the files now.
+        drop(redirect_controller);
 
         let child = spawn_result.map_err(|e| spawn_failure(&cmd.program, &e))?;
 

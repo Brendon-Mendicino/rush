@@ -240,6 +240,42 @@ pub fn dup2_raw<Fd: AsRawFd>(oldfd: Fd, newfd: Fd) -> io::Result<RawFd> {
     cvt(res)
 }
 
+/// The fd is open (`fcntl(F_GETFD)` does not fail with `EBADF`).
+pub fn is_valid_fd(fd: RawFd) -> bool {
+    let res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    res != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+}
+
+/// Set or clear close-on-exec on `fd`. Async-signal-safe.
+pub fn set_cloexec(fd: RawFd, cloexec: bool) -> io::Result<()> {
+    let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
+    let flags = if cloexec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    cvt(unsafe { libc::fcntl(fd, libc::F_SETFD, flags) })?;
+    Ok(())
+}
+
+/// The message of an error the way C prints it (`strerror`), without the
+/// " (os error N)" suffix of `io::Error`'s `Display`.
+pub fn error_message(err: &io::Error) -> String {
+    let Some(errno) = err.raw_os_error() else {
+        return err.to_string();
+    };
+
+    let mut buf = [0 as libc::c_char; 256];
+    let res = unsafe { libc::strerror_r(errno, buf.as_mut_ptr(), buf.len()) };
+    if res != 0 {
+        return err.to_string();
+    }
+
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Duplicate `fd` on the lowest free fd `>= min_fd`, with close-on-exec set.
 pub fn dup_cloexec<Fd: AsRawFd>(fd: Fd, min_fd: RawFd) -> io::Result<RawFd> {
     let res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
