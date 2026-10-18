@@ -21,3 +21,19 @@ fn pipeline_runs_around_a_missing_command() {
 
     assert_eq!(stdout(&output), "x\nafter\n");
 }
+
+#[test]
+fn bang_negates_the_status() {
+    let output = run_shell("! false && echo a\n! true && echo b\n! true || echo c\n");
+
+    assert_eq!(stdout(&output), "a\nc\n");
+}
+
+#[test]
+fn bang_negates_the_whole_pipeline() {
+    // The status of a pipeline is the one of its last command (`cat`
+    // succeeds), whatever happened before it.
+    let output = run_shell("! ls /nonexistent-rush 2>&1 | cat > /dev/null || echo negated\n");
+
+    assert_eq!(stdout(&output), "negated\n");
+}

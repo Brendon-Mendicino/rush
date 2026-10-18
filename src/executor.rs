@@ -50,6 +50,31 @@ impl ExecStatus {
             Self::Signaled(sig) | Self::Stopped(sig) => 128 + sig as i32,
         }
     }
+
+    /// Negates the output of the command
+    pub fn not(self) -> ExecStatus {
+        match self {
+            // Keep the interruption visible to `&&` and `||`.
+            status if status.interrupted() => status,
+            status if status.failure() => Self::SUCCESS,
+            _ => Self::FAILURE,
+        }
+    }
+
+    /// The command was interrupted (Ctrl-C): the rest of the and-or list must
+    /// not run.
+    pub fn interrupted(self) -> bool {
+        matches!(self, Self::Signaled(Signal::SIGINT))
+    }
+
+    /// Indicates whether the command exit is considered a failure
+    pub fn failure(&self) -> bool {
+        match self {
+            Self::Stopped(_) | Self::Signaled(_) => true,
+            Self::Exited(0) => false,
+            Self::Exited(_) => true,
+        }
+    }
 }
 
 impl From<JobExit> for ExecStatus {
@@ -474,7 +499,7 @@ impl Executor {
         }
     }
 
-    fn pipeline(&mut self, pipeline: &Pipeline, is_foreground: bool) -> Job {
+    fn schedule_pipeline(&mut self, pipeline: &Pipeline, is_foreground: bool) -> Job {
         assert!(
             !pipeline.cmds.is_empty(),
             "A pipeline must always contain something"
@@ -526,9 +551,9 @@ impl Executor {
     }
 
     fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
-        let job = self.pipeline(pipeline, true);
+        let job = self.schedule_pipeline(pipeline, true);
 
-        match Waiter::new(&self.shell).wait(job) {
+        let exec_status = match Waiter::new(&self.shell).wait(job) {
             Ok(WaitResult::Completed(exit)) => exit.into(),
             Ok(WaitResult::Stopped { job, sig_stop }) => {
                 self.bg_jobs.push(job);
@@ -538,13 +563,41 @@ impl Executor {
                 eprintln!("rush: wait: {e}");
                 ExecStatus::FAILURE
             }
+        };
+
+        if pipeline.negated {
+            exec_status.not()
+        } else {
+            exec_status
         }
+    }
+
+    fn or_list(&mut self, orl: &OrList) -> ExecStatus {
+        let left_status = self.op_list(&orl.left);
+
+        // Short-circuit if the lhs execution did not fail, or was interrupted
+        if !left_status.failure() || left_status.interrupted() {
+            return left_status;
+        }
+
+        self.op_list(&orl.right)
+    }
+
+    fn and_list(&mut self, andl: &AndList) -> ExecStatus {
+        let left_status = self.op_list(&andl.left);
+
+        // Short-circuit if the lhs execution failed (an interruption is a failure)
+        if left_status.failure() {
+            return left_status;
+        }
+
+        self.op_list(&andl.right)
     }
 
     fn op_list(&mut self, op: &OpList) -> ExecStatus {
         match op {
-            OpList::AndList(_) => not_implemented("`&&`"),
-            OpList::OrList(_) => not_implemented("`||`"),
+            OpList::AndList(andl) => self.and_list(andl),
+            OpList::OrList(orl) => self.or_list(orl),
             OpList::Pipeline(pipeline) => self.wait_pipeline(pipeline),
         }
     }
@@ -758,6 +811,25 @@ mod tests {
             ExecStatus::from(JobExit::Signaled(Signal::SIGKILL)),
             ExecStatus::Signaled(Signal::SIGKILL)
         );
+    }
+
+    #[test]
+    fn exec_status_failure_and_not() {
+        let statuses = [
+            (ExecStatus::SUCCESS, false),
+            (ExecStatus::Exited(2), true),
+            (ExecStatus::Signaled(Signal::SIGTERM), true),
+            (ExecStatus::Stopped(Signal::SIGTSTP), true),
+        ];
+
+        for (status, failure) in statuses {
+            assert_eq!(status.failure(), failure, "{status:?}");
+            assert_eq!(status.not().failure(), !failure, "{status:?}");
+        }
+
+        let interrupted = ExecStatus::Signaled(Signal::SIGINT);
+        assert!(interrupted.interrupted());
+        assert_eq!(interrupted.not(), interrupted);
     }
 
     #[test]
