@@ -129,7 +129,11 @@ static SPECS: LazyLock<Vec<Specification>> = LazyLock::new(|| {
         // - L: match unicode literal
         // - Nd: match unicode numbers
         // - So: other symbol
-        spec(r"^((?:[\p{L}\p{Nd}\p{So}=\-\/.]|\\.)+)", TokenType::Word),
+        // `_` for variable names, `: , + % @` for values (`PATH=/a:/b`).
+        spec(
+            r"^((?:[\p{L}\p{Nd}\p{So}_=\-\/.:,+%@]|\\.)+)",
+            TokenType::Word,
+        ),
         // Quoatations
         spec(r"^('[^']*')", TokenType::QuotedWord),
         // Sepcification::new(r"^("[^']")", TokenType::string),

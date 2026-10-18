@@ -12,7 +12,7 @@ use crate::nix::{self, Pid, SigHandler, Signal};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VarAttr {
     /// The variable is exported to the environment of the child processes.
-    pub external: bool,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl ShellVars {
         // works only with `str`.
         for (name, value) in env::vars_os() {
             if let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) {
-                vars.upsert(name, value, Some(VarAttr { external: true }));
+                vars.upsert(name, value, Some(VarAttr { exported: true }));
             }
         }
 
@@ -97,6 +97,13 @@ impl ShellVars {
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Var)> {
         self.vars.iter().map(|(name, var)| (name.as_str(), var))
+    }
+
+    /// The variables passed down to the environment of the children.
+    pub fn exported(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.iter()
+            .filter(|(_, var)| var.attr.exported)
+            .map(|(name, var)| (name, var.value.as_str()))
     }
 }
 
@@ -194,7 +201,7 @@ mod tests {
     fn upsert_keeps_attributes_when_none() {
         let mut vars = ShellVars::default();
 
-        vars.upsert("A", "1", Some(VarAttr { external: true }));
+        vars.upsert("A", "1", Some(VarAttr { exported: true }));
         vars.upsert("A", "2", None);
         vars.upsert("B", "3", None);
 
@@ -203,8 +210,8 @@ mod tests {
         assert_eq!(vars.get("C"), None);
 
         let attr = |name| vars.iter().find(|(n, _)| *n == name).unwrap().1.attr;
-        assert!(attr("A").external);
-        assert!(!attr("B").external);
+        assert!(attr("A").exported);
+        assert!(!attr("B").exported);
     }
 
     #[test]
@@ -213,6 +220,19 @@ mod tests {
         let path = env::var("PATH").expect("PATH is set in the test environment");
 
         assert_eq!(vars.get("PATH"), Some(path.as_str()));
-        assert!(vars.iter().all(|(_, var)| var.attr.external));
+        assert!(vars.iter().all(|(_, var)| var.attr.exported));
+    }
+
+    #[test]
+    fn only_external_vars_are_exported() {
+        let mut vars = ShellVars::default();
+
+        vars.upsert("ENV", "1", Some(VarAttr { exported: true }));
+        vars.upsert("LOCAL", "2", None);
+        // An assignment to an exported variable keeps it exported.
+        vars.upsert("ENV", "3", None);
+
+        let exported: Vec<_> = vars.exported().collect();
+        assert_eq!(exported, [("ENV", "3")]);
     }
 }

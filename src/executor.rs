@@ -156,6 +156,16 @@ struct RedirectionApplyer {
     ops: Vec<RedirectOp>,
 }
 
+/// Outcome of starting a command of a pipeline.
+#[derive(Debug)]
+enum CommandRun {
+    /// A child process, to be waited as part of the job.
+    Spawned(Spawned),
+    /// The command finished without a process: it ran in the shell (an
+    /// assignment), or it could not be started (the error is already printed).
+    Done(JobExit),
+}
+
 /// A spawned command and the process group it ended up in.
 #[derive(Debug)]
 struct Spawned {
@@ -294,20 +304,26 @@ impl Executor {
 
     /// Spawn an external command. When it cannot be spawned the error is reported
     /// and the command's status is returned instead.
-    fn simple_command(
-        &self,
-        cmd: &SimpleCommand,
-        state: PipelineState,
-    ) -> Result<Spawned, JobExit> {
+    fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> CommandRun {
         let mut redirect_controller = RedirectController::default();
 
         if let Err(e) = redirect_controller.add_redirects(&cmd.redirections) {
             eprintln!("rush: {e}");
-            return Err(JobExit::Exited(1));
+            return CommandRun::Done(JobExit::Exited(1));
         }
 
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
+
+        // The environment is the exported shell variables plus the command's
+        // `VAR=x` prefixes. `env` keeps the last value of a key, so a prefix
+        // overrides a shell variable and the last prefix wins. The program is
+        // looked up in this `PATH`.
+        command.env_clear();
+        command.envs(self.shell.vars.exported());
+        for assignment in &cmd.envs {
+            command.env(assignment.key, assignment.value_text());
+        }
 
         // An interactive shell puts every job in its own process group, the first
         // command of the pipeline becomes the leader (0 = use its own pid).
@@ -376,7 +392,10 @@ impl Executor {
         // The child has its own copies of the files now.
         drop(redirect_controller);
 
-        let child = spawn_result.map_err(|e| spawn_failure(&cmd.program, &e))?;
+        let child = match spawn_result {
+            Ok(child) => child,
+            Err(e) => return CommandRun::Done(spawn_failure(&cmd.program, &e)),
+        };
 
         // A non-interactive shell does no job control: the children stay in the
         // shell's process group. Otherwise the first child of the pipeline leads
@@ -389,10 +408,10 @@ impl Executor {
             self.shell.pgid
         };
 
-        Ok(Spawned { child, pgid })
+        CommandRun::Spawned(Spawned { child, pgid })
     }
 
-    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> Result<Spawned, JobExit> {
+    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> CommandRun {
         let program = match &cmd.program {
             Word::Token(token) => token.text(),
             Word::Substitution(sub) => todo!(),
@@ -417,15 +436,45 @@ impl Executor {
         self.simple_command(&expanded, state)
     }
 
-    fn command(&self, command: &Command, state: PipelineState) -> Result<Spawned, JobExit> {
+    /// `a=1 b=2` with no command: set the shell variables.
+    fn simple_assignment(
+        &mut self,
+        assignment: &SimpleAssignment,
+        state: PipelineState,
+    ) -> CommandRun {
+        // The redirections are still performed (`a=1 >file` creates the file),
+        // and when they fail the variables are left untouched. The files are
+        // closed when the controller is dropped.
+        let mut redirect_controller = RedirectController::default();
+        if let Err(e) = redirect_controller.add_redirects(&assignment.redirections) {
+            eprintln!("rush: {e}");
+            return CommandRun::Done(JobExit::Exited(1));
+        }
+
+        // Each command of a pipeline runs in its own process: the assignment
+        // would only change a child's variables, which are thrown away.
+        if state.inside_pipeline {
+            return CommandRun::Done(JobExit::Exited(0));
+        }
+
+        // `None` keeps the attributes of an existing variable: assigning an
+        // exported variable changes the environment of the next commands.
+        for var in &assignment.envs {
+            self.shell.vars.upsert(var.key, var.value_text(), None);
+        }
+
+        CommandRun::Done(JobExit::Exited(0))
+    }
+
+    fn command(&mut self, command: &Command, state: PipelineState) -> CommandRun {
         match command {
-            Command::SimpleAssignment(assignment) => todo!(),
+            Command::SimpleAssignment(assignment) => self.simple_assignment(assignment, state),
             Command::UnsubCommand(command) => self.unsub_command(command, state),
             Command::Subshell(subshell) => todo!(),
         }
     }
 
-    fn pipeline(&self, pipeline: &Pipeline, is_foreground: bool) -> Job {
+    fn pipeline(&mut self, pipeline: &Pipeline, is_foreground: bool) -> Job {
         assert!(
             !pipeline.cmds.is_empty(),
             "A pipeline must always contain something"
@@ -447,7 +496,7 @@ impl Executor {
             };
 
             stdin = match self.command(cmd, state) {
-                Ok(Spawned { mut child, pgid }) => {
+                CommandRun::Spawned(Spawned { mut child, pgid }) => {
                     pipeline_pgid = Some(pgid);
                     let stdout = child.stdout.take().map(Stdio::from);
                     job_builder.add_job(child);
@@ -455,7 +504,7 @@ impl Executor {
                 }
                 // The next command reads from a command that wrote nothing. It must
                 // not inherit the shell's stdin.
-                Err(_) => Some(Stdio::null()),
+                CommandRun::Done(_) => Some(Stdio::null()),
             };
         }
 
@@ -467,10 +516,10 @@ impl Executor {
         };
 
         match self.command(last_cmd, state) {
-            Ok(Spawned { child, pgid }) => job_builder.build(pgid, child),
+            CommandRun::Spawned(Spawned { child, pgid }) => job_builder.build(pgid, child),
             // When nothing was spawned the job is already completed and its pgid
             // is never waited on.
-            Err(exit) => {
+            CommandRun::Done(exit) => {
                 job_builder.build_not_spawned(pipeline_pgid.unwrap_or(self.shell.pgid), exit)
             }
         }

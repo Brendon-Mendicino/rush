@@ -183,6 +183,29 @@ pub struct CmdSub<'a> {
 #[derive(Debug, Clone)]
 pub struct SyntaxTree {}
 
+impl<'a> AssignmentWord<'a> {
+    /// The value with the backslash escapes removed (`a=x\ y` → `x y`); `value`
+    /// is the raw text of the token.
+    pub fn value_text(&self) -> String {
+        let text = self.whole.text();
+
+        match text.split_once('=') {
+            Some((_, value)) => value.to_string(),
+            None => String::new(),
+        }
+    }
+}
+
+/// A shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+pub fn is_valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 impl<'a> SimpleCommand<'a> {
     pub fn text(&self) -> String {
         let cmd = self.program.to_string();
@@ -1099,6 +1122,12 @@ impl SyntaxTree {
 
         let (key, value) = word.value.split_once(eq)?;
 
+        // TODO: shall i remove this?
+        // Otherwise it is an ordinary word (`=x`, `a-b=1`, `./x=1`).
+        if !is_valid_name(key) {
+            return None;
+        }
+
         tok.merge(sub_tok);
 
         Some(AssignmentWord {
@@ -1121,5 +1150,32 @@ impl SyntaxTree {
         } else {
             panic!("Redirect is not a number or dash! fd={:#?}", filename);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::UnbufferedTokenizer;
+
+    #[test]
+    fn valid_names() {
+        for name in ["a", "_a1", "MY_VAR", "_"] {
+            assert!(is_valid_name(name), "{name}");
+        }
+        for name in ["", "1a", "a-b", "./x", "é"] {
+            assert!(!is_valid_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn assignment_word_needs_a_valid_name() {
+        let tok = UnbufferedTokenizer::new("MY_VAR=a\\ b");
+        let word = SyntaxTree::assignment_word(&tok).unwrap();
+        assert_eq!(word.key, "MY_VAR");
+        assert_eq!(word.value_text(), "a b");
+
+        let tok = UnbufferedTokenizer::new("=x");
+        assert!(SyntaxTree::assignment_word(&tok).is_none());
     }
 }
