@@ -352,6 +352,36 @@ pub fn signal(sig: Signal, handler: SigHandler) -> io::Result<()> {
     Ok(())
 }
 
+/// Which side of a [`fork`] the caller is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkResult {
+    Parent(Pid),
+    Child,
+}
+
+/// Create a child process, a copy of the caller.
+///
+/// # Safety
+///
+/// After a fork in a multi-threaded process the child may only call
+/// async-signal-safe functions: another thread could have held a lock (e.g. the
+/// allocator's) that stays locked forever in the child. The shell must stay
+/// single-threaded for its children to run ordinary Rust code.
+pub unsafe fn fork() -> io::Result<ForkResult> {
+    let res = cvt(unsafe { libc::fork() })?;
+
+    Ok(match res {
+        0 => ForkResult::Child,
+        pid => ForkResult::Parent(Pid(pid)),
+    })
+}
+
+/// Terminate the process at once: no destructors, no unwinding, no `atexit`
+/// handlers and no flushing of the std buffers.
+pub fn _exit(code: i32) -> ! {
+    unsafe { libc::_exit(code) }
+}
+
 pub fn kill(pid: Pid, sig: Signal) -> io::Result<()> {
     let res = unsafe { libc::kill(pid.as_raw(), sig as libc::c_int) };
     cvt(res)?;
@@ -369,9 +399,11 @@ pub fn waitpid(pid: WaitPid, options: libc::c_int) -> io::Result<WaitRes> {
     let mut wstatus: i32 = 0;
     let res: pid_t = unsafe { libc::waitpid(w_pid.as_raw(), &mut wstatus, options) };
     let res = cvt(res)?;
+
     if res == 0 {
         return Ok(WaitRes::StillAlive);
     }
+
     let pid = Pid::from_raw(res);
 
     let wait_res = if libc::WIFEXITED(wstatus) {
@@ -389,4 +421,22 @@ pub fn waitpid(pid: WaitPid, options: libc::c_int) -> io::Result<WaitRes> {
     };
 
     Ok(wait_res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_and_exit() {
+        // The test harness is multi-threaded: the child only calls `_exit`,
+        // which is async-signal-safe.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => _exit(3),
+            ForkResult::Parent(pid) => {
+                let res = waitpid(WaitPid::Single(pid), 0).unwrap();
+                assert!(matches!(res, WaitRes::Exited(p, 3) if p == pid), "{res:?}");
+            }
+        }
+    }
 }

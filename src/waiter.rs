@@ -1,14 +1,14 @@
 use std::io;
 
 use crate::{
-    job::{Job, JobExit, ProcStatus},
+    job::{Job, JobExit, JobProgress, ProcStatus},
     nix::{self, Pid, Signal, WaitPid, WaitRes, waitpid},
     shell::Shell,
 };
 
 #[derive(Debug)]
 pub enum WaitResult {
-    /// Everty process finished; the job no longer exists
+    /// Every process finished; the job no longer exists
     Completed(JobExit),
     /// The job was stopped (e.g. Ctrl-Z); hand it back so it can go in the job table.
     Stopped { job: Job, sig_stop: Signal },
@@ -52,9 +52,9 @@ impl<'s> Waiter<'s> {
         Ok(())
     }
 
+    /// Wait with job control: every job has its own process group, and a stopped
+    /// job is handed back.
     fn wait_job(mut job: Job) -> io::Result<WaitResult> {
-        // TODO: this pgid, when executing in non-interctive shell, should be
-        // equal for all the jobs
         debug_assert!(
             job.pgid.as_raw() != 0 || job.completed(),
             "A job with a pgid unitialized must be completed."
@@ -74,37 +74,64 @@ impl<'s> Waiter<'s> {
         }
     }
 
-    /// Collect, without blocking, the state changes of a background job.
-    pub fn update_status(job: &mut Job) -> io::Result<()> {
-        debug_assert!(
-            job.pgid.as_raw() != 0 || job.completed(),
-            "A job with a pgid unitialized must be completed."
-        );
-
+    /// Wait without job control until every process completed. The jobs share
+    /// the shell's process group, so each process is waited by pid: a wait on the
+    /// group could reap a background job. Stops are not reported (no
+    /// `WUNTRACED`), a stopped process is waited until it is continued and ends.
+    fn wait_completed(mut job: Job) -> io::Result<JobExit> {
         loop {
-            match waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED | libc::WNOHANG) {
-                // No processes ready to report.
-                Ok(WaitRes::StillAlive) => return Ok(()),
-                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
-                Err(e) => return Err(e),
-                Ok(res) => Self::process_status(job, res)?,
-            }
+            let pending = match job.completed_or_pending() {
+                JobProgress::Completed(job_exit) => return Ok(job_exit),
+                JobProgress::Pending(pending) => pending,
+            };
+
+            let res = waitpid(WaitPid::Single(pending), 0)?;
+            Self::process_status(&mut job, res)?;
         }
     }
 
-    /// Wait for a foreground job until it either completes or gets stopped.
+    /// Collect, without blocking, the state changes of a background job.
+    pub fn update_status(job: &mut Job) -> io::Result<()> {
+        // By pid: without job control the background jobs share a process group.
+        let pending = job.pending();
+
+        for pid in pending {
+            loop {
+                match waitpid(WaitPid::Single(pid), libc::WUNTRACED | libc::WNOHANG) {
+                    // Nothing to report for this process.
+                    Ok(WaitRes::StillAlive) => break,
+                    Err(e) if e.raw_os_error() == Some(libc::ECHILD) => break,
+                    Err(e) => return Err(e),
+                    Ok(res) => {
+                        let completed = matches!(res, WaitRes::Exited(..) | WaitRes::Signaled(..));
+                        Self::process_status(job, res)?;
+                        if completed {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Wait for a foreground job until it either completes or, with job control,
+    /// gets stopped.
     pub fn wait(&self, job: Job) -> io::Result<WaitResult> {
+        if !self.shell.is_interactive {
+            return Self::wait_completed(job).map(WaitResult::Completed);
+        }
+
         let mut res = Self::wait_job(job);
 
-        if self.shell.is_interactive {
-            // The terminal must go back to the shell on every path, even when
-            // waiting failed, otherwise the shell is left without a usable tty.
-            let stopped = match &mut res {
-                Ok(WaitResult::Stopped { job, .. }) => Some(job),
-                _ => None,
-            };
-            self.reclaim_terminal(stopped);
-        }
+        // The terminal must go back to the shell on every path, even when
+        // waiting failed, otherwise the shell is left without a usable tty.
+        let stopped = match &mut res {
+            Ok(WaitResult::Stopped { job, .. }) => Some(job),
+            _ => None,
+        };
+        self.reclaim_terminal(stopped);
 
         res
     }
@@ -137,20 +164,6 @@ impl<'s> Waiter<'s> {
             if let Err(e) = nix::tcsetattr(self.shell.terminal, libc::TCSADRAIN, tmodes) {
                 eprintln!("tcsetattr({}): {e}", self.shell.terminal);
             }
-        }
-    }
-
-    pub fn wait_inside_async(mut job: Job) -> io::Result<JobExit> {
-        // Don't check for stopped jobs. An async list will terminate only when all
-        // the children are completed. Some of them might get stopped by the tty. We
-        // don't want to lose them before exiting the async list.
-        loop {
-            if let Some(job_exit) = job.completed_status() {
-                return Ok(job_exit);
-            }
-
-            let res = waitpid(WaitPid::Group(job.pgid), libc::WUNTRACED)?;
-            Self::process_status(&mut job, res)?;
         }
     }
 

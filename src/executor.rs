@@ -1,6 +1,6 @@
 use crate::{
     job::{Job, JobBuilder, JobExit},
-    nix::{self, Pid, SigHandler, Signal, close, dup2_raw},
+    nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
     shell::{JOB_CONTROL_SIGNALS, Shell},
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
@@ -10,12 +10,13 @@ use std::{
     collections::HashMap,
     fmt,
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{fs::OpenOptionsExt, process::CommandExt},
     },
-    process::{self, Child, Stdio},
+    panic::{self, AssertUnwindSafe},
+    process::{self, Stdio},
 };
 
 const RED: &str = "\x1b[31m";
@@ -86,11 +87,6 @@ impl From<JobExit> for ExecStatus {
     }
 }
 
-fn not_implemented(what: &str) -> ExecStatus {
-    eprintln!("rush: {what} is not implemented yet");
-    ExecStatus::FAILURE
-}
-
 /// Report a command that could not be spawned. The status follows other shells:
 /// 127 when the program does not exist, 126 when it cannot be executed.
 fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
@@ -126,7 +122,10 @@ pub struct Executor {
 
 struct PipelineState {
     /// Input of the command: the output of the previous command of the pipeline.
-    stdin: Option<Stdio>,
+    stdin: Option<OwnedFd>,
+    /// Output of the command, when it is not the shell's (`$(...)`). Inside a
+    /// pipeline the output is a new pipe to the next command instead.
+    stdout: Option<OwnedFd>,
     inside_pipeline: bool,
     /// The job gets the terminal (interactive only).
     is_foreground: bool,
@@ -194,8 +193,27 @@ enum CommandRun {
 /// A spawned command and the process group it ended up in.
 #[derive(Debug)]
 struct Spawned {
-    child: Child,
+    pid: Pid,
     pgid: Pid,
+    /// Read end of the pipe the command writes to, inside a pipeline.
+    stdout: Option<OwnedFd>,
+}
+
+/// What a forked shell runs, which decides how it treats the terminal and the
+/// signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnType {
+    /// `( list )` and `$(list)`: part of the job it belongs to, like a command.
+    /// It gets the default signals, so Ctrl-C and Ctrl-Z act on it as well.
+    Subshell,
+    /// `list &`: never takes the terminal. Without job control it ignores
+    /// SIGINT and SIGQUIT and reads from /dev/null (POSIX).
+    Async,
+}
+
+/// `/dev/null`, the input of a command that must not read the shell's.
+fn dev_null() -> Option<OwnedFd> {
+    File::open("/dev/null").map(OwnedFd::from).ok()
 }
 
 #[derive(Clone)]
@@ -384,6 +402,17 @@ impl Executor {
             }
         }
 
+        if let Some(stdin) = state.stdin {
+            command.stdin(Stdio::from(stdin));
+        }
+
+        // We use this to chain the processes in a pipeline
+        if state.inside_pipeline {
+            command.stdout(Stdio::piped());
+        } else if let Some(stdout) = state.stdout {
+            command.stdout(Stdio::from(stdout));
+        }
+
         let applyer = Box::new(redirect_controller.get_applyer());
 
         let applyer_ptr = ApplyerPtr(Box::into_raw(applyer));
@@ -394,15 +423,6 @@ impl Executor {
                 ptr_clone.apply()?;
                 Ok(())
             });
-        }
-
-        if let Some(stdin) = state.stdin {
-            command.stdin(stdin);
-        }
-
-        // We use this to chain the processes in a pipeline
-        if state.inside_pipeline {
-            command.stdout(Stdio::piped());
         }
 
         let spawn_result = command.spawn();
@@ -417,38 +437,291 @@ impl Executor {
         // The child has its own copies of the files now.
         drop(redirect_controller);
 
-        let child = match spawn_result {
+        let mut child = match spawn_result {
             Ok(child) => child,
             Err(e) => return CommandRun::Done(spawn_failure(&cmd.program, &e)),
         };
+        let pid = Pid::from_raw(child.id() as i32);
 
         // A non-interactive shell does no job control: the children stay in the
         // shell's process group. Otherwise the first child of the pipeline leads
         // the group with its pid.
         let pgid = if self.shell.is_interactive {
-            state
-                .pipeline_pgid
-                .unwrap_or_else(|| Pid::from_raw(child.id() as i32))
+            state.pipeline_pgid.unwrap_or(pid)
         } else {
             self.shell.pgid
         };
 
-        CommandRun::Spawned(Spawned { child, pgid })
+        // Dropping the `Child` neither waits nor kills: the job reaps it by pid.
+        CommandRun::Spawned(Spawned {
+            pid,
+            pgid,
+            stdout: child.stdout.take().map(OwnedFd::from),
+        })
     }
 
-    fn unsub_command(&self, cmd: &UnsubCommand, state: PipelineState) -> CommandRun {
-        let program = match &cmd.program {
-            Word::Token(token) => token.text(),
-            Word::Substitution(sub) => todo!(),
+    /// Fork a shell that runs `body` (shell code, not a program) and exits with
+    /// its status: a subshell, an async list, a command substitution.
+    ///
+    /// The child is a copy of the shell, so whatever `body` changes (variables,
+    /// later the cwd) stays in the child. It runs without job control: its
+    /// commands stay in its process group and it never touches the terminal.
+    fn fork_child(
+        &mut self,
+        spawn_type: SpawnType,
+        state: PipelineState,
+        redirections: &[Redirect],
+        body: impl FnOnce(&mut Self) -> ExecStatus,
+    ) -> CommandRun {
+        // TODO: check again if this function can be simplified in the future, maybe using more
+        // idiomatinc rust and wrapping the libc calls to rust structs
+        let PipelineState {
+            stdin,
+            stdout,
+            inside_pipeline,
+            is_foreground,
+            pipeline_pgid,
+        } = state;
+
+        let mut redirect_controller = RedirectController::default();
+        if let Err(e) = redirect_controller.add_redirects(redirections) {
+            eprintln!("rush: {e}");
+            return CommandRun::Done(JobExit::Exited(1));
+        }
+
+        // Inside a pipeline the child writes to a new pipe, whose read end is the
+        // input of the next command.
+        let (next_stdin, stdout) = if inside_pipeline {
+            match io::pipe() {
+                Ok((reader, writer)) => (Some(OwnedFd::from(reader)), Some(OwnedFd::from(writer))),
+                Err(e) => {
+                    eprintln!("rush: pipe: {}", nix::error_message(&e));
+                    return CommandRun::Done(JobExit::Exited(1));
+                }
+            }
+        } else {
+            (None, stdout)
         };
+
+        // Anything still buffered would be written by both processes.
+        let _ = io::stdout().flush();
+
+        // SAFETY: the shell is single-threaded, see `nix::fork`.
+        let pid = match unsafe { nix::fork() } {
+            Ok(ForkResult::Child) => {
+                // The read end belongs to the next command.
+                drop(next_stdin);
+                self.enter_child(
+                    spawn_type,
+                    is_foreground,
+                    pipeline_pgid,
+                    stdin,
+                    stdout,
+                    redirect_controller,
+                );
+
+                // The child must never get back to the caller: it would go on
+                // running the parent's code (and read its input).
+                let status = panic::catch_unwind(AssertUnwindSafe(|| body(self)))
+                    .unwrap_or(ExecStatus::FAILURE);
+
+                let _ = io::stdout().flush();
+                nix::_exit(status.code());
+            }
+            Ok(ForkResult::Parent(pid)) => pid,
+            Err(e) => {
+                eprintln!("rush: fork: {}", nix::error_message(&e));
+                return CommandRun::Done(JobExit::Exited(1));
+            }
+        };
+
+        // The parent's copies of `stdin`, `stdout` and the redirected files are
+        // closed when they go out of scope: only the child needs them.
+
+        let pgid = if self.shell.is_interactive {
+            let pgid = pipeline_pgid.unwrap_or(pid);
+
+            // Unlike `Command::spawn`, `fork` returns before the child ran: it may
+            // not be in its group yet. Both sides set it (GNU libc manual).
+            match nix::setpgid(pid, pgid) {
+                // The child already exited: it set its group itself.
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(e) => eprintln!("rush: setpgid({}, {}): {e}", pid.as_raw(), pgid.as_raw()),
+                Ok(()) => {}
+            }
+
+            if is_foreground
+                && spawn_type != SpawnType::Async
+                && let Err(e) = nix::tcsetpgrp(self.shell.terminal, pgid)
+            {
+                eprintln!("rush: tcsetpgrp({}): {e}", pgid.as_raw());
+            }
+
+            pgid
+        } else {
+            self.shell.pgid
+        };
+
+        CommandRun::Spawned(Spawned {
+            pid,
+            pgid,
+            stdout: next_stdin,
+        })
+    }
+
+    /// Set up a forked child before it runs its shell code.
+    fn enter_child(
+        &mut self,
+        spawn_type: SpawnType,
+        is_foreground: bool,
+        pipeline_pgid: Option<Pid>,
+        stdin: Option<OwnedFd>,
+        stdout: Option<OwnedFd>,
+        redirect_controller: RedirectController,
+    ) {
+        if self.shell.is_interactive {
+            // Same as a command's `pre_exec`: join the job's group, take the
+            // terminal while SIGTTOU is still ignored, restore the signals.
+            let _ = nix::setpgid(Pid::from_raw(0), pipeline_pgid.unwrap_or(Pid::from_raw(0)));
+
+            if is_foreground && spawn_type != SpawnType::Async {
+                let _ = nix::tcsetpgrp(self.shell.terminal, nix::getpgrp());
+            }
+
+            for sig in JOB_CONTROL_SIGNALS {
+                let _ = nix::signal(sig, SigHandler::Default);
+            }
+        } else if spawn_type == SpawnType::Async {
+            // Without job control Ctrl-C reaches every process of the shell's
+            // group: the background ones must not die with the foreground job.
+            for sig in [Signal::SIGINT, Signal::SIGQUIT] {
+                let _ = nix::signal(sig, SigHandler::Ignore);
+            }
+        }
+
+        let stdio = [(stdin, libc::STDIN_FILENO), (stdout, libc::STDOUT_FILENO)];
+        for (fd, target) in stdio {
+            if let Some(fd) = fd
+                && let Err(e) = dup2_raw(fd.as_raw_fd(), target)
+            {
+                eprintln!("rush: dup2: {}", nix::error_message(&e));
+                nix::_exit(1);
+            }
+        }
+
+        if let Err(e) = redirect_controller.get_applyer().apply() {
+            eprintln!("rush: {}", nix::error_message(&e));
+            nix::_exit(1);
+        }
+        // Close the original files: the child does not exec, close-on-exec
+        // would never kick in.
+        drop(redirect_controller);
+
+        // The child is a shell without job control: its commands stay in its
+        // process group (the job's), it never touches the terminal, and stops
+        // are not reported. The parent's jobs are not its children.
+        self.shell.is_interactive = false;
+        self.shell.pgid = nix::getpgrp();
+        self.bg_jobs.clear();
+    }
+
+    /// `( list )`: run the list in a forked shell.
+    fn subshell(&mut self, subshell: &Subshell, state: PipelineState) -> CommandRun {
+        self.fork_child(
+            SpawnType::Subshell,
+            state,
+            &subshell.redirections,
+            |executor| executor.list(&subshell.seq_list),
+        )
+    }
+
+    /// `list &`: run the list in a forked shell without waiting for it.
+    fn async_list(&mut self, op_list: &OpList) -> ExecStatus {
+        let state = PipelineState {
+            // POSIX: without job control an async list reads from /dev/null.
+            stdin: (!self.shell.is_interactive).then(dev_null).flatten(),
+            stdout: None,
+            inside_pipeline: false,
+            is_foreground: false,
+            pipeline_pgid: None,
+        };
+
+        match self.fork_child(SpawnType::Async, state, &[], |executor| {
+            executor.op_list(op_list)
+        }) {
+            CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
+                eprintln!("{}: Background", pid.as_raw());
+                self.bg_jobs.push(JobBuilder::new().build(pgid, pid));
+                ExecStatus::SUCCESS
+            }
+            CommandRun::Done(exit) => exit.into(),
+        }
+    }
+
+    /// `$(list)`: the output of the list run in a forked shell, without the
+    /// trailing newlines.
+    fn cmdsub(&mut self, cmdsub: &CmdSub) -> String {
+        let (mut reader, writer) = match io::pipe() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                eprintln!("rush: pipe: {}", nix::error_message(&e));
+                return String::new();
+            }
+        };
+
+        let state = PipelineState {
+            stdin: None,
+            stdout: Some(writer.into()),
+            inside_pipeline: false,
+            is_foreground: true,
+            pipeline_pgid: None,
+        };
+
+        // The write end is moved into the child's state: once `fork_child`
+        // returns the parent has no copy left, and the read gets EOF when the
+        // child is done.
+        let run = self.fork_child(SpawnType::Subshell, state, &[], |executor| {
+            executor.list(&cmdsub.seq_list)
+        });
+
+        // Read everything before waiting: a child blocked on a full pipe would
+        // never exit.
+        let mut output = Vec::new();
+        if let Err(e) = reader.read_to_end(&mut output) {
+            eprintln!("rush: read: {}", nix::error_message(&e));
+        }
+        drop(reader);
+
+        if let CommandRun::Spawned(Spawned { pid, pgid, .. }) = run {
+            let job = JobBuilder::new().build(pgid, pid);
+
+            match Waiter::new(&self.shell).wait(job) {
+                Ok(WaitResult::Completed(_)) => {}
+                Ok(WaitResult::Stopped { job, .. }) => self.bg_jobs.push(job),
+                Err(e) => eprintln!("rush: wait: {e}"),
+            }
+        }
+
+        let output = String::from_utf8_lossy(&output);
+        output.trim_end_matches('\n').to_string()
+    }
+
+    /// The text of a word, after substitutions.
+    fn expand_word(&mut self, word: &Word) -> String {
+        match word {
+            Word::Token(token) => token.text(),
+            Word::Substitution(Substitution::CmdSub(cmdsub)) => self.cmdsub(cmdsub),
+            Word::Substitution(Substitution::VarSub(_)) => todo!(),
+        }
+    }
+
+    fn unsub_command(&mut self, cmd: &UnsubCommand, state: PipelineState) -> CommandRun {
+        let program = self.expand_word(&cmd.program);
 
         let arguments = cmd
             .arguments
             .iter()
-            .map(|w| match w {
-                Word::Token(token) => token.text(),
-                Word::Substitution(sub) => todo!(),
-            })
+            .map(|word| self.expand_word(word))
             .collect::<Vec<_>>();
 
         let expanded = SimpleCommand {
@@ -495,7 +768,7 @@ impl Executor {
         match command {
             Command::SimpleAssignment(assignment) => self.simple_assignment(assignment, state),
             Command::UnsubCommand(command) => self.unsub_command(command, state),
-            Command::Subshell(subshell) => todo!(),
+            Command::Subshell(subshell) => self.subshell(subshell, state),
         }
     }
 
@@ -515,33 +788,34 @@ impl Executor {
         for cmd in inner_cmds {
             let state = PipelineState {
                 stdin: stdin.take(),
+                stdout: None,
                 inside_pipeline: true,
                 is_foreground,
                 pipeline_pgid,
             };
 
             stdin = match self.command(cmd, state) {
-                CommandRun::Spawned(Spawned { mut child, pgid }) => {
+                CommandRun::Spawned(Spawned { pid, pgid, stdout }) => {
                     pipeline_pgid = Some(pgid);
-                    let stdout = child.stdout.take().map(Stdio::from);
-                    job_builder.add_job(child);
+                    job_builder.add_job(pid);
                     stdout
                 }
                 // The next command reads from a command that wrote nothing. It must
                 // not inherit the shell's stdin.
-                CommandRun::Done(_) => Some(Stdio::null()),
+                CommandRun::Done(_) => dev_null(),
             };
         }
 
         let state = PipelineState {
             stdin,
+            stdout: None,
             inside_pipeline: false,
             is_foreground,
             pipeline_pgid,
         };
 
         match self.command(last_cmd, state) {
-            CommandRun::Spawned(Spawned { child, pgid }) => job_builder.build(pgid, child),
+            CommandRun::Spawned(Spawned { pid, pgid, .. }) => job_builder.build(pgid, pid),
             // When nothing was spawned the job is already completed and its pgid
             // is never waited on.
             CommandRun::Done(exit) => {
@@ -613,7 +887,13 @@ impl Executor {
     fn list(&mut self, list: &List) -> ExecStatus {
         match list {
             List::SequentialList(s) => self.sequential_list(s),
-            List::AsyncList(_) => not_implemented("`&`"),
+            List::AsyncList(async_list) => {
+                if let Some(left) = &async_list.left {
+                    self.list(left);
+                }
+
+                self.async_list(&async_list.right)
+            }
         }
     }
 
@@ -633,7 +913,7 @@ impl Executor {
             return false;
         };
 
-        let mut tokenizer = UnbufferedTokenizer::new(line);
+        let tokenizer = UnbufferedTokenizer::new(line);
 
         let mut prev = TokenType::Eof;
 
@@ -735,6 +1015,11 @@ impl Executor {
             });
         }
 
+        // An interactive shell reaps before printing the prompt.
+        if !self.shell.is_interactive {
+            self.reap_bg_jobs();
+        }
+
         let status = self.execute();
 
         self.input_buffer.clear();
@@ -782,7 +1067,9 @@ impl Executor {
                 eprintln!("rush: wait: {e}");
             }
 
-            if let Some(exit) = job.completed_status() {
+            if let Some(exit) = job.completed_status()
+                && self.shell.is_interactive
+            {
                 eprintln!("{}: Completed {exit:?}", job.pgid.as_raw());
             }
         }

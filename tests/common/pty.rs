@@ -204,6 +204,49 @@ impl InteractiveShell {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    /// Like [`Self::wait_foreground_job`], but `program` may be any process of
+    /// the foreground job, not only its leader: in `(sleep 30)` the leader is
+    /// the forked subshell, and `sleep` its child. Once `sleep` exists the
+    /// subshell has restored its signals. Returns the job's pgid.
+    pub fn wait_foreground_process(&self, program: &str) -> i32 {
+        let deadline = Instant::now() + TIMEOUT;
+
+        loop {
+            let pgid = self.foreground_pgid();
+
+            if pgid != self.pid() && process_in_group(pgid, program) {
+                return pgid;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no {program} in the foreground job"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Some process of the group `pgid` is running `program`. The fields of
+/// `/proc/<pid>/stat` are `pid (comm) state ppid pgrp ...`.
+fn process_in_group(pgid: i32, program: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            return false;
+        };
+        let Some((head, rest)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        let comm = head.split_once(" (").map_or("", |(_, comm)| comm);
+        let pgrp = rest.split_whitespace().nth(2);
+
+        comm == program && pgrp == Some(pgid.to_string().as_str())
+    })
 }
 
 /// Kill and reap the shell. Its children go too: when the session leader dies

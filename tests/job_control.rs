@@ -166,3 +166,92 @@ fn ctrl_z_stops_the_foreground_job() {
     // to the whole process group. SIGKILL works on stopped processes too.
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
+
+#[test]
+fn subshell_commands_join_the_job_group() {
+    let mut sh = InteractiveShell::spawn();
+
+    // `cat` is a child of the forked subshell, which leads the job's group.
+    sh.send("(cat /proc/self/stat)\n");
+    let (pid, pgrp, tpgid) = stat_ids(&sh.expect_prompt());
+    assert_ne!(pgrp, pid, "the subshell leads the group, not cat");
+    assert_ne!(pgrp, sh.pid());
+    assert_eq!(tpgid, pgrp, "the job owns the terminal");
+
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+}
+
+#[test]
+fn subshell_can_read_the_terminal() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("(cat)\n");
+    sh.wait_foreground_process("cat");
+    sh.send("typed\n");
+    sh.stdout.expect("typed\r\n");
+    sh.send("\x04");
+
+    assert!(!sh.expect_prompt().contains(RED));
+}
+
+#[test]
+fn ctrl_c_interrupts_a_subshell() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("(sleep 30; echo after)\n");
+    sh.wait_foreground_process("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    assert!(
+        !output.contains("after"),
+        "the subshell went on: {output:?}"
+    );
+    assert!(output.contains(RED));
+}
+
+#[test]
+fn ctrl_z_stops_a_subshell() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("(sleep 30; echo after)\n");
+    let pgid = sh.wait_foreground_process("sleep");
+    sh.send("\x1a");
+
+    sh.stderr.expect("stopped by SIGTSTP");
+    let output = sh.expect_prompt();
+    assert!(!output.contains("after"), "{output:?}");
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+
+    // The subshell itself is stopped, not only its child.
+    let stat = fs::read_to_string(format!("/proc/{pgid}/stat")).unwrap();
+    assert!(stat.contains(") T "), "the subshell is not stopped: {stat}");
+
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+#[test]
+fn async_job_does_not_take_the_terminal() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("sleep 30 &\n");
+    let line = sh.stderr.expect(": Background");
+    let pid: i32 = line
+        .lines()
+        .last()
+        .and_then(|l| l.split(':').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    sh.expect_prompt();
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+
+    // Its own process group, like any job.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let (_, rest) = stat.rsplit_once(") ").unwrap();
+    let pgrp: i32 = rest.split_whitespace().nth(2).unwrap().parse().unwrap();
+    assert_eq!(pgrp, pid);
+
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+}

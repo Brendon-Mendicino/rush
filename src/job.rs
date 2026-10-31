@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process};
+use std::collections::HashMap;
 
 use crate::nix::{Pid, Signal};
 
@@ -34,7 +34,7 @@ pub enum JobMaster {
 
 #[derive(Debug)]
 pub struct JobBuilder {
-    jobs: HashMap<Pid, process::Child>,
+    pids: Vec<Pid>,
 }
 
 /**
@@ -43,16 +43,27 @@ pub struct JobBuilder {
  * For more info on implementing a job controls system take a look at:
  * https://www.gnu.org/software/libc/manual/html_node/Implementing-a-Shell.html
  *
+ * The processes are only known by pid: they are spawned programs
+ * (`process::Command`) or forked shells (subshells, async lists), and both are
+ * reaped with `waitpid` only.
  */
 #[derive(Debug)]
 pub struct Job {
     pub pgid: Pid,
-    pub jobs: HashMap<Pid, process::Child>,
     pub job_master: JobMaster,
     pub job_status: HashMap<Pid, ProcStatus>,
     /// Terminal modes of the job, saved when it gets stopped and consumed when it is
     /// put back in the foreground.
     pub tmodes: Option<libc::termios>,
+}
+
+/// Where a job stands: done, or still waiting on one of its processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobProgress {
+    /// Every process completed; this is the job's status.
+    Completed(JobExit),
+    /// A process that has not completed yet (running or stopped).
+    Pending(Pid),
 }
 
 impl JobExit {
@@ -67,20 +78,16 @@ impl JobExit {
 
 impl JobBuilder {
     pub fn new() -> Self {
-        Self {
-            jobs: HashMap::new(),
-        }
+        Self { pids: Vec::new() }
     }
 
-    pub fn add_job(&mut self, child: process::Child) {
-        self.jobs.insert(Pid::from_raw(child.id() as i32), child);
+    pub fn add_job(&mut self, pid: Pid) {
+        self.pids.push(pid);
     }
 
-    pub fn build(mut self, pgid: Pid, job_master: process::Child) -> Job {
-        let job_master_pid = Pid::from_raw(job_master.id() as i32);
-
+    pub fn build(mut self, pgid: Pid, job_master: Pid) -> Job {
         self.add_job(job_master);
-        self.finish(pgid, JobMaster::Process(job_master_pid))
+        self.finish(pgid, JobMaster::Process(job_master))
     }
 
     /// Build a job whose last command could not be spawned. When nothing was
@@ -90,13 +97,14 @@ impl JobBuilder {
     }
 
     fn finish(self, pgid: Pid, job_master: JobMaster) -> Job {
-        let JobBuilder { jobs } = self;
-
-        let job_status = jobs.keys().map(|&pid| (pid, ProcStatus::Running)).collect();
+        let job_status = self
+            .pids
+            .into_iter()
+            .map(|pid| (pid, ProcStatus::Running))
+            .collect();
 
         Job {
             pgid,
-            jobs,
             job_master,
             job_status,
             tmodes: None,
@@ -105,21 +113,38 @@ impl JobBuilder {
 }
 
 impl Job {
+    /// Processes that have not completed yet (running or stopped).
+    fn pending_pids(&self) -> impl Iterator<Item = Pid> + '_ {
+        self.job_status
+            .iter()
+            .filter(|(_, status)| !status.is_completed())
+            .map(|(&pid, _)| pid)
+    }
+
+    /// The job's status, once every process completed.
+    fn master_exit(&self) -> JobExit {
+        match self.job_master {
+            JobMaster::NotSpawned(exit) => exit,
+            JobMaster::Process(pid) => JobExit::from_proc_status(self.job_status[&pid])
+                .expect("the job master completed with the rest of the job"),
+        }
+    }
+
+    pub fn completed_or_pending(&self) -> JobProgress {
+        match self.pending_pids().next() {
+            Some(pid) => JobProgress::Pending(pid),
+            None => JobProgress::Completed(self.master_exit()),
+        }
+    }
+
     pub fn completed(&self) -> bool {
-        self.job_status.values().all(|s| s.is_completed())
+        self.pending_pids().next().is_none()
     }
 
     pub fn completed_status(&self) -> Option<JobExit> {
-        if !self.completed() {
-            return None;
-        }
-
-        match self.job_master {
-            JobMaster::Process(pid) => self
-                .job_status
-                .get(&pid)
-                .and_then(|&status| JobExit::from_proc_status(status)),
-            JobMaster::NotSpawned(exit) => Some(exit),
+        match self.completed_or_pending() {
+            JobProgress::Completed(exit) => Some(exit),
+            JobProgress::Pending(_) => None,
         }
     }
 
@@ -144,5 +169,10 @@ impl Job {
                 *s = ProcStatus::Running;
             }
         }
+    }
+
+    pub fn pending(&self) -> Vec<Pid> {
+        // Collected: `update_status` changes the job while going through them.
+        self.pending_pids().collect()
     }
 }
