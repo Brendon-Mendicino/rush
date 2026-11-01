@@ -46,7 +46,7 @@ Problems with this setup, found by reading the code:
 | Built-in | Status |
 |---|---|
 | `cd` | Complete, apart from redirections and pipelines (Phase 0). Tests are in `tests/builtins/cd.rs`. |
-| `exit` | `exit [n]` works through `process::exit`. With no argument it should use `$?`, not 0. It's also broken in pipelines and subshells. |
+| `exit` | `exit [n]` works through `process::exit`. With no argument it should use `$?`, not 0. In a subshell it exits only the subshell (forked child); it's still broken in pipelines (Phase 0.5). |
 | `env` | **Not a POSIX built-in.** It ignores its arguments (`env A=1 cmd` doesn't work), prints unexported variables too, and its order is random (HashMap). → Remove it so `/usr/bin/env` runs. Its listing job belongs to `set` and `export -p`. |
 | all the others | Stubs in `src/builtin/<name>.rs` (synopsis + spec link) that print `rush: <name>: not implemented yet` and return 1. They're listed in `tests/builtins/not_implemented.rs`; remove a name from there once it's implemented. |
 | `exec` | Complete, apart from the special-built-in rules (Phase 0.6) and pipelines (Phase 0.5). Tests are in `tests/builtins/exec.rs`. |
@@ -66,7 +66,7 @@ Problems with this setup, found by reading the code:
 - [x] **0.2 Control-flow result.** `builtin::Status` is `Exited(i32) | Exit(i32) | Return(i32) | Break(n) | Continue(n) | Eval(String) | Exec(Vec<String>)`; `Eval` and `Exec` are already handled. Done: the type. Still to do: the executor unwinds on it (today `Exit`/`Return` map to their code and `Break`/`Continue` to 0), which lets `exit` stop using `process::exit`. `Executor::run` then ends the loop, runs the EXIT trap, and exits with the code.
 - [x] **0.3 Error convention.** Built-ins return `Err(builtin::Error)`, and `builtin::run` writes `rush: <name>: <msg>` on the built-in's stderr with status 1, `Error::new(status, …)` for another status, or 2 for clap usage errors (`--help` → stdout, 0). Use `?`, `.context(what)` on `io::Result`, and `bi.report()` for errors after which the built-in continues. The `128+errno` mapping is gone.
 - [ ] **0.4 Redirections for in-process built-ins.** Before running a built-in, save fds 0/1/2 (and any fd being redirected) with `dup_cloexec(fd, 10)`, apply the redirections with `dup2`, run it, then restore. Alternatively, give the built-in `File`s built from the redirected fds. `exec` with no command is the one case where the redirections stay applied.
-- [ ] **0.5 Built-ins in pipelines.** When a built-in isn't the only command, `fork` (add `nix::fork`). The child sets up its pipe fds, runs the built-in, flushes, and calls `_exit(status)`. The parent treats the child like any spawned process so it joins the job's process group. The `CommandRun::Spawned` path has to accept a `Pid` without a `process::Child`.
+- [ ] **0.5 Built-ins in pipelines.** When a built-in isn't the only command, run it in a forked child. The machinery exists since the forking work: `nix::fork`, `Executor::fork_child` (pipe fds, redirections, job's process group, `_exit(status)`), and a pid-based `Job`/`CommandRun::Spawned`. What's left is the wiring: in `unsub_command`, call `fork_child(SpawnType::Subshell, state, &redirections, |ex| <run the built-in>)` when it is in a pipeline. Built-ins inside `( )`, `&` and `$(...)` already run in a forked child, so they can't change the parent shell (`(cd /)`, `(exit 3)` work).
 - [ ] **0.6 Classification and lookup order.** Keep two tables, `SPECIAL_BUILTINS` and `REGULAR_BUILTINS`. Order: special → (functions, later) → regular → PATH.
   - Special built-ins: assignment prefixes are applied to the shell vars permanently, and an error or redirection error exits a non-interactive shell.
   - Regular built-ins: assignment prefixes are visible only while the built-in runs (save the old values and restore them).
@@ -85,7 +85,7 @@ Problems with this setup, found by reading the code:
 ### Phase 2: job control (needs `&`, a job table, and job IDs)
 `jobs` `fg` `bg` `wait` `kill`
 
-The grammar already parses `AsyncList`. The executor still has to implement it (`List::AsyncList` → `not_implemented("&")`, and `Waiter::wait_inside_async` already exists). On top of that, `Job` needs a job number, the command text, current/previous (`+`/`-`) tracking, a "reported" flag, and the `%`-job-ID parser.
+`&` works: `Executor::async_list` forks the list and stores the job in `Executor::bg_jobs`, which are reaped before each prompt (and before each command when non-interactive). On top of that, `Job` needs a job number, the command text, current/previous (`+`/`-`) tracking, a "reported" flag, and the `%`-job-ID parser.
 
 ### Phase 3: built-ins that need language features
 | Built-in | Needs |
@@ -156,7 +156,8 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] `exit n` ends the shell with status `n`
 - [ ] no `n` → status of the last command (`$?`), not 0
 - [ ] unwind through a control-flow result instead of `std::process::exit`, flushing stdout
-- [ ] in a subshell or a pipeline element, exit only that subshell (`exit 3 | cat` must not kill the shell)
+- [x] in a subshell, exit only that subshell (`(exit 3)`: the subshell is a forked child)
+- [ ] in a pipeline element, exit only that element (`exit 3 | cat` must not kill the shell, Phase 0.5)
 - [ ] run the EXIT trap first, except when `exit` is called from inside the EXIT trap
 - [ ] `n` outside 0–255 or not numeric: the result is unspecified, so print an error and use status 2 (matching dash/bash)
 - [ ] drop clap's `--help`

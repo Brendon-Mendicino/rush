@@ -62,10 +62,11 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 - [ ] Substitution in program name and arguments (`unsub_command`, replace the `todo!()`s)
 
 ## 9. Builtins (`builtin.cpp`)
-- [ ] Dispatch: builtins are checked before exec; run in-process outside pipelines
-- [ ] `cd [dir|~]`: `$HOME` fallback, `too many arguments`, error message on failure
-- [ ] `exit [n]`
-- [ ] `exec cmd args…`: replace the shell process (`CommandExt::exec`) with the shell env
+The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this section only tracks parity with the C++ ones.
+- [ ] Dispatch: builtins are checked before exec (`builtin::BUILTINS`, done); run in-process outside pipelines, in a forked child inside one (`BUILTINS.md` 0.5, still in-process)
+- [x] `cd [dir|~]`: `$HOME` fallback, `too many arguments`, error message on failure (full POSIX `cd`, see `BUILTINS.md`)
+- [ ] `exit [n]` (works through `process::exit`; `$?` default and pipelines still missing)
+- [x] `exec cmd args…`: replace the shell process (`CommandExt::exec`) with the shell env (also `exec` without a command: permanent redirections)
 - [ ] `jobs`: list `bg_jobs` with Stopped/Background state
 - [ ] `fg`: last job → `Waiter::fg`; re-store it if it stops again
 - [ ] `bg`: last job → `Waiter::bg`
