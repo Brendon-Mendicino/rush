@@ -1,5 +1,6 @@
 use crate::executor::Executor;
 
+mod builtin;
 mod cmd_runner;
 mod executor;
 mod job;
