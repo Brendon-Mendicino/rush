@@ -1,8 +1,5 @@
 use std::{
-    collections::{
-        HashMap,
-        hash_map::{self, Entry},
-    },
+    collections::{HashMap, hash_map::Entry},
     env, io,
     os::fd::{AsRawFd, RawFd},
 };
@@ -22,8 +19,8 @@ pub struct Var {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ShellVars {
-    vars: HashMap<String, Var>,
+pub struct ShellEnv {
+    env: HashMap<String, Var>,
 }
 
 #[derive(Debug)]
@@ -35,7 +32,7 @@ pub struct Shell {
     /// Terminal modes of the shell, saved at startup. `None` when the shell is
     /// not interactive or they could not be read.
     pub tmodes: Option<libc::termios>,
-    pub vars: ShellVars,
+    pub env: ShellEnv,
 }
 
 /// Signals ignored by an interactive shell, the children restore them to the default.
@@ -47,7 +44,7 @@ pub const JOB_CONTROL_SIGNALS: [Signal; 5] = [
     Signal::SIGTTOU,
 ];
 
-impl ShellVars {
+impl ShellEnv {
     /// Create the shell variables from the environment of the process. All of them
     /// are marked as external.
     pub fn from_env() -> Self {
@@ -74,7 +71,7 @@ impl ShellVars {
     ) {
         let value = value.into();
 
-        match self.vars.entry(name.into()) {
+        match self.env.entry(name.into()) {
             Entry::Occupied(mut entry) => {
                 let var = entry.get_mut();
                 var.value = value;
@@ -92,11 +89,11 @@ impl ShellVars {
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.vars.get(name).map(|var| var.value.as_str())
+        self.env.get(name).map(|var| var.value.as_str())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Var)> {
-        self.vars.iter().map(|(name, var)| (name.as_str(), var))
+        self.env.iter().map(|(name, var)| (name.as_str(), var))
     }
 
     /// The variables passed down to the environment of the children.
@@ -120,7 +117,7 @@ impl Shell {
             terminal,
             is_interactive,
             tmodes: None,
-            vars: ShellVars::from_env(),
+            env: ShellEnv::from_env(),
         };
 
         if is_interactive {
@@ -199,7 +196,7 @@ mod tests {
 
     #[test]
     fn upsert_keeps_attributes_when_none() {
-        let mut vars = ShellVars::default();
+        let mut vars = ShellEnv::default();
 
         vars.upsert("A", "1", Some(VarAttr { exported: true }));
         vars.upsert("A", "2", None);
@@ -216,7 +213,7 @@ mod tests {
 
     #[test]
     fn env_vars_are_external() {
-        let vars = ShellVars::from_env();
+        let vars = ShellEnv::from_env();
         let path = env::var("PATH").expect("PATH is set in the test environment");
 
         assert_eq!(vars.get("PATH"), Some(path.as_str()));
@@ -225,7 +222,7 @@ mod tests {
 
     #[test]
     fn only_external_vars_are_exported() {
-        let mut vars = ShellVars::default();
+        let mut vars = ShellEnv::default();
 
         vars.upsert("ENV", "1", Some(VarAttr { exported: true }));
         vars.upsert("LOCAL", "2", None);

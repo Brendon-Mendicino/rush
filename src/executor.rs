@@ -1,4 +1,5 @@
 use crate::{
+    builtin::{self, BUILTINS, Builtin, FnBuiltin, Status},
     job::{Job, JobBuilder, JobExit},
     nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
     shell::{JOB_CONTROL_SIGNALS, Shell},
@@ -110,6 +111,32 @@ fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
             JobExit::Exited(1)
         }
     }
+}
+
+/// Lines keep their newline: a continuation line ends with "\\\n" (or "\\\r\n").
+/// Cut it and paste the next line on it.
+fn join_continuations(input: &[String]) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+
+    for line in input {
+        let continued = lines.last_mut().and_then(|previous| {
+            let cut = previous
+                .strip_suffix("\\\n")
+                .or_else(|| previous.strip_suffix("\\\r\n"))?
+                .len();
+            Some((previous, cut))
+        });
+
+        match continued {
+            Some((previous, cut)) => {
+                previous.truncate(cut);
+                previous.push_str(line);
+            }
+            None => lines.push(line.clone()),
+        }
+    }
+
+    lines
 }
 
 #[derive(Debug)]
@@ -336,6 +363,40 @@ impl ApplyerPtr {
     }
 }
 
+// TODO: check this, maybe add a drop trait
+/// Copies of the fds that redirections are about to replace in the shell itself,
+/// to put them back afterwards.
+struct SavedFds(Vec<(RawFd, Option<OwnedFd>)>);
+
+impl SavedFds {
+    /// Save every fd the redirections touch, `None` for the ones that are not open.
+    fn save(redirections: &RedirectController) -> io::Result<Self> {
+        let mut saved = Vec::new();
+
+        for &fd in redirections.redirected.keys() {
+            let copy = if nix::is_valid_fd(fd) {
+                let copy = nix::dup_cloexec(fd, 10)?;
+                Some(unsafe { OwnedFd::from_raw_fd(copy) })
+            } else {
+                None
+            };
+            saved.push((fd, copy));
+        }
+
+        Ok(Self(saved))
+    }
+
+    /// Put the fds back as they were. Nothing more can be done when it fails.
+    fn restore(self) {
+        for (fd, copy) in self.0 {
+            let _ = match copy {
+                Some(copy) => dup2_raw(copy.as_raw_fd(), fd).map(drop),
+                None => close(fd),
+            };
+        }
+    }
+}
+
 impl Executor {
     pub fn new() -> Self {
         Self {
@@ -343,6 +404,54 @@ impl Executor {
             shell: Shell::new(),
             bg_jobs: Vec::new(),
         }
+    }
+
+    fn builtin_from_simple_command(
+        &mut self,
+        cmd: &SimpleCommand,
+        fn_builtin: FnBuiltin,
+        in_pipeline: bool,
+    ) -> CommandRun {
+        let mut redirect_controller = RedirectController::default();
+
+        if let Err(e) = redirect_controller.add_redirects(&cmd.redirections) {
+            eprintln!("rush: {e}");
+            return CommandRun::Done(JobExit::Exited(1));
+        }
+
+        let mut stdin = std::io::stdin();
+        let mut stdout = std::io::stdout();
+        let mut stderr = std::io::stderr();
+
+        let prog = vec![cmd.program.as_str()];
+        let prog_args = cmd.arguments.iter().map(|s| s.as_str()).collect();
+        let args = vec![prog, prog_args].concat();
+
+        let builtin = Builtin {
+            stdin: &mut stdin,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            args: &args,
+            shell: &mut self.shell,
+        };
+
+        let exit = match builtin::run(fn_builtin, builtin) {
+            Status::Exited(code) => JobExit::Exited(code),
+            Status::Eval(program) => match self.execute_str(&program) {
+                ExecStatus::Exited(code) => JobExit::Exited(code),
+                // Keeps an interruption visible to the and-or list around `eval`.
+                ExecStatus::Signaled(sig) => JobExit::Signaled(sig),
+                // The job is already in the background jobs.
+                status @ ExecStatus::Stopped(_) => JobExit::Exited(status.code()),
+            },
+            Status::Exec(argv) => self.exec(cmd, &argv, &redirect_controller, in_pipeline),
+            // TODO: unwind the loops, functions and the shell. No built-in returns
+            // these yet.
+            Status::Exit(code) | Status::Return(code) => JobExit::Exited(code),
+            Status::Break(_) | Status::Continue(_) => JobExit::Exited(0),
+        };
+
+        CommandRun::Done(exit)
     }
 
     /// Spawn an external command. When it cannot be spawned the error is reported
@@ -358,15 +467,7 @@ impl Executor {
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
 
-        // The environment is the exported shell variables plus the command's
-        // `VAR=x` prefixes. `env` keeps the last value of a key, so a prefix
-        // overrides a shell variable and the last prefix wins. The program is
-        // looked up in this `PATH`.
-        command.env_clear();
-        command.envs(self.shell.vars.exported());
-        for assignment in &cmd.envs {
-            command.env(assignment.key, assignment.value_text());
-        }
+        self.set_command_env(&mut command, &cmd.envs);
 
         // An interactive shell puts every job in its own process group, the first
         // command of the pipeline becomes the leader (0 = use its own pid).
@@ -458,6 +559,91 @@ impl Executor {
             pgid,
             stdout: child.stdout.take().map(OwnedFd::from),
         })
+    }
+
+    /// The environment of a program: the exported shell variables plus the
+    /// command's `VAR=x` prefixes. `env` keeps the last value of a key, so a prefix
+    /// overrides a shell variable and the last prefix wins. The program is looked up
+    /// in this `PATH`.
+    fn set_command_env(&self, command: &mut process::Command, assignments: &[AssignmentWord]) {
+        command.env_clear();
+        command.envs(self.shell.env.exported());
+        for assignment in assignments {
+            command.env(assignment.key, assignment.value_text());
+        }
+    }
+
+    // TODO: check this
+    /// `exec`: without a command, make the redirections permanent in the shell;
+    /// otherwise replace the shell with the command. Returns only when the command
+    /// could not be run, after putting the shell back as it was.
+    fn exec(
+        &self,
+        cmd: &SimpleCommand,
+        argv: &[String],
+        redirections: &RedirectController,
+        in_pipeline: bool,
+    ) -> JobExit {
+        // Built-ins don't get a process of their own in a pipeline yet: the whole
+        // shell would be replaced.
+        if in_pipeline {
+            eprintln!("rush: exec: not supported in a pipeline yet");
+            return JobExit::Exited(1);
+        }
+
+        // What the shell already wrote goes where it was meant to.
+        let _ = io::stdout().flush();
+
+        let Some((program, arguments)) = argv.split_first() else {
+            return match redirections.get_applyer().apply() {
+                Ok(()) => JobExit::Exited(0),
+                Err(e) => {
+                    eprintln!("rush: exec: {}", nix::error_message(&e));
+                    JobExit::Exited(1)
+                }
+            };
+        };
+
+        let saved = match SavedFds::save(redirections) {
+            Ok(saved) => saved,
+            Err(e) => {
+                eprintln!("rush: exec: {}", nix::error_message(&e));
+                return JobExit::Exited(1);
+            }
+        };
+        if let Err(e) = redirections.get_applyer().apply() {
+            saved.restore();
+            eprintln!("rush: exec: {}", nix::error_message(&e));
+            return JobExit::Exited(1);
+        }
+
+        let mut command = process::Command::new(program);
+        command.args(arguments);
+        self.set_command_env(&mut command, &cmd.envs);
+
+        // The program gets the default handling of the signals the shell ignores,
+        // it keeps the shell's process group and terminal.
+        self.set_job_control_signals(SigHandler::Default);
+
+        let err = command.exec();
+
+        self.set_job_control_signals(SigHandler::Ignore);
+        saved.restore();
+
+        spawn_failure(program, &err)
+    }
+
+    /// Set the handling of the signals an interactive shell ignores.
+    fn set_job_control_signals(&self, handler: SigHandler) {
+        if !self.shell.is_interactive {
+            return;
+        }
+
+        for sig in JOB_CONTROL_SIGNALS {
+            if let Err(e) = nix::signal(sig, handler) {
+                eprintln!("signal({sig:?}): {e}");
+            }
+        }
     }
 
     /// Fork a shell that runs `body` (shell code, not a program) and exits with
@@ -731,7 +917,16 @@ impl Executor {
             envs: cmd.envs.clone(),
         };
 
-        self.simple_command(&expanded, state)
+        // TODO: check this
+        match BUILTINS.get(expanded.program.as_str()) {
+            Some(builtin) => {
+                // A pipeline of more than one command: the first ones write into a
+                // pipe, the others read from the previous command.
+                let in_pipeline = state.inside_pipeline || state.stdin.is_some();
+                self.builtin_from_simple_command(&expanded, *builtin, in_pipeline)
+            }
+            None => self.simple_command(&expanded, state),
+        }
     }
 
     /// `a=1 b=2` with no command: set the shell variables.
@@ -758,7 +953,7 @@ impl Executor {
         // `None` keeps the attributes of an existing variable: assigning an
         // exported variable changes the environment of the next commands.
         for var in &assignment.envs {
-            self.shell.vars.upsert(var.key, var.value_text(), None);
+            self.shell.env.upsert(var.key, var.value_text(), None);
         }
 
         CommandRun::Done(JobExit::Exited(0))
@@ -948,36 +1143,23 @@ impl Executor {
         }
     }
 
-    fn process_input(&self) -> Vec<String> {
-        let mut lines = Vec::<String>::new();
+    /// Run the lines read from the input.
+    fn execute(&mut self) -> ExecStatus {
+        let input = join_continuations(&self.input_buffer);
 
-        // Lines keep their newline: a continuation line ends with "\\\n" (or "\\\r\n").
-        // Cut it and paste the next line on it.
-        for line in &self.input_buffer {
-            let continued = lines.last_mut().and_then(|previous| {
-                let cut = previous
-                    .strip_suffix("\\\n")
-                    .or_else(|| previous.strip_suffix("\\\r\n"))?
-                    .len();
-                Some((previous, cut))
-            });
-
-            match continued {
-                Some((previous, cut)) => {
-                    previous.truncate(cut);
-                    previous.push_str(line);
-                }
-                None => lines.push(line.clone()),
-            }
-        }
-
-        lines
+        self.execute_lines(&input)
     }
 
-    fn execute(&mut self) -> ExecStatus {
-        let input = self.process_input();
+    /// Run a program given as a string, like `eval` does.
+    fn execute_str(&mut self, program: &str) -> ExecStatus {
+        let lines: Vec<String> = program.split_inclusive('\n').map(String::from).collect();
+        let input = join_continuations(&lines);
 
-        let tokenizer = BufTokenizer::from_buffer(&input);
+        self.execute_lines(&input)
+    }
+
+    fn execute_lines(&mut self, input: &[String]) -> ExecStatus {
+        let tokenizer = BufTokenizer::from_buffer(input);
 
         if tokenizer.next_is_eof() {
             return ExecStatus::SUCCESS;

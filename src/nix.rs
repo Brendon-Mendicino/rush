@@ -94,6 +94,7 @@ pub enum Signal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(unused)]
 pub enum WaitPid {
     Any,
     CallerGroup,

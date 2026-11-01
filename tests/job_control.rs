@@ -76,7 +76,7 @@ fn foreground_job_gets_its_own_group_and_the_terminal() {
     assert_ne!(pgrp, sh.pid(), "the job is not in the shell's group");
     assert_eq!(tpgid, pgrp, "the job owns the terminal");
 
-    sh.send("true | cat /proc/self/stat\n");
+    sh.send("sleep 0 | cat /proc/self/stat\n");
     let (pid, pgrp, tpgid) = stat_ids(&sh.expect_prompt());
     assert_ne!(
         pgrp, pid,

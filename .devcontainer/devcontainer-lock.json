@@ -1,0 +1,9 @@
+{
+  "features": {
+    "ghcr.io/devcontainer-config/features/dot-config:5": {
+      "version": "5.0.0",
+      "resolved": "ghcr.io/devcontainer-config/features/dot-config@sha256:dfbe76767fb0e284f078a06e7857734cc765daf5ae4e5c4ea4152105e861dd0b",
+      "integrity": "sha256:dfbe76767fb0e284f078a06e7857734cc765daf5ae4e5c4ea4152105e861dd0b"
+    }
+  }
+}
