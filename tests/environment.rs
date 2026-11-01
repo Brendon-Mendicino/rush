@@ -58,6 +58,13 @@ fn new_assignment_is_not_exported() {
 }
 
 #[test]
+fn assignment_at_the_end_of_a_pipeline_does_not_affect_the_shell() {
+    let output = run_with_outer("echo | RUSH_OUTER=changed\nprintenv RUSH_OUTER\n");
+
+    assert_eq!(stdout(&output), "outer\n");
+}
+
+#[test]
 fn assignment_in_a_pipeline_does_not_affect_the_shell() {
     // `cat` reads an empty input: if it inherited the shell's stdin it would
     // swallow the next line.

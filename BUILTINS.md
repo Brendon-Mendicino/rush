@@ -36,7 +36,7 @@ The dispatch is `Executor::unsub_command` → `BUILTINS.get(name)` → `builtin_
 
 Problems with this setup, found by reading the code:
 1. **Redirections are ignored.** `RedirectController` opens the files, but the built-in never sees them: `cd >x` creates `x`, and the output still goes to the terminal.
-2. **Pipelines are wrong.** A built-in in a pipeline runs in the shell and returns `CommandRun::Done`, so the next command reads `/dev/null` and the built-in's output goes to the terminal. `exit | cat` kills the interactive shell, and `cd /tmp | cat` changes the shell's directory. POSIX runs each command of a multi-command pipeline in a subshell.
+2. ~~Pipelines are wrong.~~ Done: in a pipeline of more than one command a built-in runs in a forked child (0.5), so `exit 1 | cat` and `cd /tmp | cat` don't affect the shell and its output goes into the pipe. Outside a pipeline it runs in the shell, where its redirections are still ignored (problem 1).
 3. **`VAR=x` prefixes are dropped** for built-ins (`cmd.envs` isn't used).
 4. ~~Built-ins can't change shell state.~~ Done: `Builtin` now carries `shell: &mut Shell`. The job table (`Executor::bg_jobs`) still can't be reached.
 5. ~~Errors are silent and map to odd codes.~~ Done: built-ins return `Result<Status, Error>` and `builtin::run` reports errors centrally (see 0.3).
@@ -46,10 +46,10 @@ Problems with this setup, found by reading the code:
 | Built-in | Status |
 |---|---|
 | `cd` | Complete, apart from redirections and pipelines (Phase 0). Tests are in `tests/builtins/cd.rs`. |
-| `exit` | `exit [n]` works through `process::exit`. With no argument it should use `$?`, not 0. In a subshell it exits only the subshell (forked child); it's still broken in pipelines (Phase 0.5). |
+| `exit` | `exit [n]` returns `Status::Exit`, and the executor ends the current process: the shell, or only the forked child in a subshell or a pipeline. With no argument it should use `$?`, not 0. Tests are in `tests/builtins/exit.rs`. |
 | `env` | **Not a POSIX built-in.** It ignores its arguments (`env A=1 cmd` doesn't work), prints unexported variables too, and its order is random (HashMap). → Remove it so `/usr/bin/env` runs. Its listing job belongs to `set` and `export -p`. |
 | all the others | Stubs in `src/builtin/<name>.rs` (synopsis + spec link) that print `rush: <name>: not implemented yet` and return 1. They're listed in `tests/builtins/not_implemented.rs`; remove a name from there once it's implemented. |
-| `exec` | Complete, apart from the special-built-in rules (Phase 0.6) and pipelines (Phase 0.5). Tests are in `tests/builtins/exec.rs`. |
+| `exec` | Complete, apart from the special-built-in rules (Phase 0.6). In a pipeline it replaces only that command's child. Tests are in `tests/builtins/exec.rs`. |
 | `eval` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/eval.rs`. |
 | `:` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/colon.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
@@ -66,7 +66,8 @@ Problems with this setup, found by reading the code:
 - [x] **0.2 Control-flow result.** `builtin::Status` is `Exited(i32) | Exit(i32) | Return(i32) | Break(n) | Continue(n) | Eval(String) | Exec(Vec<String>)`; `Eval` and `Exec` are already handled. Done: the type. Still to do: the executor unwinds on it (today `Exit`/`Return` map to their code and `Break`/`Continue` to 0), which lets `exit` stop using `process::exit`. `Executor::run` then ends the loop, runs the EXIT trap, and exits with the code.
 - [x] **0.3 Error convention.** Built-ins return `Err(builtin::Error)`, and `builtin::run` writes `rush: <name>: <msg>` on the built-in's stderr with status 1, `Error::new(status, …)` for another status, or 2 for clap usage errors (`--help` → stdout, 0). Use `?`, `.context(what)` on `io::Result`, and `bi.report()` for errors after which the built-in continues. The `128+errno` mapping is gone.
 - [ ] **0.4 Redirections for in-process built-ins.** Before running a built-in, save fds 0/1/2 (and any fd being redirected) with `dup_cloexec(fd, 10)`, apply the redirections with `dup2`, run it, then restore. Alternatively, give the built-in `File`s built from the redirected fds. `exec` with no command is the one case where the redirections stay applied.
-- [ ] **0.5 Built-ins in pipelines.** When a built-in isn't the only command, run it in a forked child. The machinery exists since the forking work: `nix::fork`, `Executor::fork_child` (pipe fds, redirections, job's process group, `_exit(status)`), and a pid-based `Job`/`CommandRun::Spawned`. What's left is the wiring: in `unsub_command`, call `fork_child(SpawnType::Subshell, state, &redirections, |ex| <run the built-in>)` when it is in a pipeline. Built-ins inside `( )`, `&` and `$(...)` already run in a forked child, so they can't change the parent shell (`(cd /)`, `(exit 3)` work).
+- [x] **0.5 Built-ins in pipelines.** When a built-in isn't the only command (`PipelineState::in_pipeline`, set once by `schedule_pipeline` for every command of a pipeline of more than one), `unsub_command` runs it through `fork_child`, which sets up the pipe fds, applies its redirections, puts it in the job's process group and ends it with `_exit(status)`. `Executor::run_builtin` itself doesn't know about pipelines. Built-ins inside `( )`, `&` and `$(...)` run in a forked child too. Tests are in `tests/builtins/pipeline.rs`.
+  - Caveat for `read`: a forked child inherits the parent's buffered `io::stdin()`, which holds lines of the script the REPL has read ahead. A built-in reading its input in a pipeline must read fd 0 directly, not through the global buffered stdin.
 - [ ] **0.6 Classification and lookup order.** Keep two tables, `SPECIAL_BUILTINS` and `REGULAR_BUILTINS`. Order: special → (functions, later) → regular → PATH.
   - Special built-ins: assignment prefixes are applied to the shell vars permanently, and an error or redirection error exits a non-interactive shell.
   - Regular built-ins: assignment prefixes are visible only while the built-in runs (save the old values and restore them).
@@ -149,7 +150,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] command not found → 127; not executable → 126; the shell goes on with its fds and signals put back (`SavedFds`)
 - [x] a leading `--` is skipped
 - [ ] a failed exec or redirection error exits a non-interactive shell (status 1–125 for redirections; Phase 0.6)
-- [ ] inside a multi-command pipeline it is refused for now (built-ins aren't forked yet, Phase 0.5)
+- [x] inside a multi-command pipeline it replaces only that command's child (`exec echo a | cat`)
 - [ ] `exec <file`: the shell reads its own commands through a buffered stdin, so lines already buffered from the old stdin still run first; `exec cmd` loses them (needs unbuffered reading of the input, like `read`)
 
 #### `exit [n]`
@@ -157,7 +158,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] no `n` → status of the last command (`$?`), not 0
 - [ ] unwind through a control-flow result instead of `std::process::exit`, flushing stdout
 - [x] in a subshell, exit only that subshell (`(exit 3)`: the subshell is a forked child)
-- [ ] in a pipeline element, exit only that element (`exit 3 | cat` must not kill the shell, Phase 0.5)
+- [x] in a pipeline element, exit only that element (`exit 3 | cat` and `cat | exit 3` don't kill the shell)
 - [ ] run the EXIT trap first, except when `exit` is called from inside the EXIT trap
 - [ ] `n` outside 0–255 or not numeric: the result is unspecified, so print an error and use status 2 (matching dash/bash)
 - [ ] drop clap's `--help`
@@ -251,7 +252,8 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] `cd dir`, `cd` → `$HOME`, `cd -` → `$OLDPWD`
 - [x] step 9: a curpath of `PATH_MAX` or more is made relative to `PWD`
 - [x] a stale `PWD` inherited from the environment is ignored (falls back to `getcwd`)
-- [ ] `cd >file` and `cd x | cat` (needs Phase 0.4/0.5)
+- [x] `cd x | cat` doesn't change the shell's directory (0.5)
+- [ ] `cd >file` (needs Phase 0.4)
 - [x] HOME unset or empty and no operand: the behavior is implementation-defined; print an error and return 1 instead of calling `chdir("")`
 - [x] CDPATH search when the operand doesn't start with `/`, `.` or `..` (an empty entry means `.`); print the new directory when a non-empty CDPATH entry was used
 - [x] `-L` (default): build `curpath` from `$PWD` + the operand, canonicalize it logically (drop `.`, fold `x/..`, and check that `x` is a directory before folding)
@@ -326,7 +328,8 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] `-L` (default): print `$PWD` if it is absolute, has no `.`/`..`, and names the cwd; otherwise behave like `-P`
 - [x] `-P`: `getcwd` (`env::current_dir`) without symlinks
 - [x] last of `-L`/`-P` wins; on error, print nothing to stdout, write `rush: pwd: <strerror>` and return 1
-- [ ] `pwd >file` and `pwd | cat` (needs Phase 0.4/0.5)
+- [x] `pwd | cat`, and `pwd >file | cat` (in a pipeline the child applies the redirections, 0.5)
+- [ ] `pwd >file` outside a pipeline (needs Phase 0.4)
 
 #### `read [-r] var...`
 - [ ] read one logical line from fd 0 **without over-reading** (byte by byte, or through the shared REPL reader when stdin is the script)
@@ -335,7 +338,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] invalid var name → error
 - [ ] assigning to a readonly variable → error
 - [ ] EOF before a newline → still assign what was read, then status >0
-- [ ] inside a pipeline or subshell it changes only that subshell (falls out of 0.5)
+- [ ] inside a pipeline or subshell it changes only that subshell (falls out of 0.5; mind the stdin caveat there)
 
 #### `true`
 - [x] built in, returns 0; arguments are ignored

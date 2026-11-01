@@ -12,6 +12,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, Read, Write},
+    iter,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{fs::OpenOptionsExt, process::CommandExt},
@@ -147,13 +148,24 @@ pub struct Executor {
     bg_jobs: Vec<Job>,
 }
 
+/// Where a command's stdout goes.
+#[derive(Debug)]
+enum Output {
+    /// The shell's stdout.
+    Inherit,
+    /// A new pipe to the next command of the pipeline.
+    Pipe,
+    /// This fd (`$(...)`'s pipe).
+    Fd(OwnedFd),
+}
+
 struct PipelineState {
     /// Input of the command: the output of the previous command of the pipeline.
     stdin: Option<OwnedFd>,
-    /// Output of the command, when it is not the shell's (`$(...)`). Inside a
-    /// pipeline the output is a new pipe to the next command instead.
-    stdout: Option<OwnedFd>,
-    inside_pipeline: bool,
+    stdout: Output,
+    /// The pipeline has more than one command: each runs in a process of its own
+    /// (POSIX §2.12), so built-ins and assignments must not touch the shell.
+    in_pipeline: bool,
     /// The job gets the terminal (interactive only).
     is_foreground: bool,
     pipeline_pgid: Option<Pid>,
@@ -332,6 +344,19 @@ impl RedirectController {
 
         Ok(())
     }
+
+    fn from_redirects(redirections: &[Redirect]) -> Result<Self, RedirectError> {
+        let mut controller = Self::default();
+        controller.add_redirects(redirections)?;
+        Ok(controller)
+    }
+}
+
+/// Report a redirection that cannot be set up: the command does not run, its
+/// status is 1.
+fn redirection_failure(e: RedirectError) -> CommandRun {
+    eprintln!("rush: {e}");
+    CommandRun::Done(JobExit::Exited(1))
 }
 
 impl RedirectionApplyer {
@@ -363,9 +388,8 @@ impl ApplyerPtr {
     }
 }
 
-// TODO: check this, maybe add a drop trait
-/// Copies of the fds that redirections are about to replace in the shell itself,
-/// to put them back afterwards.
+/// Copies of the fds that redirections are about to replace in the shell itself.
+/// They are put back when the guard is dropped.
 struct SavedFds(Vec<(RawFd, Option<OwnedFd>)>);
 
 impl SavedFds {
@@ -385,10 +409,12 @@ impl SavedFds {
 
         Ok(Self(saved))
     }
+}
 
+impl Drop for SavedFds {
     /// Put the fds back as they were. Nothing more can be done when it fails.
-    fn restore(self) {
-        for (fd, copy) in self.0 {
+    fn drop(&mut self) {
+        for (fd, copy) in self.0.drain(..) {
             let _ = match copy {
                 Some(copy) => dup2_raw(copy.as_raw_fd(), fd).map(drop),
                 None => close(fd),
@@ -406,28 +432,24 @@ impl Executor {
         }
     }
 
-    fn builtin_from_simple_command(
+    /// Run a built-in in the current process: the shell, or the child a pipeline
+    /// command runs in. `redirections` are only used by `exec`, which applies
+    /// them to the process itself.
+    fn run_builtin(
         &mut self,
         cmd: &SimpleCommand,
-        fn_builtin: FnBuiltin,
-        in_pipeline: bool,
-    ) -> CommandRun {
-        let mut redirect_controller = RedirectController::default();
+        builtin: FnBuiltin,
+        redirections: &RedirectController,
+    ) -> JobExit {
+        let args: Vec<&str> = iter::once(cmd.program.as_str())
+            .chain(cmd.arguments.iter().map(String::as_str))
+            .collect();
 
-        if let Err(e) = redirect_controller.add_redirects(&cmd.redirections) {
-            eprintln!("rush: {e}");
-            return CommandRun::Done(JobExit::Exited(1));
-        }
+        let mut stdin = io::stdin();
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
 
-        let mut stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
-        let mut stderr = std::io::stderr();
-
-        let prog = vec![cmd.program.as_str()];
-        let prog_args = cmd.arguments.iter().map(|s| s.as_str()).collect();
-        let args = vec![prog, prog_args].concat();
-
-        let builtin = Builtin {
+        let bi = Builtin {
             stdin: &mut stdin,
             stdout: &mut stdout,
             stderr: &mut stderr,
@@ -435,7 +457,7 @@ impl Executor {
             shell: &mut self.shell,
         };
 
-        let exit = match builtin::run(fn_builtin, builtin) {
+        match builtin::run(builtin, bi) {
             Status::Exited(code) => JobExit::Exited(code),
             Status::Eval(program) => match self.execute_str(&program) {
                 ExecStatus::Exited(code) => JobExit::Exited(code),
@@ -444,25 +466,27 @@ impl Executor {
                 // The job is already in the background jobs.
                 status @ ExecStatus::Stopped(_) => JobExit::Exited(status.code()),
             },
-            Status::Exec(argv) => self.exec(cmd, &argv, &redirect_controller, in_pipeline),
-            // TODO: unwind the loops, functions and the shell. No built-in returns
-            // these yet.
-            Status::Exit(code) | Status::Return(code) => JobExit::Exited(code),
+            Status::Exec(argv) => self.exec(&cmd.envs, &argv, redirections),
+            // Leave the current process: the shell itself, or the forked child of
+            // a pipeline command, a subshell, `&` or `$(...)`.
+            // TODO: unwind instead, for the EXIT trap (BUILTINS.md 0.2).
+            Status::Exit(code) => {
+                let _ = io::stdout().flush();
+                nix::_exit(code)
+            }
+            // TODO: unwind the loops and functions. No built-in returns these yet.
+            Status::Return(code) => JobExit::Exited(code),
             Status::Break(_) | Status::Continue(_) => JobExit::Exited(0),
-        };
-
-        CommandRun::Done(exit)
+        }
     }
 
     /// Spawn an external command. When it cannot be spawned the error is reported
     /// and the command's status is returned instead.
     fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> CommandRun {
-        let mut redirect_controller = RedirectController::default();
-
-        if let Err(e) = redirect_controller.add_redirects(&cmd.redirections) {
-            eprintln!("rush: {e}");
-            return CommandRun::Done(JobExit::Exited(1));
-        }
+        let redirect_controller = match RedirectController::from_redirects(&cmd.redirections) {
+            Ok(controller) => controller,
+            Err(e) => return redirection_failure(e),
+        };
 
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
@@ -507,11 +531,15 @@ impl Executor {
             command.stdin(Stdio::from(stdin));
         }
 
-        // We use this to chain the processes in a pipeline
-        if state.inside_pipeline {
-            command.stdout(Stdio::piped());
-        } else if let Some(stdout) = state.stdout {
-            command.stdout(Stdio::from(stdout));
+        match state.stdout {
+            Output::Inherit => {}
+            // We use this to chain the processes in a pipeline
+            Output::Pipe => {
+                command.stdout(Stdio::piped());
+            }
+            Output::Fd(fd) => {
+                command.stdout(Stdio::from(fd));
+            }
         }
 
         let applyer = Box::new(redirect_controller.get_applyer());
@@ -573,24 +601,16 @@ impl Executor {
         }
     }
 
-    // TODO: check this
-    /// `exec`: without a command, make the redirections permanent in the shell;
-    /// otherwise replace the shell with the command. Returns only when the command
-    /// could not be run, after putting the shell back as it was.
+    /// `exec`: without a command, make the redirections permanent in the current
+    /// process; otherwise replace the process with the command. Returns only when
+    /// the command could not be run, after putting the process back as it was.
+    /// In a forked child (a pipeline command) this affects only the child.
     fn exec(
         &self,
-        cmd: &SimpleCommand,
+        envs: &[AssignmentWord],
         argv: &[String],
         redirections: &RedirectController,
-        in_pipeline: bool,
     ) -> JobExit {
-        // Built-ins don't get a process of their own in a pipeline yet: the whole
-        // shell would be replaced.
-        if in_pipeline {
-            eprintln!("rush: exec: not supported in a pipeline yet");
-            return JobExit::Exited(1);
-        }
-
         // What the shell already wrote goes where it was meant to.
         let _ = io::stdout().flush();
 
@@ -612,14 +632,15 @@ impl Executor {
             }
         };
         if let Err(e) = redirections.get_applyer().apply() {
-            saved.restore();
+            // Put stderr back before reporting.
+            drop(saved);
             eprintln!("rush: exec: {}", nix::error_message(&e));
             return JobExit::Exited(1);
         }
 
         let mut command = process::Command::new(program);
         command.args(arguments);
-        self.set_command_env(&mut command, &cmd.envs);
+        self.set_command_env(&mut command, envs);
 
         // The program gets the default handling of the signals the shell ignores,
         // it keeps the shell's process group and terminal.
@@ -628,7 +649,8 @@ impl Executor {
         let err = command.exec();
 
         self.set_job_control_signals(SigHandler::Ignore);
-        saved.restore();
+        // Put the fds back before reporting.
+        drop(saved);
 
         spawn_failure(program, &err)
     }
@@ -664,29 +686,28 @@ impl Executor {
         let PipelineState {
             stdin,
             stdout,
-            inside_pipeline,
+            in_pipeline: _,
             is_foreground,
             pipeline_pgid,
         } = state;
 
-        let mut redirect_controller = RedirectController::default();
-        if let Err(e) = redirect_controller.add_redirects(redirections) {
-            eprintln!("rush: {e}");
-            return CommandRun::Done(JobExit::Exited(1));
-        }
+        let redirect_controller = match RedirectController::from_redirects(redirections) {
+            Ok(controller) => controller,
+            Err(e) => return redirection_failure(e),
+        };
 
         // Inside a pipeline the child writes to a new pipe, whose read end is the
         // input of the next command.
-        let (next_stdin, stdout) = if inside_pipeline {
-            match io::pipe() {
+        let (next_stdin, stdout) = match stdout {
+            Output::Inherit => (None, None),
+            Output::Pipe => match io::pipe() {
                 Ok((reader, writer)) => (Some(OwnedFd::from(reader)), Some(OwnedFd::from(writer))),
                 Err(e) => {
                     eprintln!("rush: pipe: {}", nix::error_message(&e));
                     return CommandRun::Done(JobExit::Exited(1));
                 }
-            }
-        } else {
-            (None, stdout)
+            },
+            Output::Fd(fd) => (None, Some(fd)),
         };
 
         // Anything still buffered would be written by both processes.
@@ -826,8 +847,8 @@ impl Executor {
         let state = PipelineState {
             // POSIX: without job control an async list reads from /dev/null.
             stdin: (!self.shell.is_interactive).then(dev_null).flatten(),
-            stdout: None,
-            inside_pipeline: false,
+            stdout: Output::Inherit,
+            in_pipeline: false,
             is_foreground: false,
             pipeline_pgid: None,
         };
@@ -857,8 +878,8 @@ impl Executor {
 
         let state = PipelineState {
             stdin: None,
-            stdout: Some(writer.into()),
-            inside_pipeline: false,
+            stdout: Output::Fd(writer.into()),
+            in_pipeline: false,
             is_foreground: true,
             pipeline_pgid: None,
         };
@@ -917,15 +938,27 @@ impl Executor {
             envs: cmd.envs.clone(),
         };
 
-        // TODO: check this
         match BUILTINS.get(expanded.program.as_str()) {
-            Some(builtin) => {
-                // A pipeline of more than one command: the first ones write into a
-                // pipe, the others read from the previous command.
-                let in_pipeline = state.inside_pipeline || state.stdin.is_some();
-                self.builtin_from_simple_command(&expanded, *builtin, in_pipeline)
-            }
             None => self.simple_command(&expanded, state),
+            // A built-in in a pipeline gets its own process like any other command:
+            // it must not change or exit the shell. `fork_child` applies its
+            // redirections to the child, nothing is left for `exec` to apply.
+            Some(&builtin) if state.in_pipeline => self.fork_child(
+                SpawnType::Subshell,
+                state,
+                &expanded.redirections,
+                |executor| {
+                    executor
+                        .run_builtin(&expanded, builtin, &RedirectController::default())
+                        .into()
+                },
+            ),
+            Some(&builtin) => match RedirectController::from_redirects(&expanded.redirections) {
+                Ok(redirections) => {
+                    CommandRun::Done(self.run_builtin(&expanded, builtin, &redirections))
+                }
+                Err(e) => redirection_failure(e),
+            },
         }
     }
 
@@ -938,15 +971,13 @@ impl Executor {
         // The redirections are still performed (`a=1 >file` creates the file),
         // and when they fail the variables are left untouched. The files are
         // closed when the controller is dropped.
-        let mut redirect_controller = RedirectController::default();
-        if let Err(e) = redirect_controller.add_redirects(&assignment.redirections) {
-            eprintln!("rush: {e}");
-            return CommandRun::Done(JobExit::Exited(1));
+        if let Err(e) = RedirectController::from_redirects(&assignment.redirections) {
+            return redirection_failure(e);
         }
 
         // Each command of a pipeline runs in its own process: the assignment
         // would only change a child's variables, which are thrown away.
-        if state.inside_pipeline {
+        if state.in_pipeline {
             return CommandRun::Done(JobExit::Exited(0));
         }
 
@@ -973,6 +1004,7 @@ impl Executor {
             "A pipeline must always contain something"
         );
 
+        let in_pipeline = pipeline.cmds.len() > 1;
         // Decided by the first spawned command, the others join its group.
         let mut pipeline_pgid = None;
         let mut stdin = None;
@@ -983,28 +1015,32 @@ impl Executor {
         for cmd in inner_cmds {
             let state = PipelineState {
                 stdin: stdin.take(),
-                stdout: None,
-                inside_pipeline: true,
+                stdout: Output::Pipe,
+                in_pipeline,
                 is_foreground,
                 pipeline_pgid,
             };
 
-            stdin = match self.command(cmd, state) {
+            let result = self.command(cmd, state);
+
+            match result {
                 CommandRun::Spawned(Spawned { pid, pgid, stdout }) => {
                     pipeline_pgid = Some(pgid);
                     job_builder.add_job(pid);
-                    stdout
+                    stdin = stdout;
                 }
                 // The next command reads from a command that wrote nothing. It must
                 // not inherit the shell's stdin.
-                CommandRun::Done(_) => dev_null(),
-            };
+                CommandRun::Done(_) => {
+                    stdin = dev_null();
+                }
+            }
         }
 
         let state = PipelineState {
             stdin,
-            stdout: None,
-            inside_pipeline: false,
+            stdout: Output::Inherit,
+            in_pipeline,
             is_foreground,
             pipeline_pgid,
         };

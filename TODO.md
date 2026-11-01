@@ -54,7 +54,7 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 - [x] Subshell `( list )`: apply redirections, run list in child, `_exit(status)`
 - [x] Async list `list &`: child in its own pgid, never takes the terminal; parent prints `<pid>: Background` and stores the job in `bg_jobs`. The child runs without job control, so it waits its commands until they complete (stops are not reported) (the C++ `wait_inside_async`)
 - [x] Command substitution `$(...)`: pipe child stdout, run list, read all output, strip **all** trailing `\n` (POSIX; the C++ stripped one), wait the child
-- [ ] Builtins inside a pipeline run in a forked child (with `fork_child`, once §9 has builtins)
+- [x] Builtins inside a pipeline run in a forked child (`fork_child`, decided by `PipelineState::in_pipeline`)
 - [x] Beyond the C++: forked children run without job control (`is_interactive = false`: their commands stay in the job's group, they never touch the terminal); without job control jobs are waited by pid, not by group (`Waiter::wait_completed`, `update_status`), so a background job sharing the shell's group cannot be reaped by a foreground wait; background jobs are reaped before each command in non-interactive mode too
 
 ## 8. Variable substitution
@@ -63,9 +63,9 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 
 ## 9. Builtins (`builtin.cpp`)
 The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this section only tracks parity with the C++ ones.
-- [ ] Dispatch: builtins are checked before exec (`builtin::BUILTINS`, done); run in-process outside pipelines, in a forked child inside one (`BUILTINS.md` 0.5, still in-process)
+- [x] Dispatch: builtins are checked before exec (`builtin::BUILTINS`); run in-process outside pipelines, in a forked child inside one
 - [x] `cd [dir|~]`: `$HOME` fallback, `too many arguments`, error message on failure (full POSIX `cd`, see `BUILTINS.md`)
-- [ ] `exit [n]` (works through `process::exit`; `$?` default and pipelines still missing)
+- [ ] `exit [n]` (returns `Status::Exit`, exits only a subshell or pipeline child; the `$?` default is still missing)
 - [x] `exec cmd args…`: replace the shell process (`CommandExt::exec`) with the shell env (also `exec` without a command: permanent redirections)
 - [ ] `jobs`: list `bg_jobs` with Stopped/Background state
 - [ ] `fg`: last job → `Waiter::fg`; re-store it if it stops again

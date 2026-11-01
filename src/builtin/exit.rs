@@ -1,4 +1,4 @@
-use crate::builtin::{Builtin, BuiltinResult};
+use crate::builtin::{Builtin, BuiltinResult, Status};
 use clap::Parser;
 
 /// Ma io che ne so
@@ -13,6 +13,7 @@ pub fn exit(bi: &mut Builtin) -> BuiltinResult {
 
     let code = args.code.unwrap_or(0);
 
-    // TODO: return `Status::Exit(code)` once the executor unwinds on it.
-    std::process::exit(code);
+    // The executor leaves the process: the shell, or the child a pipeline
+    // command or a subshell runs in.
+    Ok(Status::Exit(code))
 }

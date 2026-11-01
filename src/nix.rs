@@ -34,6 +34,8 @@ pub struct Pid(pid_t);
 #[repr(i32)]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// The variants keep the C names (`SIGINT`, not `Sigint`).
+#[allow(clippy::upper_case_acronyms)]
 pub enum Signal {
     /// Hangup
     SIGHUP = libc::SIGHUP,

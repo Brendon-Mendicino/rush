@@ -129,11 +129,10 @@ fn a_failed_redirection_fails() {
 }
 
 #[test]
-fn is_refused_in_a_pipeline() {
-    let output = run_shell("exec echo a | cat\necho after\n");
+fn replaces_only_the_child_in_a_pipeline() {
+    let output = run_shell("exec echo a | cat\nsleep 0 | exec echo b\necho after\n");
 
-    assert!(stderr(&output).contains("rush: exec: not supported in a pipeline yet"));
-    assert_eq!(stdout(&output), "after\n");
+    assert_eq!(stdout(&output), "a\nb\nafter\n");
 }
 
 #[test]
