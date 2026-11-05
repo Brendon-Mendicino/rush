@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{run, run_shell, run_shell_in, shell_command, stderr, stdout, test_dir};
+use common::{
+    pty::InteractiveShell, run, run_shell, run_shell_in, shell_command, stderr, stdout, test_dir,
+};
 
 #[test]
 fn redirects_output_and_input() {
@@ -197,4 +199,39 @@ fn shell_closes_redirected_files_after_spawning() {
 
     drop(stdin);
     child.wait().unwrap();
+}
+
+#[test]
+fn opened_files_avoid_the_fds_the_command_names() {
+    // `a.txt` must not be opened on fd 10, which `10>&1` replaces before
+    // `11>a.txt` copies it.
+    let dir = test_dir("opened_files_avoid_the_fds_the_command_names");
+
+    let output = run_shell_in("readlink /proc/self/fd/11 10>&1 11>a.txt\n", &dir);
+
+    let a = fs::canonicalize(dir.join("a.txt")).unwrap();
+    assert_eq!(stdout(&output), format!("{}\n", a.to_str().unwrap()));
+}
+
+#[test]
+fn the_shell_fds_are_not_open_for_the_user() {
+    // fd 10 is never opened by the user: the shell's copy of `b.txt` must not be
+    // reachable through it.
+    let dir = test_dir("the_shell_fds_are_not_open_for_the_user");
+
+    let output = run_shell_in("ls 3>b.txt 4>&10 && echo ran\n", &dir);
+
+    assert!(stderr(&output).contains("rush: 10: Bad file descriptor"));
+    assert_eq!(stdout(&output), "");
+}
+
+#[test]
+fn the_terminal_copy_is_not_open_for_the_user() {
+    // The interactive shell keeps its copy of the terminal on fd 10: the user
+    // never opened it, so `n>&10` is a bad file descriptor.
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("ls 4>&10\n");
+    sh.stderr.expect("rush: 10: Bad file descriptor");
+    sh.expect_prompt();
 }

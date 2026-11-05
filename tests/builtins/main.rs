@@ -13,4 +13,5 @@ mod r#false;
 mod not_implemented;
 mod pipeline;
 mod pwd;
+mod redirections;
 mod r#true;

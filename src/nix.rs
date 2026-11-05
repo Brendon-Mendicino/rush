@@ -279,6 +279,23 @@ pub fn error_message(err: &io::Error) -> String {
         .into_owned()
 }
 
+/// Reads straight from an fd, without buffering, and never closes it. Unlike
+/// `io::stdin()` it can't hand out data that a buffer read ahead earlier.
+#[derive(Debug, Clone, Copy)]
+pub struct FdReader(pub RawFd);
+
+impl io::Read for FdReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let res = unsafe { libc::read(self.0, buf.as_mut_ptr().cast(), buf.len()) };
+            match cvt(res) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                res => return res.map(|n| n as usize),
+            }
+        }
+    }
+}
+
 /// Duplicate `fd` on the lowest free fd `>= min_fd`, with close-on-exec set.
 pub fn dup_cloexec<Fd: AsRawFd>(fd: Fd, min_fd: RawFd) -> io::Result<RawFd> {
     let res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };

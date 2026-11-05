@@ -127,6 +127,17 @@ impl Shell {
         shell
     }
 
+    /// The fds the shell opened for itself (the copy of the terminal). They are
+    /// not the user's: redirections must not use them (`n>&m`).
+    pub fn internal_fds(&self) -> Vec<RawFd> {
+        // Without job control the "terminal" is just stdin.
+        if self.terminal > libc::STDERR_FILENO {
+            vec![self.terminal]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn init_job_control(&mut self) {
         // Keep the terminal on an fd of its own: children take the terminal in
         // `pre_exec`, when their stdin may already be a pipe or /dev/null.

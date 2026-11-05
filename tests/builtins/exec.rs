@@ -168,3 +168,22 @@ fn after_a_failed_exec_the_shell_still_ignores_ctrl_c() {
 
     sh.stdout.expect("alive");
 }
+
+#[test]
+fn a_redirection_to_the_terminal_fd_keeps_job_control_working() {
+    // The interactive shell keeps its copy of the terminal on a high fd, 10 when
+    // it starts: `exec 10>…` must move it, not overwrite it.
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("exec 10>/dev/null\n");
+    sh.expect_prompt();
+
+    sh.send("cat\n");
+    sh.wait_foreground_job("cat");
+    sh.send("typed\n");
+    sh.stdout.expect("typed\r\n");
+    sh.send("\x04");
+    sh.expect_prompt();
+
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+}

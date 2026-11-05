@@ -212,6 +212,12 @@ struct RedirectController {
     ops: Vec<RedirectOp>,
     /// Fds opened (`true`) or closed (`false`) by the redirections seen so far.
     redirected: HashMap<RawFd, bool>,
+    /// Above every fd the redirections name: the fds the shell creates for them
+    /// (the opened files, the saved copies) go here, so that they never take a
+    /// number the user wrote.
+    floor: RawFd,
+    /// The shell's own fds (the terminal copy): `n>&m` can't reach them.
+    internal: Vec<RawFd>,
 }
 
 #[derive(Debug)]
@@ -265,7 +271,7 @@ impl RedirectController {
     fn add_redirect(&mut self, redirect: &Redirect) -> Result<(), RedirectError> {
         match redirect {
             Redirect::FileRedirect(file_redirect) => {
-                let file = Self::open(file_redirect)?;
+                let file = self.open(file_redirect)?;
                 let dst = file_redirect.redirect_fd;
 
                 self.ops.push(RedirectOp::Dup {
@@ -279,12 +285,13 @@ impl RedirectController {
                 let src = dup_fd.fd_replacer;
 
                 // Either opened by an earlier redirection of this command, or
-                // inherited from the shell.
+                // inherited from the shell, but not one of the shell's own fds.
+                // The opened files are above `floor`, so `src` can't be one of them.
                 let is_open = self
                     .redirected
                     .get(&src)
                     .copied()
-                    .unwrap_or_else(|| nix::is_valid_fd(src));
+                    .unwrap_or_else(|| nix::is_valid_fd(src) && !self.internal.contains(&src));
                 if !is_open {
                     return Err(RedirectError::BadFd(src));
                 }
@@ -304,7 +311,7 @@ impl RedirectController {
         Ok(())
     }
 
-    fn open(redirect: &FileRedirect) -> Result<OwnedFd, RedirectError> {
+    fn open(&self, redirect: &FileRedirect) -> Result<OwnedFd, RedirectError> {
         let mut options = File::options();
 
         match redirect.file_kind {
@@ -317,17 +324,22 @@ impl RedirectController {
         options.mode(0o664);
 
         let filename = redirect.filename.text();
-        let file = options
-            .open(&filename)
-            .map_err(|err| RedirectError::Open { filename, err })?;
+        let file = match options.open(&filename) {
+            Ok(file) => file,
+            Err(err) => return Err(RedirectError::Open { filename, err }),
+        };
 
-        // Move the file out of the low fds that redirections usually target:
-        // otherwise a redirection could overwrite a file that a later one still
-        // has to dup (`4>a 3>b` with `a` opened on 3). The copy is close-on-exec
-        // like the original, only the dup2'd fds reach the program.
-        match nix::dup_cloexec(file.as_raw_fd(), 10) {
+        // Keep the file off every fd the command names: a later redirection
+        // could replace it before it is dup'd (`10>&1 11>a`, `4>a 3>b`). The fd
+        // `open` returned is kept when it is already above them. The copy is
+        // close-on-exec like the original, only the dup2'd fds reach the program.
+        if file.as_raw_fd() >= self.floor {
+            return Ok(file.into());
+        }
+
+        match nix::dup_cloexec(file.as_raw_fd(), self.floor) {
             Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
-            Err(_) => Ok(file.into()),
+            Err(err) => Err(RedirectError::Open { filename, err }),
         }
     }
 
@@ -345,10 +357,34 @@ impl RedirectController {
         Ok(())
     }
 
-    fn from_redirects(redirections: &[Redirect]) -> Result<Self, RedirectError> {
-        let mut controller = Self::default();
+    /// `internal` are the shell's own fds ([`Shell::internal_fds`]).
+    fn from_redirects(
+        redirections: &[Redirect],
+        internal: &[RawFd],
+    ) -> Result<Self, RedirectError> {
+        let highest = redirections
+            .iter()
+            .flat_map(Self::named_fds)
+            .fold(libc::STDERR_FILENO, RawFd::max);
+
+        let mut controller = Self {
+            floor: highest + 1,
+            internal: internal.to_vec(),
+            ..Self::default()
+        };
         controller.add_redirects(redirections)?;
         Ok(controller)
+    }
+
+    /// The fds a redirection names: its target, and the source of `n>&m`.
+    fn named_fds(redirect: &Redirect) -> impl Iterator<Item = RawFd> {
+        let (target, source) = match redirect {
+            Redirect::FileRedirect(file) => (file.redirect_fd, None),
+            Redirect::FdRedirect(dup) => (dup.fd_to_replace, Some(dup.fd_replacer)),
+            Redirect::CloseFd(close) => (close.fd, None),
+        };
+
+        iter::once(target).chain(source)
     }
 }
 
@@ -388,33 +424,67 @@ impl ApplyerPtr {
     }
 }
 
-/// Copies of the fds that redirections are about to replace in the shell itself.
-/// They are put back when the guard is dropped.
-struct SavedFds(Vec<(RawFd, Option<OwnedFd>)>);
+/// Redirections applied to the shell process itself, for a built-in that runs in
+/// the shell. Dropping the guard undoes them.
+#[must_use]
+struct RedirectGuard {
+    /// Each redirected fd with a copy of what it was, `None` when it was closed.
+    saved: Vec<(RawFd, Option<OwnedFd>)>,
+}
 
-impl SavedFds {
-    /// Save every fd the redirections touch, `None` for the ones that are not open.
-    fn save(redirections: &RedirectController) -> io::Result<Self> {
-        let mut saved = Vec::new();
+impl RedirectGuard {
+    /// Nothing applied: the redirections are already in place (the forked child
+    /// of a pipeline command).
+    fn none() -> Self {
+        Self { saved: Vec::new() }
+    }
 
-        for &fd in redirections.redirected.keys() {
+    fn apply(redirections: &RedirectController, shell: &mut Shell) -> io::Result<Self> {
+        // What is still buffered belongs to the old stdout.
+        let _ = io::stdout().flush();
+
+        let floor = redirections.floor;
+        let targets: Vec<RawFd> = redirections.redirected.keys().copied().collect();
+
+        // The shell's copy of the terminal must survive (`exec 10>log`): move it
+        // out of the way, for good, it is the shell's own fd anyway.
+        if shell.internal_fds().contains(&shell.terminal) && targets.contains(&shell.terminal) {
+            let moved = nix::dup_cloexec(shell.terminal, floor)?;
+            close(shell.terminal)?;
+            shell.terminal = moved;
+        }
+
+        // If anything below fails the guard is dropped, and puts back what was
+        // already replaced.
+        let mut guard = Self::none();
+        for fd in targets {
             let copy = if nix::is_valid_fd(fd) {
-                let copy = nix::dup_cloexec(fd, 10)?;
+                let copy = nix::dup_cloexec(fd, floor)?;
                 Some(unsafe { OwnedFd::from_raw_fd(copy) })
             } else {
                 None
             };
-            saved.push((fd, copy));
+            guard.saved.push((fd, copy));
         }
 
-        Ok(Self(saved))
+        redirections.get_applyer().apply()?;
+
+        Ok(guard)
+    }
+
+    /// Keep the redirections (`exec` without a command): only the copies go.
+    fn keep(mut self) {
+        self.saved.clear();
     }
 }
 
-impl Drop for SavedFds {
+impl Drop for RedirectGuard {
     /// Put the fds back as they were. Nothing more can be done when it fails.
     fn drop(&mut self) {
-        for (fd, copy) in self.0.drain(..) {
+        // Output written while redirected goes where it was meant to.
+        let _ = io::stdout().flush();
+
+        for (fd, copy) in self.saved.drain(..) {
             let _ = match copy {
                 Some(copy) => dup2_raw(copy.as_raw_fd(), fd).map(drop),
                 None => close(fd),
@@ -433,19 +503,20 @@ impl Executor {
     }
 
     /// Run a built-in in the current process: the shell, or the child a pipeline
-    /// command runs in. `redirections` are only used by `exec`, which applies
-    /// them to the process itself.
+    /// command runs in. Its redirections are in place while `redirections`
+    /// lives: they are undone when the built-in is done, unless `exec` keeps them.
     fn run_builtin(
         &mut self,
         cmd: &SimpleCommand,
         builtin: FnBuiltin,
-        redirections: &RedirectController,
+        redirections: RedirectGuard,
     ) -> JobExit {
         let args: Vec<&str> = iter::once(cmd.program.as_str())
             .chain(cmd.arguments.iter().map(String::as_str))
             .collect();
 
-        let mut stdin = io::stdin();
+        // Not `io::stdin()`: its buffer may hold script lines the REPL read ahead.
+        let mut stdin = nix::FdReader(libc::STDIN_FILENO);
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
 
@@ -483,10 +554,12 @@ impl Executor {
     /// Spawn an external command. When it cannot be spawned the error is reported
     /// and the command's status is returned instead.
     fn simple_command(&self, cmd: &SimpleCommand, state: PipelineState) -> CommandRun {
-        let redirect_controller = match RedirectController::from_redirects(&cmd.redirections) {
-            Ok(controller) => controller,
-            Err(e) => return redirection_failure(e),
-        };
+        let redirect_controller =
+            match RedirectController::from_redirects(&cmd.redirections, &self.shell.internal_fds())
+            {
+                Ok(controller) => controller,
+                Err(e) => return redirection_failure(e),
+            };
 
         let mut command = process::Command::new(&cmd.program);
         command.args(&cmd.arguments);
@@ -601,42 +674,23 @@ impl Executor {
         }
     }
 
-    /// `exec`: without a command, make the redirections permanent in the current
-    /// process; otherwise replace the process with the command. Returns only when
-    /// the command could not be run, after putting the process back as it was.
-    /// In a forked child (a pipeline command) this affects only the child.
+    /// `exec`: without a command, keep the redirections in the current process;
+    /// otherwise replace the process with the command. Returns only when the
+    /// command could not be run, after putting the process back as it was. In a
+    /// forked child (a pipeline command) this affects only the child.
     fn exec(
         &self,
         envs: &[AssignmentWord],
         argv: &[String],
-        redirections: &RedirectController,
+        redirections: RedirectGuard,
     ) -> JobExit {
+        let Some((program, arguments)) = argv.split_first() else {
+            redirections.keep();
+            return JobExit::Exited(0);
+        };
+
         // What the shell already wrote goes where it was meant to.
         let _ = io::stdout().flush();
-
-        let Some((program, arguments)) = argv.split_first() else {
-            return match redirections.get_applyer().apply() {
-                Ok(()) => JobExit::Exited(0),
-                Err(e) => {
-                    eprintln!("rush: exec: {}", nix::error_message(&e));
-                    JobExit::Exited(1)
-                }
-            };
-        };
-
-        let saved = match SavedFds::save(redirections) {
-            Ok(saved) => saved,
-            Err(e) => {
-                eprintln!("rush: exec: {}", nix::error_message(&e));
-                return JobExit::Exited(1);
-            }
-        };
-        if let Err(e) = redirections.get_applyer().apply() {
-            // Put stderr back before reporting.
-            drop(saved);
-            eprintln!("rush: exec: {}", nix::error_message(&e));
-            return JobExit::Exited(1);
-        }
 
         let mut command = process::Command::new(program);
         command.args(arguments);
@@ -650,7 +704,7 @@ impl Executor {
 
         self.set_job_control_signals(SigHandler::Ignore);
         // Put the fds back before reporting.
-        drop(saved);
+        drop(redirections);
 
         spawn_failure(program, &err)
     }
@@ -691,10 +745,11 @@ impl Executor {
             pipeline_pgid,
         } = state;
 
-        let redirect_controller = match RedirectController::from_redirects(redirections) {
-            Ok(controller) => controller,
-            Err(e) => return redirection_failure(e),
-        };
+        let redirect_controller =
+            match RedirectController::from_redirects(redirections, &self.shell.internal_fds()) {
+                Ok(controller) => controller,
+                Err(e) => return redirection_failure(e),
+            };
 
         // Inside a pipeline the child writes to a new pipe, whose read end is the
         // input of the next command.
@@ -949,16 +1004,31 @@ impl Executor {
                 &expanded.redirections,
                 |executor| {
                     executor
-                        .run_builtin(&expanded, builtin, &RedirectController::default())
+                        .run_builtin(&expanded, builtin, RedirectGuard::none())
                         .into()
                 },
             ),
-            Some(&builtin) => match RedirectController::from_redirects(&expanded.redirections) {
-                Ok(redirections) => {
-                    CommandRun::Done(self.run_builtin(&expanded, builtin, &redirections))
-                }
-                Err(e) => redirection_failure(e),
-            },
+            // Outside a pipeline the built-in runs in the shell: its redirections
+            // are applied to the shell while it runs.
+            Some(&builtin) => {
+                let redirections = match RedirectController::from_redirects(
+                    &expanded.redirections,
+                    &self.shell.internal_fds(),
+                ) {
+                    Ok(redirections) => redirections,
+                    Err(e) => return redirection_failure(e),
+                };
+
+                let guard = match RedirectGuard::apply(&redirections, &mut self.shell) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        eprintln!("rush: {}", nix::error_message(&e));
+                        return CommandRun::Done(JobExit::Exited(1));
+                    }
+                };
+
+                CommandRun::Done(self.run_builtin(&expanded, builtin, guard))
+            }
         }
     }
 
@@ -971,7 +1041,9 @@ impl Executor {
         // The redirections are still performed (`a=1 >file` creates the file),
         // and when they fail the variables are left untouched. The files are
         // closed when the controller is dropped.
-        if let Err(e) = RedirectController::from_redirects(&assignment.redirections) {
+        if let Err(e) =
+            RedirectController::from_redirects(&assignment.redirections, &self.shell.internal_fds())
+        {
             return redirection_failure(e);
         }
 
@@ -1058,7 +1130,9 @@ impl Executor {
     fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
         let job = self.schedule_pipeline(pipeline, true);
 
-        let exec_status = match Waiter::new(&self.shell).wait(job) {
+        let wait_result = Waiter::new(&self.shell).wait(job);
+
+        let exec_status = match wait_result {
             Ok(WaitResult::Completed(exit)) => exit.into(),
             Ok(WaitResult::Stopped { job, sig_stop }) => {
                 self.bg_jobs.push(job);
