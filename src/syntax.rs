@@ -1,4 +1,4 @@
-use std::vec;
+use std::{fmt, vec};
 
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 
@@ -221,6 +221,169 @@ impl<'a> SimpleCommand<'a> {
         }
 
         text
+    }
+}
+
+// ------------------------------------
+// Command text
+// ------------------------------------
+//
+// The AST printed back as shell code, like bash does for `jobs`: the words keep
+// their raw text (quotes, `$`, backslashes), the blanks are normalized.
+
+/// Write `items` separated by `sep`.
+fn join<T: fmt::Display>(f: &mut fmt::Formatter<'_>, items: &[T], sep: &str) -> fmt::Result {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            f.write_str(sep)?;
+        }
+        write!(f, "{item}")?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for AssignmentWord<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.whole.value)
+    }
+}
+
+impl fmt::Display for Word<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Word::Token(token) => f.write_str(token.value),
+            Word::Substitution(Substitution::VarSub(var)) => f.write_str(var.token.value),
+            Word::Substitution(Substitution::CmdSub(cmd)) => write!(f, "{cmd}"),
+        }
+    }
+}
+
+impl fmt::Display for CmdSub<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "$({})", self.seq_list)
+    }
+}
+
+/// The fd is left out when it is the operator's default.
+impl fmt::Display for Redirect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (fd, default, op, target) = match self {
+            Redirect::FileRedirect(file) => {
+                let (op, default) = match file.file_kind {
+                    OpenKind::Read => ("<", 0),
+                    OpenKind::Replace => (">", 1),
+                    OpenKind::Append => (">>", 1),
+                    OpenKind::Rw => ("<>", 0),
+                };
+                (
+                    file.redirect_fd,
+                    default,
+                    op,
+                    file.filename.value.to_string(),
+                )
+            }
+            Redirect::FdRedirect(dup) if dup.fd_to_replace == 0 => {
+                (0, 0, "<&", dup.fd_replacer.to_string())
+            }
+            Redirect::FdRedirect(dup) => (dup.fd_to_replace, 1, ">&", dup.fd_replacer.to_string()),
+            Redirect::CloseFd(close) if close.fd == 0 => (0, 0, "<&", "-".to_string()),
+            Redirect::CloseFd(close) => (close.fd, 1, ">&", "-".to_string()),
+        };
+
+        if fd != default {
+            write!(f, "{fd}")?;
+        }
+        write!(f, "{op}{target}")
+    }
+}
+
+/// Either part can be empty (`>f` alone is an assignment of nothing).
+impl fmt::Display for SimpleAssignment<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let envs = self.envs.iter().map(ToString::to_string);
+        let redirections = self.redirections.iter().map(ToString::to_string);
+
+        join(f, &envs.chain(redirections).collect::<Vec<_>>(), " ")
+    }
+}
+
+impl fmt::Display for UnsubCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for env in &self.envs {
+            write!(f, "{env} ")?;
+        }
+        write!(f, "{}", self.program)?;
+        for argument in &self.arguments {
+            write!(f, " {argument}")?;
+        }
+        for redirect in &self.redirections {
+            write!(f, " {redirect}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Subshell<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({})", self.seq_list)?;
+        for redirect in &self.redirections {
+            write!(f, " {redirect}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Command<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Command::SimpleAssignment(assignment) => write!(f, "{assignment}"),
+            Command::UnsubCommand(command) => write!(f, "{command}"),
+            Command::Subshell(subshell) => write!(f, "{subshell}"),
+        }
+    }
+}
+
+impl fmt::Display for Pipeline<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.negated {
+            f.write_str("! ")?;
+        }
+        join(f, &self.cmds, " | ")
+    }
+}
+
+impl fmt::Display for OpList<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpList::AndList(and) => write!(f, "{} && {}", and.left, and.right),
+            OpList::OrList(or) => write!(f, "{} || {}", or.left, or.right),
+            OpList::Pipeline(pipeline) => write!(f, "{pipeline}"),
+        }
+    }
+}
+
+/// Each element is followed by its separator: `;` between two elements, `&`
+/// after an asynchronous one (`a & b; c &`).
+impl fmt::Display for List<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (left, right, is_async) = match self {
+            List::SequentialList(seq) => (&seq.left, &seq.right, false),
+            List::AsyncList(asy) => (&asy.left, &asy.right, true),
+        };
+
+        if let Some(left) = left {
+            match **left {
+                // It already ends with its `&`.
+                List::AsyncList(_) => write!(f, "{left} ")?,
+                List::SequentialList(_) => write!(f, "{left}; ")?,
+            }
+        }
+        write!(f, "{right}")?;
+
+        if is_async {
+            f.write_str(" &")?;
+        }
+        Ok(())
     }
 }
 
@@ -1177,5 +1340,46 @@ mod tests {
 
         let tok = UnbufferedTokenizer::new("=x");
         assert!(SyntaxTree::assignment_word(&tok).is_none());
+    }
+
+    /// Parse a whole program and print it back.
+    fn reprint(input: &str) -> String {
+        let lines = vec![format!("{input}\n")];
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).expect(input);
+        assert!(tok.next_is_eof(), "{input}: not fully parsed");
+
+        let commands: Vec<String> = program
+            .child
+            .commands
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        commands.join("\n")
+    }
+
+    #[test]
+    fn commands_print_back_as_shell_code() {
+        for input in [
+            "sleep 10",
+            "a | b",
+            "! a | b",
+            "a && b || c",
+            "(a; b) >f",
+            "x=1 cmd 2>&1",
+            "echo $(ls) $HOME 'q w' a\\ b",
+            "a; b &",
+            "a & b",
+            "a <in >>out 3<>rw <&3 4>&- 2>err",
+            "x=1 y=2",
+        ] {
+            assert_eq!(reprint(input), input);
+        }
+    }
+
+    #[test]
+    fn blanks_are_normalized() {
+        assert_eq!(reprint("a   |b"), "a | b");
+        assert_eq!(reprint("0<in 1>out"), "<in >out");
     }
 }

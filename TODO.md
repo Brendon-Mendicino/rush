@@ -19,7 +19,7 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 - [x] `execute()`: skip empty input (`next_is_eof`), report parse failure instead of `todo!()`, run `program`
 - [x] `program()` returns the last list's exit status; feed it to `TerminalState.exit_code` (red prompt)
 - [x] Prompt only when interactive
-- [x] `bg_jobs: Vec<Job>` on `Executor`; before each prompt reap them (re-add a `Waiter::update_status` using `WNOHANG`), print completed ones and drop them
+- [x] `bg_jobs: Vec<Job>` on `Executor`; before each prompt reap them (re-add a `Waiter::update_status` using `WNOHANG`), print completed ones and drop them (now `jobs: JobTable`, reported in the `jobs` format)
 - [x] A Rust equivalent of `ExecStats` for results that are not a waited job (builtins, assignments, errors: `ERROR` / `SHALLOW`)
 
 ## 3. Spawning external commands (`Spawner::spawn_async`, command case)
@@ -50,7 +50,7 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 
 ## 7. Shell-forking constructs
 - [x] **Decide** how to spawn things that run shell code in a child: `nix::fork` for shell code (`Executor::fork_child`), `Command` for programs. `Job` holds pids only (no `process::Child`). Requires the shell to stay single-threaded
-- [x] Spawn-type signal setups (`SpawnType`): subshell gets the default signals like a command (bash, not the C++ ignore of TSTP/TTIN/TTOU: Ctrl-Z stops the whole job); async never takes the terminal, and without job control ignores INT/QUIT and reads `/dev/null` (POSIX)
+- [x] Spawn-type signal setups (`SpawnType`): subshell gets the default signals like a command (bash, not the C++ ignore of TSTP/TTIN/TTOU: Ctrl-Z stops the whole job); async never takes the terminal, and without job control ignores INT/QUIT and reads `/dev/null` (POSIX); a command substitution is not a job: it stays in the shell's group and keeps TSTP/TTIN/TTOU ignored, so Ctrl-Z can't stop it while the shell reads its output (bash, dash)
 - [x] Subshell `( list )`: apply redirections, run list in child, `_exit(status)`
 - [x] Async list `list &`: child in its own pgid, never takes the terminal; parent prints `<pid>: Background` and stores the job in `bg_jobs`. The child runs without job control, so it waits its commands until they complete (stops are not reported) (the C++ `wait_inside_async`)
 - [x] Command substitution `$(...)`: pipe child stdout, run list, read all output, strip **all** trailing `\n` (POSIX; the C++ stripped one), wait the child
@@ -67,9 +67,9 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
 - [x] `cd [dir|~]`: `$HOME` fallback, `too many arguments`, error message on failure (full POSIX `cd`, see `BUILTINS.md`)
 - [ ] `exit [n]` (returns `Status::Exit`, exits only a subshell or pipeline child; the `$?` default is still missing)
 - [x] `exec cmd args…`: replace the shell process (`CommandExt::exec`) with the shell env (also `exec` without a command: permanent redirections)
-- [ ] `jobs`: list `bg_jobs` with Stopped/Background state
-- [ ] `fg`: last job → `Waiter::fg`; re-store it if it stops again
-- [ ] `bg`: last job → `Waiter::bg`
+- [x] `jobs`: list the job table (`JobTable`) in the POSIX format
+- [x] `fg`: current job or `%` job ID → `Waiter::fg`; put back under the same number if it stops again
+- [x] `bg`: current job or `%` job IDs → `Waiter::bg`
 
 ## Beyond parity (not done in testsh either)
 - [ ] Heredocs `<<` / `<<-` (`io_here` is `unimplemented!` in both)
@@ -77,5 +77,5 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
 - [ ] Double-quoted strings (tokenizer has it commented out)
 - [ ] `export` builtin / stage 4 envs (mark vars external)
 - [ ] Parser rule 7b (assignment-word handling, `syntax.rs` TODO)
-- [ ] `fg %n` / `bg %n` job selection (testsh always uses the last job)
-- [ ] More tests: `fg`/`bg` and the job table once the builtins exist (the pty harness is in `tests/common/pty.rs`)
+- [x] `fg %n` / `bg %n` job selection (testsh always uses the last job): every XBD §3.204 form
+- [x] More tests: `fg`/`bg` and the job table (`tests/builtins/{jobs,fg,bg}.rs`, `tests/job_control.rs`)

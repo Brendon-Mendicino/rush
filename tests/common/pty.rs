@@ -226,6 +226,20 @@ impl InteractiveShell {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    /// Wait until a process of the shell's own process group runs `program`:
+    /// something the shell runs without making it a job (`$(...)`).
+    pub fn wait_shell_group_process(&self, program: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+
+        while !process_in_group(self.pid(), program) {
+            assert!(
+                Instant::now() < deadline,
+                "no {program} in the shell's group"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Some process of the group `pgid` is running `program`. The fields of

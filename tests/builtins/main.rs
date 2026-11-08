@@ -4,12 +4,15 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod bg;
 mod cd;
 mod colon;
 mod eval;
 mod exec;
 mod exit;
 mod r#false;
+mod fg;
+mod jobs;
 mod not_implemented;
 mod pipeline;
 mod pwd;

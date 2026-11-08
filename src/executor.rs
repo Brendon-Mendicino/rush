@@ -1,6 +1,6 @@
 use crate::{
     builtin::{self, BUILTINS, Builtin, FnBuiltin, Status},
-    job::{Job, JobBuilder, JobExit},
+    job::{Job, JobBuilder, JobExit, JobTable},
     nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
     shell::{JOB_CONTROL_SIGNALS, Shell},
     syntax::*,
@@ -144,8 +144,8 @@ fn join_continuations(input: &[String]) -> Vec<String> {
 pub struct Executor {
     input_buffer: Vec<String>,
     shell: Shell,
-    /// Jobs that got stopped or that are running in background.
-    bg_jobs: Vec<Job>,
+    /// The jobs that got stopped or that run in the background, by job number.
+    jobs: JobTable,
 }
 
 /// Where a command's stdout goes.
@@ -248,9 +248,15 @@ struct Spawned {
 /// signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnType {
-    /// `( list )` and `$(list)`: part of the job it belongs to, like a command.
-    /// It gets the default signals, so Ctrl-C and Ctrl-Z act on it as well.
+    /// `( list )`: part of the job it belongs to, like a command. It gets the
+    /// default signals, so Ctrl-C and Ctrl-Z act on it as well.
     Subshell,
+    /// `$(list)`: not a job. It stays in the shell's process group (which owns
+    /// the terminal) and can't be stopped from the keyboard: SIGTSTP, SIGTTIN
+    /// and SIGTTOU stay ignored, for the commands it runs too, like in bash and
+    /// dash. A stopped command substitution would hang the shell, which reads
+    /// all of its output before waiting for it. Ctrl-C still interrupts it.
+    CmdSub,
     /// `list &`: never takes the terminal. Without job control it ignores
     /// SIGINT and SIGQUIT and reads from /dev/null (POSIX).
     Async,
@@ -498,7 +504,7 @@ impl Executor {
         Self {
             input_buffer: Vec::new(),
             shell: Shell::new(),
-            bg_jobs: Vec::new(),
+            jobs: JobTable::default(),
         }
     }
 
@@ -526,6 +532,7 @@ impl Executor {
             stderr: &mut stderr,
             args: &args,
             shell: &mut self.shell,
+            jobs: &mut self.jobs,
         };
 
         match builtin::run(builtin, bi) {
@@ -684,6 +691,7 @@ impl Executor {
         argv: &[String],
         redirections: RedirectGuard,
     ) -> JobExit {
+        // TODO: review the code flow
         let Some((program, arguments)) = argv.split_first() else {
             redirections.keep();
             return JobExit::Exited(0);
@@ -711,6 +719,7 @@ impl Executor {
 
     /// Set the handling of the signals an interactive shell ignores.
     fn set_job_control_signals(&self, handler: SigHandler) {
+        // TODO: review how this is used, check if the signlas can be used as rust struct
         if !self.shell.is_interactive {
             return;
         }
@@ -800,7 +809,7 @@ impl Executor {
         // The parent's copies of `stdin`, `stdout` and the redirected files are
         // closed when they go out of scope: only the child needs them.
 
-        let pgid = if self.shell.is_interactive {
+        let pgid = if self.shell.is_interactive && spawn_type != SpawnType::CmdSub {
             let pgid = pipeline_pgid.unwrap_or(pid);
 
             // Unlike `Command::spawn`, `fork` returns before the child ran: it may
@@ -841,7 +850,13 @@ impl Executor {
         stdout: Option<OwnedFd>,
         redirect_controller: RedirectController,
     ) {
-        if self.shell.is_interactive {
+        // TODO: what is this mess?
+        if self.shell.is_interactive && spawn_type == SpawnType::CmdSub {
+            // In the shell's group, with the job-control signals still ignored.
+            for sig in [Signal::SIGINT, Signal::SIGQUIT] {
+                let _ = nix::signal(sig, SigHandler::Default);
+            }
+        } else if self.shell.is_interactive {
             // Same as a command's `pre_exec`: join the job's group, take the
             // terminal while SIGTTOU is still ignored, restore the signals.
             let _ = nix::setpgid(Pid::from_raw(0), pipeline_pgid.unwrap_or(Pid::from_raw(0)));
@@ -881,10 +896,14 @@ impl Executor {
 
         // The child is a shell without job control: its commands stay in its
         // process group (the job's), it never touches the terminal, and stops
-        // are not reported. The parent's jobs are not its children.
+        // are not reported.
+        //
+        // It keeps a copy of the parent's jobs, so that `jobs | cat` and
+        // `$(jobs -p)` list them. The copy is only a snapshot: the jobs are not
+        // its children (waiting on them fails with ECHILD and they stay as they
+        // were), and without job control `fg` and `bg` refuse to touch them.
         self.shell.is_interactive = false;
         self.shell.pgid = nix::getpgrp();
-        self.bg_jobs.clear();
     }
 
     /// `( list )`: run the list in a forked shell.
@@ -908,12 +927,20 @@ impl Executor {
             pipeline_pgid: None,
         };
 
-        match self.fork_child(SpawnType::Async, state, &[], |executor| {
+        let fork_result = self.fork_child(SpawnType::Async, state, &[], |executor| {
             executor.op_list(op_list)
-        }) {
+        });
+
+        match fork_result {
             CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
-                eprintln!("{}: Background", pid.as_raw());
-                self.bg_jobs.push(JobBuilder::new().build(pgid, pid));
+                let job = JobBuilder::new().build(pgid, pid);
+                let number = self.jobs.insert(job, op_list.to_string());
+
+                // Like dash and bash (and POSIX Issue 8): the job number and the
+                // pid, only when interactive.
+                if self.shell.is_interactive {
+                    eprintln!("[{number}] {}", pid.as_raw());
+                }
                 ExecStatus::SUCCESS
             }
             CommandRun::Done(exit) => exit.into(),
@@ -942,7 +969,7 @@ impl Executor {
         // The write end is moved into the child's state: once `fork_child`
         // returns the parent has no copy left, and the read gets EOF when the
         // child is done.
-        let run = self.fork_child(SpawnType::Subshell, state, &[], |executor| {
+        let run = self.fork_child(SpawnType::CmdSub, state, &[], |executor| {
             executor.list(&cmdsub.seq_list)
         });
 
@@ -954,14 +981,12 @@ impl Executor {
         }
         drop(reader);
 
-        if let CommandRun::Spawned(Spawned { pid, pgid, .. }) = run {
-            let job = JobBuilder::new().build(pgid, pid);
-
-            match Waiter::new(&self.shell).wait(job) {
-                Ok(WaitResult::Completed(_)) => {}
-                Ok(WaitResult::Stopped { job, .. }) => self.bg_jobs.push(job),
-                Err(e) => eprintln!("rush: wait: {e}"),
-            }
+        // Not a job: it can't be stopped (see `SpawnType::CmdSub`), never goes
+        // in the job table, and is waited until it completes.
+        if let CommandRun::Spawned(Spawned { pid, pgid, .. }) = run
+            && let Err(e) = Waiter::wait_completed(JobBuilder::new().build(pgid, pid))
+        {
+            eprintln!("rush: wait: {e}");
         }
 
         let output = String::from_utf8_lossy(&output);
@@ -1127,6 +1152,18 @@ impl Executor {
         }
     }
 
+    /// A foreground job got stopped: it goes in the job table, and the user is
+    /// told in the `jobs` format (`set -m`: "if a foreground job stops, the
+    /// shell shall write a message to standard error to that effect").
+    fn job_stopped(&mut self, job: Job, sig_stop: Signal, command: String) -> ExecStatus {
+        let number = self.jobs.insert(job, command);
+
+        if let Some(line) = self.jobs.format_line(number, false) {
+            eprintln!("{line}");
+        }
+        ExecStatus::Stopped(sig_stop)
+    }
+
     fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
         let job = self.schedule_pipeline(pipeline, true);
 
@@ -1135,8 +1172,7 @@ impl Executor {
         let exec_status = match wait_result {
             Ok(WaitResult::Completed(exit)) => exit.into(),
             Ok(WaitResult::Stopped { job, sig_stop }) => {
-                self.bg_jobs.push(job);
-                ExecStatus::Stopped(sig_stop)
+                self.job_stopped(job, sig_stop, pipeline.to_string())
             }
             Err(e) => {
                 eprintln!("rush: wait: {e}");
@@ -1309,7 +1345,7 @@ impl Executor {
 
         // An interactive shell reaps before printing the prompt.
         if !self.shell.is_interactive {
-            self.reap_bg_jobs();
+            self.notify_jobs();
         }
 
         let status = self.execute();
@@ -1342,7 +1378,7 @@ impl Executor {
         if state.needs_more {
             print!("> ");
         } else {
-            self.reap_bg_jobs();
+            self.notify_jobs();
 
             print!("$ ");
         }
@@ -1352,21 +1388,30 @@ impl Executor {
         io::stdout().flush()
     }
 
-    /// Update the state of the background jobs and drop the completed ones.
-    fn reap_bg_jobs(&mut self) {
-        for job in &mut self.bg_jobs {
-            if let Err(e) = Waiter::update_status(job) {
-                eprintln!("rush: wait: {e}");
-            }
+    /// Collect what happened to the jobs. An interactive shell reports the
+    /// changes in the `jobs` format and forgets the completed jobs (`set -m`).
+    /// A non-interactive one says nothing and keeps them until `jobs` reports
+    /// them.
+    fn notify_jobs(&mut self) {
+        self.jobs.update_status();
 
-            if let Some(exit) = job.completed_status()
-                && self.shell.is_interactive
-            {
-                eprintln!("{}: Completed {exit:?}", job.pgid.as_raw());
+        if !self.shell.is_interactive {
+            return;
+        }
+
+        for number in self.jobs.numbers() {
+            if self.jobs.get(number).is_some_and(|entry| entry.reported) {
+                continue;
+            }
+            if let Some(line) = self.jobs.format_line(number, false) {
+                eprintln!("{line}");
+            }
+            if let Some(entry) = self.jobs.get_mut(number) {
+                entry.reported = true;
             }
         }
 
-        self.bg_jobs.retain(|job| !job.completed());
+        self.jobs.forget_reported_done();
     }
 }
 

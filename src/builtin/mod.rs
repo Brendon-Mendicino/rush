@@ -5,7 +5,11 @@ use std::{
     sync::LazyLock,
 };
 
-use crate::{nix, shell::Shell};
+use crate::{
+    job::{JobId, JobTable},
+    nix,
+    shell::Shell,
+};
 
 // Special built-ins (POSIX §2.14).
 mod r#break;
@@ -57,12 +61,14 @@ const ENDL: &str = "\r\n";
 #[cfg(not(windows))]
 const ENDL: &str = "\n";
 
-pub struct Builtin<'stream, 'args, 'arg, 'shell> {
+pub struct Builtin<'stream, 'args, 'arg, 'shell, 'jobs> {
     pub stdin: &'stream mut dyn Read,
     pub stdout: &'stream mut dyn Write,
     pub stderr: &'stream mut dyn Write,
     pub args: &'args [&'arg str],
     pub shell: &'shell mut Shell,
+    /// The shell's jobs, for `jobs`, `fg` and `bg`.
+    pub jobs: &'jobs mut JobTable,
 }
 
 /// How a built-in finished.
@@ -192,6 +198,37 @@ pub fn run(f: FnBuiltin, mut bi: Builtin) -> Status {
     }
 }
 
+/// Parse a job control job ID (XBD §3.204), as the clap `value_parser` of the
+/// built-ins that take one: `%%`, `%+` (and a bare `%`), `%-`, `%n`, `%string`,
+/// `%?string`.
+fn parse_job_id(s: &str) -> Result<JobId, String> {
+    let Some(id) = s.strip_prefix('%') else {
+        return Err(format!("{s}: no such job"));
+    };
+
+    Ok(match id {
+        "" | "%" | "+" => JobId::Current,
+        "-" => JobId::Previous,
+        _ if id.bytes().all(|b| b.is_ascii_digit()) => match id.parse() {
+            Ok(number) => JobId::Number(number),
+            Err(_) => return Err(format!("{s}: no such job")),
+        },
+        _ => match id.strip_prefix('?') {
+            Some(part) => JobId::Contains(part.to_string()),
+            None => JobId::Prefix(id.to_string()),
+        },
+    })
+}
+
+/// The job `id` names, or the current job: for `fg` and `bg`. The error is the
+/// diagnostic.
+fn find_job(jobs: &JobTable, id: Option<&JobId>) -> Result<usize, String> {
+    match id {
+        Some(id) => jobs.find(id).map_err(|e| format!("{id}: {e}")),
+        None => jobs.current().ok_or_else(|| "no current job".to_string()),
+    }
+}
+
 /// Body of the built-ins that are not implemented yet: report it and fail.
 fn not_implemented(_bi: &mut Builtin) -> BuiltinResult {
     Err("not implemented yet".into())
@@ -239,7 +276,7 @@ pub static BUILTINS: LazyLock<HashMap<&str, FnBuiltin>> = LazyLock::new(|| {
     builtins.into_iter().collect()
 });
 
-impl Builtin<'_, '_, '_, '_> {
+impl Builtin<'_, '_, '_, '_, '_> {
     /// Parse the arguments, `args[0]` is the name of the built-in. The errors, and
     /// `--help`, are printed by [`run`].
     pub(self) fn parse<T>(&self) -> Result<T, Error>
@@ -298,9 +335,12 @@ mod tests {
             tmodes: None,
             env: ShellEnv::default(),
         };
+        // TODO: for a future plan make the stdout redirect into a pipe so the shell can control
+        // how to display it to the user (when in interactive mode)
         let mut stdin = io::empty();
         let mut stdout = Stdout::default();
         let mut stderr = Vec::new();
+        let mut jobs = JobTable::default();
 
         let status = run(
             f,
@@ -310,6 +350,7 @@ mod tests {
                 stderr: &mut stderr,
                 args,
                 shell: &mut shell,
+                jobs: &mut jobs,
             },
         );
 
@@ -429,6 +470,25 @@ mod tests {
     #[test]
     fn valid_arguments_are_parsed() {
         assert_eq!(run_builtin(parses, &["name", "-f"]).status, Status::SUCCESS);
+    }
+
+    #[test]
+    fn job_ids_are_parsed() {
+        for (s, id) in [
+            ("%", JobId::Current),
+            ("%%", JobId::Current),
+            ("%+", JobId::Current),
+            ("%-", JobId::Previous),
+            ("%12", JobId::Number(12)),
+            ("%sleep", JobId::Prefix("sleep".into())),
+            ("%?ee", JobId::Contains("ee".into())),
+            ("%1a", JobId::Prefix("1a".into())),
+        ] {
+            assert_eq!(parse_job_id(s), Ok(id), "{s}");
+        }
+
+        assert_eq!(parse_job_id("1"), Err("1: no such job".into()));
+        assert!(parse_job_id("%99999999999999999999999").is_err());
     }
 
     #[test]

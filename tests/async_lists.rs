@@ -17,7 +17,12 @@ fn does_not_wait_for_the_list() {
     let output = run_shell("(sleep 0.3; echo later) &\necho now\n");
 
     assert_eq!(stdout(&output), "now\nlater\n");
-    assert!(stderr(&output).contains(": Background"));
+    // Without job control the shell doesn't announce the job.
+    assert!(
+        !stderr(&output).lines().any(|line| line.starts_with("[1]")),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

@@ -148,7 +148,8 @@ fn ctrl_z_stops_the_foreground_job() {
     let pgid = sh.wait_foreground_job("sleep");
     sh.send("\x1a");
 
-    sh.stderr.expect("stopped by SIGTSTP");
+    // Reported in the format of `jobs`.
+    sh.stderr.expect("[1] + Stopped (SIGTSTP) sleep 30\n");
     sh.expect_prompt();
     assert_eq!(
         sh.foreground_pgid(),
@@ -218,7 +219,8 @@ fn ctrl_z_stops_a_subshell() {
     let pgid = sh.wait_foreground_process("sleep");
     sh.send("\x1a");
 
-    sh.stderr.expect("stopped by SIGTSTP");
+    sh.stderr
+        .expect("[1] + Stopped (SIGTSTP) (sleep 30; echo after)\n");
     let output = sh.expect_prompt();
     assert!(!output.contains("after"), "{output:?}");
     assert_eq!(sh.foreground_pgid(), sh.pid());
@@ -235,14 +237,9 @@ fn async_job_does_not_take_the_terminal() {
     let mut sh = InteractiveShell::spawn();
 
     sh.send("sleep 30 &\n");
-    let line = sh.stderr.expect(": Background");
-    let pid: i32 = line
-        .lines()
-        .last()
-        .and_then(|l| l.split(':').next())
-        .unwrap()
-        .parse()
-        .unwrap();
+    // `[job number] pid`
+    sh.stderr.expect("[1] ");
+    let pid: i32 = sh.stderr.expect("\n").trim().parse().unwrap();
 
     sh.expect_prompt();
     assert_eq!(sh.foreground_pgid(), sh.pid());
@@ -254,4 +251,57 @@ fn async_job_does_not_take_the_terminal() {
     assert_eq!(pgrp, pid);
 
     unsafe { libc::kill(-pid, libc::SIGKILL) };
+}
+
+#[test]
+fn completed_background_jobs_are_reported_before_the_prompt() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("sleep 0.1 &\n");
+    sh.stderr.expect("[1] ");
+    sh.expect_prompt();
+
+    sh.send("sleep 0.5\n");
+    sh.stderr.expect("[1] + Done sleep 0.1\n");
+    sh.expect_prompt();
+
+    // Reported once, then forgotten.
+    sh.send("jobs\necho end\n");
+    let output = sh.stdout.expect("end\r\n");
+    assert!(!output.contains("[1]"), "{output:?}");
+}
+
+#[test]
+fn ctrl_z_does_not_stop_a_command_substitution() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("echo $(sleep 0.5 && echo test)\n");
+    // Not a job: it runs in the shell's group, which keeps the terminal.
+    sh.wait_shell_group_process("sleep");
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+    sh.send("\x1a");
+
+    // Ignored: the substitution completes and the shell goes on.
+    sh.stdout.expect("test\r\n");
+    sh.expect_prompt();
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+
+    sh.send("jobs\necho end\n");
+    let output = sh.stdout.expect("end\r\n");
+    assert!(!output.contains("[1]"), "not in the job table: {output:?}");
+}
+
+#[test]
+fn ctrl_c_interrupts_a_command_substitution() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("echo $(sleep 30; echo test) after\n");
+    sh.wait_shell_group_process("sleep");
+    sh.send("\x03");
+
+    // The shell survives and gets the terminal back.
+    sh.expect_prompt();
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+    sh.send("echo alive\n");
+    sh.stdout.expect("alive\r\n");
 }

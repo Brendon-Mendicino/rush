@@ -30,10 +30,8 @@ impl<'s> Waiter<'s> {
                 eprintln!("{}: Terminated by signal {sig:?}", pid.as_raw());
                 (pid, ProcStatus::Signaled(sig))
             }
-            WaitRes::Stopped(pid, sig) => {
-                eprintln!("{}: stopped by {sig:?}", pid.as_raw());
-                (pid, ProcStatus::Stopped(sig))
-            }
+            // The shell reports the stopped job, in the `jobs` format.
+            WaitRes::Stopped(pid, sig) => (pid, ProcStatus::Stopped(sig)),
             WaitRes::Continued(pid) => (pid, ProcStatus::Running),
             WaitRes::StillAlive => {
                 unreachable!("StillAlive must be handled by the WNOHANG caller")
@@ -78,7 +76,7 @@ impl<'s> Waiter<'s> {
     /// the shell's process group, so each process is waited by pid: a wait on the
     /// group could reap a background job. Stops are not reported (no
     /// `WUNTRACED`), a stopped process is waited until it is continued and ends.
-    fn wait_completed(mut job: Job) -> io::Result<JobExit> {
+    pub fn wait_completed(mut job: Job) -> io::Result<JobExit> {
         loop {
             let pending = match job.completed_or_pending() {
                 JobProgress::Completed(job_exit) => return Ok(job_exit),
@@ -90,14 +88,16 @@ impl<'s> Waiter<'s> {
         }
     }
 
-    /// Collect, without blocking, the state changes of a background job.
+    /// Collect, without blocking, the state changes of a background job: also
+    /// when it is continued from outside (`kill -CONT`).
     pub fn update_status(job: &mut Job) -> io::Result<()> {
         // By pid: without job control the background jobs share a process group.
         let pending = job.pending();
 
         for pid in pending {
             loop {
-                match waitpid(WaitPid::Single(pid), libc::WUNTRACED | libc::WNOHANG) {
+                let flags = libc::WUNTRACED | libc::WCONTINUED | libc::WNOHANG;
+                match waitpid(WaitPid::Single(pid), flags) {
                     // Nothing to report for this process.
                     Ok(WaitRes::StillAlive) => break,
                     Err(e) if e.raw_os_error() == Some(libc::ECHILD) => break,
@@ -160,21 +160,21 @@ impl<'s> Waiter<'s> {
         }
 
         // TODO: this is not fine when calling `stty`. Decide how do handle this
-        if let Some(tmodes) = &self.shell.tmodes {
-            if let Err(e) = nix::tcsetattr(self.shell.terminal, libc::TCSADRAIN, tmodes) {
-                eprintln!("tcsetattr({}): {e}", self.shell.terminal);
-            }
+        if let Some(tmodes) = &self.shell.tmodes
+            && let Err(e) = nix::tcsetattr(self.shell.terminal, libc::TCSADRAIN, tmodes)
+        {
+            eprintln!("tcsetattr({}): {e}", self.shell.terminal);
         }
     }
 
-    pub fn bg(&self, job: &mut Job) {
+    /// Continue a stopped job, in the background. It is marked running only when
+    /// it could be signalled.
+    pub fn bg(&self, job: &mut Job) -> io::Result<()> {
         let pgrp = Pid::from_raw(-job.pgid.as_raw());
-        if let Err(e) = nix::kill(pgrp, Signal::SIGCONT) {
-            eprintln!("kill({}, SIGCONT): {e}", pgrp.as_raw());
-        }
+        nix::kill(pgrp, Signal::SIGCONT)?;
 
-        // TODO: error handling?
         job.mark_running();
+        Ok(())
     }
 
     pub fn fg(&self, mut job: Job) -> io::Result<WaitResult> {
@@ -190,13 +190,17 @@ impl<'s> Waiter<'s> {
         // Restore the tmodes on the terminal before sending SIGCONT. They are taken
         // out of the job: once it runs again they are stale, and a fresh copy is
         // saved if it gets stopped again.
-        if let Some(tmodes) = job.tmodes.take() {
-            if let Err(e) = nix::tcsetattr(self.shell.terminal, libc::TCSADRAIN, &tmodes) {
-                eprintln!("tcsetattr({}): {e}", self.shell.terminal);
-            }
+        if let Some(tmodes) = job.tmodes.take()
+            && let Err(e) = nix::tcsetattr(self.shell.terminal, libc::TCSADRAIN, &tmodes)
+        {
+            eprintln!("tcsetattr({}): {e}", self.shell.terminal);
         }
 
-        self.bg(&mut job);
+        if let Err(e) = self.bg(&mut job) {
+            // The terminal goes back to the shell.
+            self.reclaim_terminal(None);
+            return Err(e);
+        }
         self.wait(job)
     }
 }

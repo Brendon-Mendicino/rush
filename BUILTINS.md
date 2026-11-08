@@ -32,20 +32,20 @@ Command search order (§2.9.1): if the name has no `/`, check special built-in �
 
 ## What exists today (`src/builtin/`)
 
-The dispatch is `Executor::unsub_command` → `BUILTINS.get(name)` → `builtin_from_simple_command`, which runs the built-in **in the shell process**. A built-in has the signature `fn(Builtin) -> io::Result<i32>` and gets the shell's real stdin/stdout/stderr, argv, and a read-only `HashMap` copy of *all* shell variables. Arguments are parsed with clap (`Builtin::try_parse`).
+The dispatch is `Executor::unsub_command` → `BUILTINS.get(name)` → `Executor::run_builtin`, which runs the built-in **in the shell process**, or in a forked child inside a pipeline of more than one command. A built-in has the signature `fn(&mut Builtin) -> BuiltinResult` and gets stdin/stdout/stderr, argv, `&mut Shell` (all the shell variables) and `&mut JobTable` (the jobs). Arguments are parsed with clap (`Builtin::parse`).
 
 Problems with this setup, found by reading the code:
 1. ~~Redirections are ignored.~~ Done (0.4): a built-in's redirections are applied to the shell while it runs, then undone.
-2. ~~Pipelines are wrong.~~ Done: in a pipeline of more than one command a built-in runs in a forked child (0.5), so `exit 1 | cat` and `cd /tmp | cat` don't affect the shell and its output goes into the pipe. Outside a pipeline it runs in the shell, where its redirections are still ignored (problem 1).
+2. ~~Pipelines are wrong.~~ Done: in a pipeline of more than one command a built-in runs in a forked child (0.5), so `exit 1 | cat` and `cd /tmp | cat` don't affect the shell and its output goes into the pipe. Outside a pipeline it runs in the shell, with its redirections applied for its duration (0.4).
 3. **`VAR=x` prefixes are dropped** for built-ins (`cmd.envs` isn't used).
-4. ~~Built-ins can't change shell state.~~ Done: `Builtin` now carries `shell: &mut Shell`. The job table (`Executor::bg_jobs`) still can't be reached.
+4. ~~Built-ins can't change shell state.~~ Done: `Builtin` carries `shell: &mut Shell` and `jobs: &mut JobTable` (0.1).
 5. ~~Errors are silent and map to odd codes.~~ Done: built-ins return `Result<Status, Error>` and `builtin::run` reports errors centrally (see 0.3).
 6. **clap is not POSIX.** It adds `--help`/`--version`, uses its own error format, treats `-1` as an option, and can't parse `+o`, `-9` or `-SIGNAME`.
 7. **`exit` calls `std::process::exit`.** That skips cleanup and EXIT traps, and it can't leave just a subshell.
 
 | Built-in | Status |
 |---|---|
-| `cd` | Complete, apart from redirections and pipelines (Phase 0). Tests are in `tests/builtins/cd.rs`. |
+| `cd` | Complete, apart from the POSIX option parser (Phase 0.7). Tests are in `tests/builtins/cd.rs`. |
 | `exit` | `exit [n]` returns `Status::Exit`, and the executor ends the current process: the shell, or only the forked child in a subshell or a pipeline. With no argument it should use `$?`, not 0. Tests are in `tests/builtins/exit.rs`. |
 | `env` | **Not a POSIX built-in.** It ignores its arguments (`env A=1 cmd` doesn't work), prints unexported variables too, and its order is random (HashMap). → Remove it so `/usr/bin/env` runs. Its listing job belongs to `set` and `export -p`. |
 | all the others | Stubs in `src/builtin/<name>.rs` (synopsis + spec link) that print `rush: <name>: not implemented yet` and return 1. They're listed in `tests/builtins/not_implemented.rs`; remove a name from there once it's implemented. |
@@ -53,7 +53,8 @@ Problems with this setup, found by reading the code:
 | `eval` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/eval.rs`. |
 | `:` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/colon.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
-| `pwd` | Complete, apart from redirections and pipelines (Phase 0). Tests are in `tests/builtins/pwd.rs`. |
+| `pwd` | Complete. Tests are in `tests/builtins/pwd.rs`. |
+| `jobs`, `fg`, `bg` | Complete on top of the job table (0.1), apart from what needs `wait`/`$!`/`kill` (Phase 2). Tests are in `tests/builtins/{jobs,fg,bg}.rs`, the shell's own job reports in `tests/job_control.rs`. |
 | `kill`/`newgrp` | The stub exists but is **not registered** in `BUILTINS`. PATH finds `/usr/bin/*`, which is fine for `kill <pid>`, but `kill %1` and similar can't work. |
 
 ---
@@ -62,7 +63,12 @@ Problems with this setup, found by reading the code:
 
 ### Phase 0: infrastructure (do this first; every built-in depends on it)
 
-- [ ] **0.1 Built-in context with mutable state.** ~~Replace the `envs` copy with `&mut Shell`~~ (done). Still to do: move the job table (`Executor::bg_jobs`) somewhere a built-in can reach, either into `Shell` or into a context struct that holds `&mut Shell` + `&mut Jobs`. Keep stdin/stdout/stderr as `dyn Read`/`dyn Write` so tests can capture them.
+- [x] **0.1 Built-in context with mutable state.** `Builtin` carries `shell: &mut Shell` and `jobs: &mut JobTable` (`job.rs`), the executor's table of background and stopped jobs. stdin/stdout/stderr stay `dyn Read`/`dyn Write` so tests can capture them.
+  - `JobTable` is a `BTreeMap` from job number to `JobEntry` (the `Job`, its command text, whether its last change was reported). A new job gets the highest number + 1, so numbering starts again from 1 once the table is empty (bash/dash).
+  - The current/previous job (`+`/`-`): a stopped job first, then the most recently started, stopped or resumed one (a stamp on each entry).
+  - Job IDs (XBD §3.204) are parsed by the built-ins (`builtin::parse_job_id`, a clap `value_parser`) into `JobId` (`Current`, `Previous`, `Number`, `Prefix`, `Contains`); the table only looks them up (`JobTable::find`).
+  - The command text is the AST printed back (`Display` for the syntax nodes in `syntax.rs`), like bash does.
+  - A forked child keeps a snapshot of the table, so `jobs | cat` and `$(jobs -p)` list the shell's jobs; it can't wait on them, and without job control `fg`/`bg` refuse.
 - [x] **0.2 Control-flow result.** `builtin::Status` is `Exited(i32) | Exit(i32) | Return(i32) | Break(n) | Continue(n) | Eval(String) | Exec(Vec<String>)`; `Eval` and `Exec` are already handled. Done: the type. Still to do: the executor unwinds on it (today `Exit`/`Return` map to their code and `Break`/`Continue` to 0), which lets `exit` stop using `process::exit`. `Executor::run` then ends the loop, runs the EXIT trap, and exits with the code.
 - [x] **0.3 Error convention.** Built-ins return `Err(builtin::Error)`, and `builtin::run` writes `rush: <name>: <msg>` on the built-in's stderr with status 1, `Error::new(status, …)` for another status, or 2 for clap usage errors (`--help` → stdout, 0). Use `?`, `.context(what)` on `io::Result`, and `bi.report()` for errors after which the built-in continues. The `128+errno` mapping is gone.
 - [x] **0.4 Redirections for in-process built-ins.** `RedirectGuard::apply` saves every fd the redirections touch, applies them to the shell with `dup2`, and puts the fds back when the guard is dropped, after the built-in (`run_builtin` owns the guard). `exec` without a command keeps them (`RedirectGuard::keep`). The saved copies, like the files the shell opens, go above the highest fd the command names (`RedirectController::floor`), never on a number the user wrote; the shell's terminal copy is moved out of the way when a redirection targets it (`exec 10>log`).
@@ -86,14 +92,23 @@ Problems with this setup, found by reading the code:
 ### Phase 2: job control (needs `&`, a job table, and job IDs)
 `jobs` `fg` `bg` `wait` `kill`
 
-`&` works: `Executor::async_list` forks the list and stores the job in `Executor::bg_jobs`, which are reaped before each prompt (and before each command when non-interactive). On top of that, `Job` needs a job number, the command text, current/previous (`+`/`-`) tracking, a "reported" flag, and the `%`-job-ID parser.
+`&` works: `Executor::async_list` forks the list and puts the job in the job table (0.1), which is updated before each prompt (and before each command when non-interactive). The job number, the command text, the current/previous (`+`/`-`) job, the "reported" flag and the `%` job IDs are done, and so are `jobs`, `fg` and `bg`.
+
+The shell reports jobs in the `jobs` format: a foreground job that stops (`[1] + Stopped (SIGTSTP) sleep 30`) right away, a background job that completed or changed state before the next prompt, then it forgets the completed ones. `cmd &` prints `[1] <pid>` (POSIX Issue 8, bash, dash). All of it only with job control: a non-interactive shell says nothing and keeps the completed jobs until `jobs` reports them.
+
+Still to do for job control:
+- `wait`, `$!` and the list of "known" process IDs; `kill %n` (`kill` is not registered yet)
+- `set -m`/`+m` to turn job control on and off (today it follows `Shell::is_interactive`), and `set -b`
+- a `{CHILD_MAX}` cap on the completed jobs a non-interactive shell keeps
+- `fg` returns `Exited(128 + n)` for a job killed by SIGINT, so an and-or list around `fg` goes on, unlike after a foreground job
+- `%?string` must be quoted for now: `?` is not a word character of the tokenizer
 
 ### Phase 3: built-ins that need language features
 | Built-in | Needs |
 |---|---|
 | `shift`, `set -- args` | positional parameters |
 | `getopts` | positional parameters, `OPTIND`/`OPTARG` |
-| `read` | IFS field splitting (§2.6.5), and reading **byte by byte**, or through the *same* buffered reader the REPL uses. When the script comes in on stdin, `read` must not swallow the lines after its own. |
+| `read` | IFS field splitting (§2.6.5). Its stdin is already unbuffered (`nix::FdReader`, 0.5), so it doesn't swallow the script lines after its own, as long as it reads byte by byte up to the newline. |
 | `.` (dot) | executing a file as a program in the current env (can return `Status::Eval(contents)`; `return` must stop it) |
 | `alias`, `unalias` | alias substitution in the tokenizer (§2.3.1), including "value ending in a blank ⇒ check the next word too" |
 | `trap` | signal handling (a self-pipe or flag set by a `sigaction` handler, checked between commands), the EXIT trap, and resetting traps in subshells |
@@ -242,11 +257,13 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] subshells inherit aliases
 
 #### `bg [job_id...]`
-- [ ] job control must be enabled (interactive / `set -m`), otherwise error
-- [ ] default job: the most recently suspended one; parse `%` job IDs
-- [ ] send SIGCONT to the process group and mark it running (`Waiter::bg` exists)
-- [ ] a job that's already running in the background → no-op, 0
-- [ ] print `"[%d] %s\n"` (job number, command); the pid becomes "known" (`$!`, `wait`)
+- [x] job control must be enabled (interactive), otherwise `rush: bg: no job control`, 1
+- [x] default job: the current one (a stopped job first); `%` job IDs
+- [x] send SIGCONT to the process group and mark it running (`Waiter::bg`); it becomes the most recent job
+- [x] a job that's already running in the background → no-op, 0; a completed one → `job has terminated`, 1
+- [x] print `"[%d] %s\n"` (job number, command)
+- [ ] the pid becomes "known" (`$!`, `wait`)
+- [ ] job control follows `set -m` (today `Shell::is_interactive`)
 
 #### `cd [-L|-P] [directory]` / `cd -`
 - [x] `cd dir`, `cd` → `$HOME`, `cd -` → `$OLDPWD`
@@ -283,11 +300,13 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] the `fc` command itself isn't added to history
 
 #### `fg [job_id]`
-- [ ] job control must be enabled, otherwise error
-- [ ] default: the current job (`%+`); parse job IDs
-- [ ] print the job's command `"%s\n"`, then hand over the terminal, restore tmodes, SIGCONT and wait (`Waiter::fg` exists)
-- [ ] remove it from the list of "known" async pids; if it stops again, it goes back to the job table
-- [ ] status = the job's status
+- [x] job control must be enabled, otherwise `rush: fg: no job control`, 1
+- [x] default: the current job (`%+`); `%` job IDs
+- [x] print the job's command `"%s\n"`, then hand over the terminal, restore tmodes, SIGCONT and wait (`Waiter::fg`)
+- [x] if it stops again, it goes back to the job table under the same number, and is reported
+- [x] status = the job's status (`128 + n` for a signal)
+- [ ] remove it from the list of "known" async pids (`$!`, `wait`)
+- [ ] an interruption (SIGINT) should stop the and-or list around `fg`, like for a foreground job
 
 #### `getopts optstring name [arg...]`
 - [ ] needs positional parameters; `OPTIND` initialized to 1 at shell startup, and OPTIND/OPTARG are not exported
@@ -306,11 +325,13 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] if a remembered path fails, search again
 
 #### `jobs [-l|-p] [job_id...]`
-- [ ] job table with job number, `+`/`-` current/previous (a stopped job takes priority), command text
-- [ ] default: print `"[%d] %c %s %s\n"` (number, current, state, command) for all jobs or the selected ones
-- [ ] states: `Running`, `Done`, `Done(code)`, `Stopped`/`Stopped (SIGTSTP|SIGSTOP|SIGTTIN|SIGTTOU)`, and a distinct format for a job killed by a signal
-- [ ] `-l`: also print the pgid (and the other processes); `-p`: only the pgid of each job leader
-- [ ] reporting a finished job removes it from the table; today `reap_bg_jobs` prints `pgid: Completed …`, which should use the same format
+- [x] job table with job number, `+`/`-` current/previous (a stopped job takes priority), command text (0.1)
+- [x] default: print `"[%d] %c %s %s\n"` (number, current, state, command) for all jobs or the selected ones; a bad job ID is reported and the others still print, status 1
+- [x] states: `Running`, `Done`, `Done(code)`, `Stopped (SIGTSTP|SIGSTOP|SIGTTIN|SIGTTOU)`, and `Terminated (SIGxxx)` for a job killed by a signal
+- [x] `-l`: also print the process ID of the job (its group leader, `Job::leader`); `-p`: only that process ID
+- [x] reporting a finished job removes it from the table; the shell's own reports (`notify_jobs`, `job_stopped`) use the same format
+- [x] lists the shell's jobs in a forked child too (`jobs | cat`, `$(jobs -p)`)
+- [ ] `-l`: the other processes of the job on their own lines
 
 #### `kill`
 - [ ] `kill pid...` sends SIGTERM by default
