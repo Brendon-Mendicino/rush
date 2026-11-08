@@ -1158,7 +1158,7 @@ impl Executor {
     fn job_stopped(&mut self, job: Job, sig_stop: Signal, command: String) -> ExecStatus {
         let number = self.jobs.insert(job, command);
 
-        if let Some(line) = self.jobs.format_line(number, false) {
+        if let Some(line) = self.jobs.report().line(number, false) {
             eprintln!("{line}");
         }
         ExecStatus::Stopped(sig_stop)
@@ -1389,7 +1389,7 @@ impl Executor {
     }
 
     /// Collect what happened to the jobs. An interactive shell reports the
-    /// changes in the `jobs` format and forgets the completed jobs (`set -m`).
+    /// changes in the `jobs` format and drops the completed jobs (`set -m`).
     /// A non-interactive one says nothing and keeps them until `jobs` reports
     /// them.
     fn notify_jobs(&mut self) {
@@ -1399,19 +1399,15 @@ impl Executor {
             return;
         }
 
-        for number in self.jobs.numbers() {
-            if self.jobs.get(number).is_some_and(|entry| entry.reported) {
-                continue;
-            }
-            if let Some(line) = self.jobs.format_line(number, false) {
+        // Dropping the report drops the completed jobs it showed.
+        let mut report = self.jobs.report();
+        // Collected: printing a line needs the report mutably.
+        let unreported: Vec<usize> = report.unreported().collect();
+        for number in unreported {
+            if let Some(line) = report.line(number, false) {
                 eprintln!("{line}");
             }
-            if let Some(entry) = self.jobs.get_mut(number) {
-                entry.reported = true;
-            }
         }
-
-        self.jobs.forget_reported_done();
     }
 }
 

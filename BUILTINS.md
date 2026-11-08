@@ -94,7 +94,7 @@ Problems with this setup, found by reading the code:
 
 `&` works: `Executor::async_list` forks the list and puts the job in the job table (0.1), which is updated before each prompt (and before each command when non-interactive). The job number, the command text, the current/previous (`+`/`-`) job, the "reported" flag and the `%` job IDs are done, and so are `jobs`, `fg` and `bg`.
 
-The shell reports jobs in the `jobs` format: a foreground job that stops (`[1] + Stopped (SIGTSTP) sleep 30`) right away, a background job that completed or changed state before the next prompt, then it forgets the completed ones. `cmd &` prints `[1] <pid>` (POSIX Issue 8, bash, dash). All of it only with job control: a non-interactive shell says nothing and keeps the completed jobs until `jobs` reports them.
+The shell reports jobs in the `jobs` format: a foreground job that stops (`[1] + Stopped (SIGTSTP) sleep 30`) right away, a background job that completed or changed state before the next prompt, then it drops the completed ones. `cmd &` prints `[1] <pid>` (POSIX Issue 8, bash, dash). All of it only with job control: a non-interactive shell says nothing and keeps the completed jobs until `jobs` reports them.
 
 Still to do for job control:
 - `wait`, `$!` and the list of "known" process IDs; `kill %n` (`kill` is not registered yet)

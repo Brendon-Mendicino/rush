@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
+    ops::Deref,
 };
 
 use crate::{
@@ -99,8 +100,12 @@ pub struct JobEntry {
     /// The command that formed the job, as `jobs`, `fg` and `bg` print it.
     pub command: String,
     pub job: Job,
-    /// Whether the last change of state was shown to the user.
-    pub reported: bool,
+    /// Whether the last change of state was shown to the user, through a
+    /// [`JobReport`].
+    // TODO: check if i can remove this from here, having a bool does not seems like a good idea
+    // for retaining the completed jobs that already reported, this could be made into an enum
+    // somewere
+    reported: bool,
     /// When the job was last started, stopped or resumed: the most recent one is
     /// the current job.
     last_used: u64,
@@ -271,16 +276,16 @@ impl JobTable {
         }
     }
 
-    /// Forget the completed jobs that were reported: their status was shown, and
-    /// their pids are gone.
-    pub fn forget_reported_done(&mut self) {
-        self.jobs
-            .retain(|_, entry| !entry.reported || !matches!(entry.job.state(), JobState::Done(_)));
+    /// Start reporting jobs to the user. The jobs shown through the report are
+    /// marked reported, and the completed ones leave the table when the report
+    /// is dropped.
+    pub fn report(&mut self) -> JobReport<'_> {
+        JobReport { table: self }
     }
 
     /// A line of `jobs`: `"[%d] %c %s %s"` (job number, current, state, command),
     /// with the process group ID before the state when `long` (`jobs -l`).
-    pub fn format_line(&self, number: usize, long: bool) -> Option<String> {
+    fn format_line(&self, number: usize, long: bool) -> Option<String> {
         let entry = self.jobs.get(&number)?;
         let marker = self.marker(number);
         let state = entry.job.state();
@@ -292,6 +297,56 @@ impl JobTable {
         } else {
             format!("[{number}] {marker} {state} {command}")
         })
+    }
+}
+
+/// Jobs being reported to the user (`jobs`, the shell's own notifications).
+///
+/// Each line taken from the report marks its job reported. When the report is
+/// dropped the reported jobs that completed leave the table: their status was
+/// shown, and their pids are gone (POSIX: reporting the termination of a job
+/// forgets its process ID). The table can still be read through the report.
+pub struct JobReport<'t> {
+    table: &'t mut JobTable,
+}
+
+impl JobReport<'_> {
+    /// The `jobs` line of a job (see [`JobTable::format_line`]); the job is now
+    /// reported.
+    pub fn line(&mut self, number: usize, long: bool) -> Option<String> {
+        let line = self.table.format_line(number, long)?;
+
+        if let Some(entry) = self.table.jobs.get_mut(&number) {
+            entry.reported = true;
+        }
+        Some(line)
+    }
+
+    /// The jobs whose last change was not reported yet, by job number. The
+    /// iterator borrows the report: collect it before calling
+    /// [`JobReport::line`].
+    pub fn unreported(&self) -> impl Iterator<Item = usize> {
+        self.table
+            .jobs
+            .iter()
+            .filter(|(_, entry)| !entry.reported)
+            .map(|(&number, _)| number)
+    }
+}
+
+impl Deref for JobReport<'_> {
+    type Target = JobTable;
+
+    fn deref(&self) -> &JobTable {
+        self.table
+    }
+}
+
+impl Drop for JobReport<'_> {
+    fn drop(&mut self) {
+        self.table
+            .jobs
+            .retain(|_, entry| !entry.reported || !matches!(entry.job.state(), JobState::Done(_)));
     }
 }
 
@@ -646,15 +701,25 @@ mod tests {
     }
 
     #[test]
-    fn reported_done_jobs_are_forgotten() {
+    fn a_report_drops_the_completed_jobs_it_showed() {
         let mut table = JobTable::default();
         table.insert(job(10, ProcStatus::Exited(0)), "a".into());
         table.insert(job(11, ProcStatus::Exited(0)), "b".into());
         table.insert(running(12), "c".into());
-        table.get_mut(2).unwrap().reported = false;
+        table.jobs.get_mut(&1).unwrap().reported = false;
+        table.jobs.get_mut(&2).unwrap().reported = false;
 
-        table.forget_reported_done();
+        {
+            let mut report = table.report();
+            assert_eq!(report.unreported().collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(report.line(1, false).unwrap(), "[1]   Done a");
+            assert_eq!(report.line(3, false).unwrap(), "[3] + Running c");
+            // Still in the table while the report lives.
+            assert_eq!(report.numbers(), [1, 2, 3]);
+            assert_eq!(report.unreported().collect::<Vec<_>>(), [2]);
+        }
 
+        // `1` was shown, `2` was not, `3` is still running.
         assert_eq!(table.numbers(), [2, 3]);
     }
 }

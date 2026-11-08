@@ -9,7 +9,7 @@
 use clap::Parser;
 
 use crate::{
-    builtin::{Builtin, BuiltinResult, ENDL, Status, parse_job_id},
+    builtin::{Builtin, BuiltinResult, Status, parse_job_id},
     job::JobId,
 };
 
@@ -22,7 +22,7 @@ use crate::{
 /// %string (the job whose command begins with string) or %?string (the job
 /// whose command contains string).
 ///
-/// A completed job is reported once, then forgotten.
+/// A completed job is reported once, then dropped.
 ///
 /// Exit status:
 ///   0   success
@@ -49,7 +49,7 @@ pub fn jobs(bi: &mut Builtin) -> BuiltinResult {
     let numbers = if args.job_ids.is_empty() {
         bi.jobs.numbers()
     } else {
-        let mut numbers = Vec::new();
+        let mut numbers = Vec::with_capacity(args.job_ids.len());
         for id in &args.job_ids {
             match bi.jobs.find(id) {
                 Ok(number) => numbers.push(number),
@@ -62,24 +62,18 @@ pub fn jobs(bi: &mut Builtin) -> BuiltinResult {
         numbers
     };
 
+    // Reporting the termination of a job drops it: the report does, when it is
+    // dropped. `-p` only reads the table, it reports nothing.
+    let mut report = bi.jobs.report();
     for number in numbers {
         if args.pids {
-            if let Some(entry) = bi.jobs.get(number) {
-                write!(bi.stdout, "{}{ENDL}", entry.job.leader().as_raw())?;
+            if let Some(entry) = report.get(number) {
+                writeln!(bi.stdout, "{}", entry.job.leader().as_raw())?;
             }
-            continue;
-        }
-
-        if let Some(line) = bi.jobs.format_line(number, args.long) {
-            write!(bi.stdout, "{line}{ENDL}")?;
-        }
-        if let Some(entry) = bi.jobs.get_mut(number) {
-            entry.reported = true;
+        } else if let Some(line) = report.line(number, args.long) {
+            writeln!(bi.stdout, "{line}")?;
         }
     }
-
-    // Reporting the termination of a job forgets it.
-    bi.jobs.forget_reported_done();
 
     Ok(status)
 }

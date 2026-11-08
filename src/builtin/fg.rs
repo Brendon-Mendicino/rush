@@ -62,7 +62,7 @@ pub fn fg(bi: &mut Builtin) -> BuiltinResult {
         WaitResult::Completed(exit) => Ok(Status::Exited(exit.code())),
         WaitResult::Stopped { job, sig_stop } => {
             bi.jobs.restore(number, job, entry.command);
-            if let Some(line) = bi.jobs.format_line(number, false) {
+            if let Some(line) = bi.jobs.report().line(number, false) {
                 write!(bi.stderr, "{line}{ENDL}")?;
             }
             Ok(Status::Exited(128 + sig_stop as i32))
