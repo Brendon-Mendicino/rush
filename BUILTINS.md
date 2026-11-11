@@ -37,7 +37,7 @@ The dispatch is `Executor::unsub_command` → `BUILTINS.get(name)` → `Executor
 Problems with this setup, found by reading the code:
 1. ~~Redirections are ignored.~~ Done (0.4): a built-in's redirections are applied to the shell while it runs, then undone.
 2. ~~Pipelines are wrong.~~ Done: in a pipeline of more than one command a built-in runs in a forked child (0.5), so `exit 1 | cat` and `cd /tmp | cat` don't affect the shell and its output goes into the pipe. Outside a pipeline it runs in the shell, with its redirections applied for its duration (0.4).
-3. **`VAR=x` prefixes are dropped** for built-ins (`cmd.envs` isn't used).
+3. ~~`VAR=x` prefixes are dropped~~ Done (0.6): they stay in the shell for a special built-in, and last while a regular one runs.
 4. ~~Built-ins can't change shell state.~~ Done: `Builtin` carries `shell: &mut Shell` and `jobs: &mut JobTable` (0.1).
 5. ~~Errors are silent and map to odd codes.~~ Done: built-ins return `Result<Status, Error>` and `builtin::run` reports errors centrally (see 0.3).
 6. **clap is not POSIX.** It adds `--help`/`--version`, uses its own error format, treats `-1` as an option, and can't parse `+o`, `-9` or `-SIGNAME`.
@@ -49,9 +49,10 @@ Problems with this setup, found by reading the code:
 | `exit` | `exit [n]` returns `Status::Exit`, and the executor ends the current process: the shell, or only the forked child in a subshell or a pipeline. With no argument it should use `$?`, not 0. Tests are in `tests/builtins/exit.rs`. |
 | `env` | **Not a POSIX built-in.** It ignores its arguments (`env A=1 cmd` doesn't work), prints unexported variables too, and its order is random (HashMap). → Remove it so `/usr/bin/env` runs. Its listing job belongs to `set` and `export -p`. |
 | all the others | Stubs in `src/builtin/<name>.rs` (synopsis + spec link) that print `rush: <name>: not implemented yet` and return 1. They're listed in `tests/builtins/not_implemented.rs`; remove a name from there once it's implemented. |
-| `exec` | Complete, apart from the special-built-in rules (Phase 0.6). In a pipeline it replaces only that command's child. Tests are in `tests/builtins/exec.rs`. |
-| `eval` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/eval.rs`. |
-| `:` | Complete, apart from the special-built-in rules (Phase 0.6). Tests are in `tests/builtins/colon.rs`. |
+| `exec` | Complete. In a pipeline it replaces only that command's child. Tests are in `tests/builtins/exec.rs`. |
+| `eval` | Complete. Tests are in `tests/builtins/eval.rs`. |
+| `:` | Complete. Tests are in `tests/builtins/colon.rs`. |
+| special vs regular | The prefix and error rules of 0.6 are tested in `tests/builtins/special.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
 | `pwd` | Complete. Tests are in `tests/builtins/pwd.rs`. |
 | `jobs`, `fg`, `bg` | Complete on top of the job table (0.1), apart from what needs `wait`/`$!`/`kill` (Phase 2). Tests are in `tests/builtins/{jobs,fg,bg}.rs`, the shell's own job reports in `tests/job_control.rs`. |
@@ -74,9 +75,11 @@ Problems with this setup, found by reading the code:
 - [x] **0.4 Redirections for in-process built-ins.** `RedirectGuard::apply` saves every fd the redirections touch, applies them to the shell with `dup2`, and puts the fds back when the guard is dropped, after the built-in (`run_builtin` owns the guard). `exec` without a command keeps them (`RedirectGuard::keep`). The saved copies, like the files the shell opens, go above the highest fd the command names (`RedirectController::floor`), never on a number the user wrote; the shell's terminal copy is moved out of the way when a redirection targets it (`exec 10>log`).
 - [x] **0.5 Built-ins in pipelines.** When a built-in isn't the only command (`PipelineState::in_pipeline`, set once by `schedule_pipeline` for every command of a pipeline of more than one), `unsub_command` runs it through `fork_child`, which sets up the pipe fds, applies its redirections, puts it in the job's process group and ends it with `_exit(status)`. `Executor::run_builtin` itself doesn't know about pipelines. Built-ins inside `( )`, `&` and `$(...)` run in a forked child too. Tests are in `tests/builtins/pipeline.rs`.
   - A built-in's stdin is an unbuffered `nix::FdReader` on fd 0, not `io::stdin()`: the global buffered stdin may hold script lines the REPL read ahead (in the shell, and copied into a forked child), which `read` must not see.
-- [ ] **0.6 Classification and lookup order.** Keep two tables, `SPECIAL_BUILTINS` and `REGULAR_BUILTINS`. Order: special → (functions, later) → regular → PATH.
-  - Special built-ins: assignment prefixes are applied to the shell vars permanently, and an error or redirection error exits a non-interactive shell.
-  - Regular built-ins: assignment prefixes are visible only while the built-in runs (save the old values and restore them).
+- [x] **0.6 Classification and lookup order.** `BUILTINS` maps each name to a `BuiltinDef { kind: Kind::Special | Kind::Regular, run }`, and `builtin::find(name)` looks it up. The order of §2.9.1 is special → functions → regular → PATH; there are no functions yet, so one lookup covers both kinds (it splits around the functions once they exist).
+  - Special built-ins: the `VAR=x` prefixes are assigned to the shell for good (`ShellEnv::upsert`, keeping the attributes of an existing variable; a new one is not exported, which §2.9.1 leaves unspecified). An error exits a non-interactive shell with the built-in's status (`Executor::builtin_error`); so do a redirection error on one, a syntax error in `eval` (2) and an `exec` whose command can't run (127/126). In a forked child (subshell, pipeline command, `$(...)`) only the child exits. An interactive shell goes on.
+  - Regular built-ins: the prefixes are set exported while the built-in runs and put back afterwards (`Shell::set_temporarily` returns a `TempVarsGuard`, which restores them when dropped). TODO: what happens when the built-in itself changes one of them (`PWD=/x cd`, `VAR=x read VAR`, a `command unset VAR`), see the doc of `TempVarsGuard`. Their errors never exit the shell.
+  - "Error" is an `Err` returned by the built-in (`builtin::run` gives back `Err(status)`); `bi.report` followed by `Ok(Status::FAILURE)` is a failure but not an error. The stubs work that way, so a special built-in that isn't implemented yet doesn't exit a script.
+  - Still to do: `command` must strip the special properties (§2.9.1); a syntax error in the script itself should exit a non-interactive shell too (§2.8.1), today it is reported and the shell goes on; variable assignment errors (readonly, 0.8).
 - [ ] **0.7 POSIX option parser.** Write a small getopt in `builtin/mod.rs` that follows Utility Syntax Guidelines 3–10: grouped `-abc`, option arguments attached or separate, `--`, and a bare `-` counts as an operand. It should also allow `+x` for `set`. Use it instead of clap for the POSIX built-ins, and reuse it in `getopts`.
 - [ ] **0.8 Variables model (`shell.rs`).**
   - `Var.value: Option<String>`, because `export X` with X unset must mark it exported without giving it a value.
@@ -132,7 +135,8 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 #### `:` (colon)
 - [x] `: [arg...]`: do nothing, exit 0; arguments are ignored, with no options and no special `--` (the shell expands them once expansion exists)
 - [x] `: >file` creates/truncates the file (the executor opens a built-in's redirection files); a failed redirection → status 1
-- [ ] `x=y :` keeps `x` (special-built-in assignment rule, needs Phase 0.6)
+- [x] `x=y :` keeps `x` (special-built-in assignment rule, 0.6)
+- [x] a failed redirection exits a non-interactive shell (0.6)
 
 #### `break [n]` / `continue [n]`
 - [ ] needs loops (phase 3)
@@ -154,8 +158,8 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] no arguments, or only empty ones → 0
 - [x] its status is the status of the program; an interruption (SIGINT) stays visible to the surrounding and-or list
 - [x] parse error → `rush: syntax error`, status 2
-- [ ] parse error exits a non-interactive shell (special-built-in error, needs Phase 0.6)
-- [ ] `x=y eval …` keeps `x` (Phase 0.6)
+- [x] parse error exits a non-interactive shell with status 2 (special-built-in error, 0.6)
+- [x] `x=y eval …` keeps `x` (0.6)
 
 #### `exec [command [arg...]]`
 - [x] returns `Status::Exec(argv)`; the executor does the work because it has the redirections and the prefixes (`Executor::exec`)
@@ -164,7 +168,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] restore the job-control signals to default before exec'ing
 - [x] command not found → 127; not executable → 126; the shell goes on with its fds and signals put back (`RedirectGuard`)
 - [x] a leading `--` is skipped
-- [ ] a failed exec or redirection error exits a non-interactive shell (status 1–125 for redirections; Phase 0.6)
+- [x] a failed exec (127/126) or a redirection error (1) exits a non-interactive shell (0.6); `x=y exec …` keeps `x` when the exec fails
 - [x] inside a multi-command pipeline it replaces only that command's child (`exec echo a | cat`)
 - [ ] `exec <file`: the shell reads its own commands through a buffered stdin, so lines already buffered from the old stdin still run first; `exec cmd` loses them (needs unbuffered reading of the input, like `read`)
 

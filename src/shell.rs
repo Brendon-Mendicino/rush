@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     env, io,
+    ops::{Deref, DerefMut},
     os::fd::{AsRawFd, RawFd},
 };
 
@@ -33,6 +34,30 @@ pub struct Shell {
     /// not interactive or they could not be read.
     pub tmodes: Option<libc::termios>,
     pub env: ShellEnv,
+}
+
+/// Variables set for the duration of a command (the `VAR=x` prefixes of a
+/// regular built-in, §2.9.1), created by [`Shell::set_temporarily`]. It hands
+/// out the shell, for the command to run with; dropping it puts back what the
+/// variables were, the old value and attributes, or nothing for a variable that
+/// didn't exist.
+///
+/// TODO: decide what happens to these variables when the command itself
+/// changes them. Restoring blindly undoes the command's own assignment:
+/// - `PWD=/x cd /tmp` leaves the old `PWD` behind, wrong after `cd` changed it
+///   (`OLDPWD` too);
+/// - `VAR=x read VAR` (BUILTINS.md) loses what `read` assigned, and the same for
+///   `getopts` with `OPTIND`/`OPTARG`;
+/// - `export`, `readonly`, `unset` and `set` are special built-ins, so their
+///   prefixes are not temporary, but a function or `command` (which strips the
+///   special properties) could run them while a guard is alive: an `unset VAR`
+///   or `export VAR` would be undone, and `readonly VAR` would be overwritten.
+///   Readonly variables also have to be refused as prefixes in the first place.
+#[must_use = "the variables are put back as soon as the guard is dropped"]
+#[derive(Debug)]
+pub struct TempVarsGuard<'s> {
+    shell: &'s mut Shell,
+    saved: Vec<(String, Option<Var>)>,
 }
 
 /// Signals ignored by an interactive shell, the children restore them to the default.
@@ -105,6 +130,23 @@ impl ShellEnv {
 }
 
 impl Shell {
+    /// Set variables, exported, until the returned guard is dropped (the
+    /// `VAR=x` prefixes of a regular built-in, §2.9.1).
+    pub fn set_temporarily<'a>(
+        &mut self,
+        vars: impl IntoIterator<Item = (&'a str, String)>,
+    ) -> TempVarsGuard<'_> {
+        let mut saved = Vec::new();
+
+        for (name, value) in vars {
+            saved.push((name.to_string(), self.env.env.get(name).cloned()));
+            self.env
+                .upsert(name, value, Some(VarAttr { exported: true }));
+        }
+
+        TempVarsGuard { shell: self, saved }
+    }
+
     /// Make sure the shell is running interactively as the foreground job
     /// before proceeding.
     pub fn new() -> Self {
@@ -201,6 +243,34 @@ impl Shell {
     }
 }
 
+impl Deref for TempVarsGuard<'_> {
+    type Target = Shell;
+
+    fn deref(&self) -> &Shell {
+        self.shell
+    }
+}
+
+impl DerefMut for TempVarsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Shell {
+        self.shell
+    }
+}
+
+impl Drop for TempVarsGuard<'_> {
+    fn drop(&mut self) {
+        let env = &mut self.shell.env.env;
+
+        // Backwards: with `x=1 x=2 cmd` the first saved value is the original.
+        for (name, var) in self.saved.drain(..).rev() {
+            match var {
+                Some(var) => env.insert(name, var),
+                None => env.remove(&name),
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +312,43 @@ mod tests {
 
         let exported: Vec<_> = vars.exported().collect();
         assert_eq!(exported, [("ENV", "3")]);
+    }
+
+    #[test]
+    fn temporary_variables_are_restored_on_drop() {
+        let mut env = ShellEnv::default();
+        env.upsert("KEPT", "old", None);
+        let mut shell = Shell {
+            pgid: Pid::from_raw(0),
+            terminal: libc::STDIN_FILENO,
+            is_interactive: false,
+            tmodes: None,
+            env,
+        };
+
+        let var = |env: &ShellEnv, name| env.env.get(name).cloned();
+
+        {
+            let guard = shell.set_temporarily([
+                ("KEPT", "new".to_string()),
+                ("NEW", "1".to_string()),
+                ("NEW", "2".to_string()),
+            ]);
+
+            assert_eq!(guard.env.get("KEPT"), Some("new"));
+            assert_eq!(guard.env.get("NEW"), Some("2"));
+            // Exported while the command runs.
+            assert!(var(&guard.env, "KEPT").unwrap().attr.exported);
+            assert!(var(&guard.env, "NEW").unwrap().attr.exported);
+        }
+
+        assert_eq!(
+            var(&shell.env, "KEPT"),
+            Some(Var {
+                value: "old".into(),
+                attr: VarAttr { exported: false },
+            })
+        );
+        assert_eq!(shell.env.get("NEW"), None);
     }
 }

@@ -48,25 +48,42 @@ fn the_command_gets_the_redirections() {
 }
 
 #[test]
-fn a_missing_command_fails_and_the_shell_goes_on() {
+fn a_missing_command_exits_a_non_interactive_shell() {
     let output = run_shell("exec nonexistent-rush-cmd || echo failed\necho after\n");
 
     assert!(stderr(&output).contains("rush: nonexistent-rush-cmd: command not found"));
-    assert_eq!(stdout(&output), "failed\nafter\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(127));
+}
+
+#[test]
+fn a_missing_command_fails_and_an_interactive_shell_goes_on() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("exec nonexistent-rush-cmd || echo failed\n");
+    sh.stderr
+        .expect("rush: nonexistent-rush-cmd: command not found");
+    sh.stdout.expect("failed\r\n");
 }
 
 #[test]
 fn a_failed_exec_puts_the_fds_back() {
     let dir = test_dir("exec_restore_fds");
+    let out = dir.join("out");
+    let mut sh = InteractiveShell::spawn();
 
-    let output = run_shell_in("exec nonexistent-rush-cmd >out || echo failed\n", &dir);
+    sh.send(&format!(
+        "exec nonexistent-rush-cmd >{} || echo failed\n",
+        out.display()
+    ));
 
-    assert_eq!(stdout(&output), "failed\n");
-    assert_eq!(fs::read_to_string(dir.join("out")).unwrap(), "");
+    // `failed` reaches the terminal, not the file.
+    sh.stdout.expect("failed\r\n");
+    assert_eq!(fs::read_to_string(out).unwrap(), "");
 }
 
 #[test]
-fn a_file_that_is_not_executable_fails() {
+fn a_file_that_is_not_executable_exits_with_126() {
     let dir = test_dir("exec_not_executable");
     fs::write(dir.join("script"), "echo no\n").unwrap();
     fs::set_permissions(dir.join("script"), fs::Permissions::from_mode(0o644)).unwrap();
@@ -74,7 +91,8 @@ fn a_file_that_is_not_executable_fails() {
     let output = run_shell_in("exec ./script || echo failed\n", &dir);
 
     assert!(stderr(&output).contains("rush: ./script: Permission denied"));
-    assert_eq!(stdout(&output), "failed\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(126));
 }
 
 #[test]
@@ -119,13 +137,14 @@ fn redirects_the_errors_of_the_shell() {
 }
 
 #[test]
-fn a_failed_redirection_fails() {
+fn a_failed_redirection_exits_a_non_interactive_shell() {
     let dir = test_dir("exec_bad_redirection");
 
     let output = run_shell_in("exec <missing || echo failed\necho after\n", &dir);
 
     assert!(stderr(&output).contains("missing"));
-    assert_eq!(stdout(&output), "failed\nafter\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

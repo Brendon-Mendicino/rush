@@ -171,9 +171,15 @@ pub type BuiltinResult = Result<Status, Error>;
 pub type FnBuiltin = fn(&mut Builtin) -> BuiltinResult;
 
 /// Run a built-in and handle its result, like Rust does with the `Result` returned
-/// by `main`: an error is reported on the built-in's stderr and becomes its exit
-/// status. Stdout is flushed, the built-ins don't need to.
-pub fn run(f: FnBuiltin, mut bi: Builtin) -> Status {
+/// by `main`: an error is reported on the built-in's stderr. Stdout is flushed,
+/// the built-ins don't need to.
+///
+/// `Ok` is how the built-in finished, whatever its status. `Err` is the status of
+/// a built-in that failed with an error (an `Err` it returned, or a usage error).
+/// For a special built-in that is a "special built-in utility error" (POSIX
+/// §2.8.1), which exits a non-interactive shell; a diagnostic after which the
+/// built-in goes on (`bi.report` and `Ok(Status::FAILURE)`) is not.
+pub fn run(f: FnBuiltin, mut bi: Builtin) -> Result<Status, i32> {
     let result = f(&mut bi).and_then(|status| {
         bi.stdout.flush()?;
         Ok(status)
@@ -182,18 +188,19 @@ pub fn run(f: FnBuiltin, mut bi: Builtin) -> Status {
     // When even the diagnostic cannot be written there is nothing left to do, the
     // status still tells that it failed.
     match result {
-        Ok(status) => status,
+        Ok(status) => Ok(status),
         Err(Error::Usage(e)) if e.use_stderr() => {
             let _ = write!(bi.stderr, "{e}");
-            Status::Exited(2)
+            Err(2)
         }
+        // `--help`: not an error.
         Err(Error::Usage(e)) => {
             let _ = write!(bi.stdout, "{e}").and_then(|_| bi.stdout.flush());
-            Status::SUCCESS
+            Ok(Status::SUCCESS)
         }
         Err(Error::Failure { status, message }) => {
             let _ = bi.report(message);
-            Status::Exited(status)
+            Err(status)
         }
     }
 }
@@ -229,14 +236,39 @@ fn find_job(jobs: &JobTable, id: Option<&JobId>) -> Result<usize, String> {
     }
 }
 
-/// Body of the built-ins that are not implemented yet: report it and fail.
-fn not_implemented(_bi: &mut Builtin) -> BuiltinResult {
-    Err("not implemented yet".into())
+/// Body of the built-ins that are not implemented yet: report it and fail. Not an
+/// error, so that a missing special built-in doesn't exit a script.
+fn not_implemented(bi: &mut Builtin) -> BuiltinResult {
+    bi.report("not implemented yet")?;
+    Ok(Status::FAILURE)
 }
 
-pub static BUILTINS: LazyLock<HashMap<&str, FnBuiltin>> = LazyLock::new(|| {
-    let builtins: [(&str, FnBuiltin); _] = [
-        // Special built-ins.
+/// The two kinds of built-ins (POSIX §2.14, §1.6). They differ in two ways:
+/// the `VAR=x` prefixes of a special built-in stay in the shell, the ones of a
+/// regular built-in last while it runs; and an error in a special built-in, or a
+/// redirection error on one, exits a non-interactive shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Special,
+    Regular,
+}
+
+/// A built-in of the [`BUILTINS`] table.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinDef {
+    pub kind: Kind,
+    pub run: FnBuiltin,
+}
+
+/// The built-in called `name`, if any. The command search (§2.9.1) finds a
+/// special built-in first, then a function, then a regular built-in, then a
+/// program in PATH. There are no functions yet, so one lookup covers both kinds.
+pub fn find(name: &str) -> Option<BuiltinDef> {
+    BUILTINS.get(name).copied()
+}
+
+static BUILTINS: LazyLock<HashMap<&str, BuiltinDef>> = LazyLock::new(|| {
+    let special: [(&str, FnBuiltin); _] = [
         ("break", self::r#break::r#break),
         (":", self::colon::colon),
         ("continue", self::r#continue::r#continue),
@@ -252,7 +284,8 @@ pub static BUILTINS: LazyLock<HashMap<&str, FnBuiltin>> = LazyLock::new(|| {
         ("times", self::times::times),
         ("trap", self::trap::trap),
         ("unset", self::unset::unset),
-        // Regular built-ins.
+    ];
+    let regular: [(&str, FnBuiltin); _] = [
         ("alias", self::alias::alias),
         ("bg", self::bg::bg),
         ("cd", self::cd::cd),
@@ -273,7 +306,14 @@ pub static BUILTINS: LazyLock<HashMap<&str, FnBuiltin>> = LazyLock::new(|| {
         ("wait", self::wait::wait),
     ];
 
-    builtins.into_iter().collect()
+    let special = special.map(|(name, run)| (name, Kind::Special, run));
+    let regular = regular.map(|(name, run)| (name, Kind::Regular, run));
+
+    special
+        .into_iter()
+        .chain(regular)
+        .map(|(name, kind, run)| (name, BuiltinDef { kind, run }))
+        .collect()
 });
 
 impl Builtin<'_, '_, '_, '_, '_> {
@@ -320,7 +360,7 @@ mod tests {
     }
 
     struct Output {
-        status: Status,
+        status: Result<Status, i32>,
         stdout: String,
         stderr: String,
         all_flushed: bool,
@@ -385,9 +425,9 @@ mod tests {
             Ok(Status::Break(2))
         }
 
-        assert_eq!(run_builtin(exited, &["x"]).status, Status::Exited(3));
-        assert_eq!(run_builtin(exit, &["x"]).status, Status::Exit(4));
-        assert_eq!(run_builtin(brk, &["x"]).status, Status::Break(2));
+        assert_eq!(run_builtin(exited, &["x"]).status, Ok(Status::Exited(3)));
+        assert_eq!(run_builtin(exit, &["x"]).status, Ok(Status::Exit(4)));
+        assert_eq!(run_builtin(brk, &["x"]).status, Ok(Status::Break(2)));
     }
 
     #[test]
@@ -411,7 +451,7 @@ mod tests {
 
         let output = run_builtin(fails, &["name", "arg"]);
 
-        assert_eq!(output.status, Status::Exited(1));
+        assert_eq!(output.status, Err(1));
         assert_eq!(output.stderr, "rush: name: something went wrong\n");
         assert_eq!(output.stdout, "");
     }
@@ -424,7 +464,7 @@ mod tests {
 
         let output = run_builtin(not_found, &["name"]);
 
-        assert_eq!(output.status, Status::Exited(127));
+        assert_eq!(output.status, Err(127));
         assert_eq!(output.stderr, "rush: name: nope: not found\n");
     }
 
@@ -440,7 +480,7 @@ mod tests {
         let plain = run_builtin(io_error, &["name"]);
         let context = run_builtin(with_context, &["name"]);
 
-        assert_eq!(plain.status, Status::Exited(1));
+        assert_eq!(plain.status, Err(1));
         assert_eq!(plain.stderr, "rush: name: No such file or directory\n");
         assert_eq!(
             context.stderr,
@@ -452,7 +492,7 @@ mod tests {
     fn a_usage_error_has_status_2() {
         let output = run_builtin(parses, &["name", "-x"]);
 
-        assert_eq!(output.status, Status::Exited(2));
+        assert_eq!(output.status, Err(2));
         assert!(output.stderr.contains("unexpected argument '-x'"));
         assert_eq!(output.stdout, "");
     }
@@ -461,7 +501,7 @@ mod tests {
     fn help_goes_to_stdout_with_status_0() {
         let output = run_builtin(parses, &["name", "--help"]);
 
-        assert_eq!(output.status, Status::SUCCESS);
+        assert_eq!(output.status, Ok(Status::SUCCESS));
         assert!(output.stdout.contains("Usage: name"));
         assert!(output.all_flushed);
         assert_eq!(output.stderr, "");
@@ -469,7 +509,10 @@ mod tests {
 
     #[test]
     fn valid_arguments_are_parsed() {
-        assert_eq!(run_builtin(parses, &["name", "-f"]).status, Status::SUCCESS);
+        assert_eq!(
+            run_builtin(parses, &["name", "-f"]).status,
+            Ok(Status::SUCCESS)
+        );
     }
 
     #[test]
@@ -501,8 +544,29 @@ mod tests {
 
         let output = run_builtin(partial, &["name"]);
 
-        assert_eq!(output.status, Status::FAILURE);
+        assert_eq!(output.status, Ok(Status::FAILURE));
         assert_eq!(output.stderr, "rush: name: a: bad\n");
         assert_eq!(output.stdout, "b\n");
+    }
+
+    #[test]
+    fn a_stub_fails_without_an_error() {
+        let output = run_builtin(not_implemented, &["set", "-e"]);
+
+        assert_eq!(output.status, Ok(Status::FAILURE));
+        assert_eq!(output.stderr, "rush: set: not implemented yet\n");
+    }
+
+    #[test]
+    fn builtins_have_their_kind() {
+        let kind = |name| find(name).map(|def| def.kind);
+
+        for name in [":", "eval", "exec", "exit", "export", "set", "unset", "."] {
+            assert_eq!(kind(name), Some(Kind::Special), "{name}");
+        }
+        for name in ["cd", "pwd", "true", "false", "jobs", "fg", "bg", "wait"] {
+            assert_eq!(kind(name), Some(Kind::Regular), "{name}");
+        }
+        assert_eq!(kind("ls"), None);
     }
 }

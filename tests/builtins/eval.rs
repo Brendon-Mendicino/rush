@@ -3,7 +3,9 @@
 
 use std::fs;
 
-use crate::common::{run, run_shell, run_shell_in, shell_command, stderr, stdout, test_dir};
+use crate::common::{
+    pty::InteractiveShell, run, run_shell, run_shell_in, shell_command, stderr, stdout, test_dir,
+};
 
 #[test]
 fn runs_its_argument() {
@@ -59,11 +61,21 @@ fn a_missing_command_fails() {
 }
 
 #[test]
-fn a_syntax_error_fails() {
+fn a_syntax_error_exits_a_non_interactive_shell() {
     let output = run_shell("eval '&&' || echo failed\necho after\n");
 
     assert!(stderr(&output).contains("rush: syntax error"));
-    assert_eq!(stdout(&output), "failed\nafter\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn a_syntax_error_fails_in_an_interactive_shell() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("eval '&&' || echo failed\n");
+    sh.stderr.expect("rush: syntax error");
+    sh.stdout.expect("failed\r\n");
 }
 
 #[test]

@@ -21,9 +21,11 @@ fn ignores_its_arguments() {
 
 #[test]
 fn is_not_looked_up_in_path() {
-    let output = run_shell("PATH=/rush-nonexistent : && echo a\n");
+    // The prefix stays in the shell (special built-in): nothing after it could
+    // be found in this PATH, the status of `:` is the status of the shell.
+    let output = run_shell("PATH=/rush-nonexistent :\n");
 
-    assert_eq!(stdout(&output), "a\n");
+    assert!(output.status.success());
     assert!(!stderr(&output).contains("command not found"));
 }
 
@@ -48,11 +50,12 @@ fn truncates_a_file_with_a_redirection() {
 }
 
 #[test]
-fn a_failed_redirection_fails() {
+fn a_failed_redirection_exits_a_non_interactive_shell() {
     let dir = test_dir("colon_bad_redirection");
 
-    let output = run_shell_in(": <missing || echo failed\n", &dir);
+    let output = run_shell_in(": <missing || echo failed\necho after\n", &dir);
 
     assert!(stderr(&output).contains("missing"));
-    assert_eq!(stdout(&output), "failed\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(1));
 }

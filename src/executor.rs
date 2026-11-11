@@ -1,5 +1,5 @@
 use crate::{
-    builtin::{self, BUILTINS, Builtin, FnBuiltin, Status},
+    builtin::{self, Builtin, BuiltinDef, Kind, Status},
     job::{Job, JobBuilder, JobExit, JobTable},
     nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
     shell::{JOB_CONTROL_SIGNALS, Shell},
@@ -394,6 +394,10 @@ impl RedirectController {
     }
 }
 
+/// The input could not be parsed; the error is already reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntaxError;
+
 /// Report a redirection that cannot be set up: the command does not run, its
 /// status is 1.
 fn redirection_failure(e: RedirectError) -> CommandRun {
@@ -514,48 +518,100 @@ impl Executor {
     fn run_builtin(
         &mut self,
         cmd: &SimpleCommand,
-        builtin: FnBuiltin,
+        def: BuiltinDef,
         redirections: RedirectGuard,
     ) -> JobExit {
         let args: Vec<&str> = iter::once(cmd.program.as_str())
             .chain(cmd.arguments.iter().map(String::as_str))
             .collect();
 
+        // The `VAR=x` prefixes (§2.9.1), assigned once the redirections are in
+        // place: a failed redirection leaves the variables untouched. A special
+        // built-in's stay in the shell (keeping the attributes of an existing
+        // variable); a regular built-in's are exported while it runs.
+        let assignments = cmd.envs.iter().map(|var| (var.key, var.value_text()));
+        let temporary = match def.kind {
+            Kind::Special => {
+                for (name, value) in assignments {
+                    self.shell.env.upsert(name, value, None);
+                }
+                Vec::new()
+            }
+            Kind::Regular => assignments.collect(),
+        };
+
         // Not `io::stdin()`: its buffer may hold script lines the REPL read ahead.
         let mut stdin = nix::FdReader(libc::STDIN_FILENO);
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
 
-        let bi = Builtin {
-            stdin: &mut stdin,
-            stdout: &mut stdout,
-            stderr: &mut stderr,
-            args: &args,
-            shell: &mut self.shell,
-            jobs: &mut self.jobs,
+        let result = {
+            // Restored when the block ends, before the result is carried out:
+            // the shell code of `eval` doesn't see a regular built-in's prefixes.
+            let mut shell = self.shell.set_temporarily(temporary);
+
+            let bi = Builtin {
+                stdin: &mut stdin,
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                args: &args,
+                shell: &mut shell,
+                jobs: &mut self.jobs,
+            };
+
+            builtin::run(def.run, bi)
         };
 
-        match builtin::run(builtin, bi) {
-            Status::Exited(code) => JobExit::Exited(code),
-            Status::Eval(program) => match self.execute_str(&program) {
-                ExecStatus::Exited(code) => JobExit::Exited(code),
+        match result {
+            Err(code) => self.builtin_error(def.kind, code),
+            Ok(Status::Exited(code)) => JobExit::Exited(code),
+            Ok(Status::Eval(program)) => match self.execute_str(&program) {
+                // `eval` of something that can't be parsed: an error of `eval`.
+                Err(SyntaxError) => self.builtin_error(def.kind, ExecStatus::SYNTAX_ERROR.code()),
+                Ok(ExecStatus::Exited(code)) => JobExit::Exited(code),
                 // Keeps an interruption visible to the and-or list around `eval`.
-                ExecStatus::Signaled(sig) => JobExit::Signaled(sig),
+                Ok(ExecStatus::Signaled(sig)) => JobExit::Signaled(sig),
                 // The job is already in the background jobs.
-                status @ ExecStatus::Stopped(_) => JobExit::Exited(status.code()),
+                Ok(status @ ExecStatus::Stopped(_)) => JobExit::Exited(status.code()),
             },
-            Status::Exec(argv) => self.exec(&cmd.envs, &argv, redirections),
+            Ok(Status::Exec(argv)) => {
+                let has_command = !argv.is_empty();
+                let exit = self.exec(&cmd.envs, &argv, redirections);
+
+                // `exec` returns from a command only when it could not run it:
+                // "exec shall not return to the shell", so a non-interactive one
+                // exits with its status (127, 126).
+                if has_command {
+                    self.builtin_error(def.kind, exit.code())
+                } else {
+                    exit
+                }
+            }
             // Leave the current process: the shell itself, or the forked child of
             // a pipeline command, a subshell, `&` or `$(...)`.
             // TODO: unwind instead, for the EXIT trap (BUILTINS.md 0.2).
-            Status::Exit(code) => {
-                let _ = io::stdout().flush();
-                nix::_exit(code)
-            }
+            Ok(Status::Exit(code)) => self.exit_shell(code),
             // TODO: unwind the loops and functions. No built-in returns these yet.
-            Status::Return(code) => JobExit::Exited(code),
-            Status::Break(_) | Status::Continue(_) => JobExit::Exited(0),
+            Ok(Status::Return(code)) => JobExit::Exited(code),
+            Ok(Status::Break(_) | Status::Continue(_)) => JobExit::Exited(0),
         }
+    }
+
+    /// A built-in failed with an error. An error of a special built-in exits a
+    /// non-interactive shell (§2.8.1), which includes every forked child: there
+    /// "the shell shall exit from the subshell environment", and the shell that
+    /// started it goes on. Otherwise it is only the status.
+    fn builtin_error(&self, kind: Kind, code: i32) -> JobExit {
+        if kind == Kind::Special && !self.shell.is_interactive {
+            self.exit_shell(code);
+        }
+        JobExit::Exited(code)
+    }
+
+    /// End the current process (the shell, or a forked child) with `code`.
+    fn exit_shell(&self, code: i32) -> ! {
+        let _ = io::stdout().flush();
+        nix::_exit(code)
     }
 
     /// Spawn an external command. When it cannot be spawned the error is reported
@@ -1018,41 +1074,46 @@ impl Executor {
             envs: cmd.envs.clone(),
         };
 
-        match BUILTINS.get(expanded.program.as_str()) {
+        match builtin::find(expanded.program.as_str()) {
             None => self.simple_command(&expanded, state),
             // A built-in in a pipeline gets its own process like any other command:
             // it must not change or exit the shell. `fork_child` applies its
-            // redirections to the child, nothing is left for `exec` to apply.
-            Some(&builtin) if state.in_pipeline => self.fork_child(
+            // redirections to the child (a redirection error ends the child),
+            // nothing is left for `exec` to apply.
+            Some(def) if state.in_pipeline => self.fork_child(
                 SpawnType::Subshell,
                 state,
                 &expanded.redirections,
                 |executor| {
                     executor
-                        .run_builtin(&expanded, builtin, RedirectGuard::none())
+                        .run_builtin(&expanded, def, RedirectGuard::none())
                         .into()
                 },
             ),
             // Outside a pipeline the built-in runs in the shell: its redirections
-            // are applied to the shell while it runs.
-            Some(&builtin) => {
+            // are applied to the shell while it runs. A redirection error on a
+            // special built-in exits a non-interactive shell (§2.8.1).
+            Some(def) => {
                 let redirections = match RedirectController::from_redirects(
                     &expanded.redirections,
                     &self.shell.internal_fds(),
                 ) {
                     Ok(redirections) => redirections,
-                    Err(e) => return redirection_failure(e),
+                    Err(e) => {
+                        eprintln!("rush: {e}");
+                        return CommandRun::Done(self.builtin_error(def.kind, 1));
+                    }
                 };
 
                 let guard = match RedirectGuard::apply(&redirections, &mut self.shell) {
                     Ok(guard) => guard,
                     Err(e) => {
                         eprintln!("rush: {}", nix::error_message(&e));
-                        return CommandRun::Done(JobExit::Exited(1));
+                        return CommandRun::Done(self.builtin_error(def.kind, 1));
                     }
                 };
 
-                CommandRun::Done(self.run_builtin(&expanded, builtin, guard))
+                CommandRun::Done(self.run_builtin(&expanded, def, guard))
             }
         }
     }
@@ -1289,26 +1350,30 @@ impl Executor {
         }
     }
 
-    /// Run the lines read from the input.
+    /// Run the lines read from the input. A syntax error is reported and the
+    /// shell goes on with the next lines.
+    // TODO: a syntax error should exit a non-interactive shell (§2.8.1).
     fn execute(&mut self) -> ExecStatus {
         let input = join_continuations(&self.input_buffer);
 
         self.execute_lines(&input)
+            .unwrap_or(ExecStatus::SYNTAX_ERROR)
     }
 
     /// Run a program given as a string, like `eval` does.
-    fn execute_str(&mut self, program: &str) -> ExecStatus {
+    fn execute_str(&mut self, program: &str) -> Result<ExecStatus, SyntaxError> {
         let lines: Vec<String> = program.split_inclusive('\n').map(String::from).collect();
         let input = join_continuations(&lines);
 
         self.execute_lines(&input)
     }
 
-    fn execute_lines(&mut self, input: &[String]) -> ExecStatus {
+    /// Parse and run the input; a syntax error is reported here, and nothing runs.
+    fn execute_lines(&mut self, input: &[String]) -> Result<ExecStatus, SyntaxError> {
         let tokenizer = BufTokenizer::from_buffer(input);
 
         if tokenizer.next_is_eof() {
-            return ExecStatus::SUCCESS;
+            return Ok(ExecStatus::SUCCESS);
         }
 
         // The whole input must be consumed, otherwise there is some garbage the
@@ -1317,7 +1382,7 @@ impl Executor {
 
         let Some(program) = program else {
             eprintln!("rush: syntax error");
-            return ExecStatus::SYNTAX_ERROR;
+            return Err(SyntaxError);
         };
 
         eprintln!("=== SYNTAX TREE ===");
@@ -1325,7 +1390,7 @@ impl Executor {
 
         eprintln!("=== COMMAND BEGIN ===");
 
-        self.program(&program)
+        Ok(self.program(&program))
     }
 
     fn update(&mut self) -> Result<TerminalState, io::Error> {
