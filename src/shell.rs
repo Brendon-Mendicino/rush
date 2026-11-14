@@ -1,27 +1,69 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    env, io,
+    collections::BTreeMap,
+    env, fmt, io,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, RawFd},
 };
 
 use crate::nix::{self, Pid, SigHandler, Signal};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct VarAttr {
-    /// The variable is exported to the environment of the child processes.
-    pub exported: bool,
+/// The value of a shell variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    /// No value, only attributes: `export X` or `readonly X` before `X` is
+    /// assigned. `$X` expands to nothing, `${X-word}` to `word`, and it is not
+    /// passed to the children.
+    Unset,
+    /// A value, possibly empty: after `X=` the variable is set but null,
+    /// `${X-word}` expands to nothing and `${X:-word}` to `word`.
+    Set(String),
 }
 
+/// The attributes of a shell variable, independent of each other and of the
+/// value. None of them can be removed, except by `unset`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VarAttr {
+    /// Passed to the environment of the child processes, when it has a value
+    /// (`export`).
+    pub exported: bool,
+    /// The value can't change and the variable can't be unset (`readonly`). The
+    /// export attribute can still be added.
+    pub readonly: bool,
+}
+
+/// A shell variable. Every combination of value and attributes can happen:
+///
+/// | value  | exported | readonly | reached by                  | children | assign | unset |
+/// |--------|----------|----------|-----------------------------|----------|--------|-------|
+/// | Unset  |          |          | not stored: never set, or `unset X` | no | yes | yes |
+/// | Unset  | x        |          | `export X`                  | no       | yes, then exported | yes |
+/// | Unset  |          | x        | `readonly X`                | no       | error  | error |
+/// | Unset  | x        | x        | `export X; readonly X`      | never    | error  | error |
+/// | Set(v) |          |          | `X=v`                       | no       | yes    | yes   |
+/// | Set(v) | x        |          | `export X=v`, the environment | yes    | yes, stays exported | yes |
+/// | Set(v) |          | x        | `readonly X=v`              | no       | error  | error |
+/// | Set(v) | x        | x        | `export X=v; readonly X`    | yes      | error  | error |
+///
+/// An "error" is a variable assignment error ([`ReadonlyError`], POSIX §2.8.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Var {
-    pub value: String,
+    pub value: Value,
     pub attr: VarAttr,
 }
 
+/// All the shell variables, exported or not, sorted by name (for `set`,
+/// `export -p`, `readonly -p`). A variable `Unset` without attributes is never
+/// stored: it is the same as one the shell never heard of.
 #[derive(Debug, Clone, Default)]
 pub struct ShellEnv {
-    env: HashMap<String, Var>,
+    vars: BTreeMap<String, Var>,
+}
+
+/// An assignment to, or the `unset` of, a readonly variable: a variable
+/// assignment error (§2.8.1), which exits a non-interactive shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadonlyError {
+    pub name: String,
 }
 
 #[derive(Debug)]
@@ -52,7 +94,6 @@ pub struct Shell {
 ///   prefixes are not temporary, but a function or `command` (which strips the
 ///   special properties) could run them while a guard is alive: an `unset VAR`
 ///   or `export VAR` would be undone, and `readonly VAR` would be overwritten.
-///   Readonly variables also have to be refused as prefixes in the first place.
 #[must_use = "the variables are put back as soon as the guard is dropped"]
 #[derive(Debug)]
 pub struct TempVarsGuard<'s> {
@@ -69,82 +110,167 @@ pub const JOB_CONTROL_SIGNALS: [Signal; 5] = [
     Signal::SIGTTOU,
 ];
 
+impl Value {
+    /// The value, when it is set.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Unset => None,
+            Self::Set(value) => Some(value),
+        }
+    }
+}
+
 impl ShellEnv {
     /// Create the shell variables from the environment of the process. All of them
-    /// are marked as external.
+    /// are set and exported.
     pub fn from_env() -> Self {
-        let mut vars = Self::default();
+        let mut env = Self::default();
 
         // Variables that are not valid UTF-8 are skipped, the rest of the shell
         // works only with `str`.
         for (name, value) in env::vars_os() {
             if let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) {
-                vars.upsert(name, value, Some(VarAttr { exported: true }));
+                let attr = VarAttr {
+                    exported: true,
+                    readonly: false,
+                };
+                env.vars.insert(
+                    name,
+                    Var {
+                        value: Value::Set(value),
+                        attr,
+                    },
+                );
             }
         }
 
-        vars
+        env
     }
 
-    /// Insert or update a variable. When `attr` is `None` the attributes of an
-    /// already existing variable are kept, a new variable gets the default ones.
-    pub fn upsert(
-        &mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-        attr: Option<VarAttr>,
-    ) {
-        let value = value.into();
-
-        match self.env.entry(name.into()) {
-            Entry::Occupied(mut entry) => {
-                let var = entry.get_mut();
-                var.value = value;
-                if let Some(attr) = attr {
-                    var.attr = attr;
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(Var {
-                    value,
-                    attr: attr.unwrap_or_default(),
-                });
-            }
-        }
-    }
-
+    /// The value of a variable, when it is set.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.env.get(name).map(|var| var.value.as_str())
+        self.vars.get(name).and_then(|var| var.value.as_str())
     }
 
+    /// The variable, also when it has only attributes.
+    pub fn var(&self, name: &str) -> Option<&Var> {
+        self.vars.get(name)
+    }
+
+    /// The variable can be assigned or unset: it is not readonly.
+    pub fn check_assignable(&self, name: &str) -> Result<(), ReadonlyError> {
+        match self.vars.get(name) {
+            Some(var) if var.attr.readonly => Err(ReadonlyError {
+                name: name.to_string(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// `name=value`: set the value, keeping the attributes. A new variable gets
+    /// none, an exported one stays exported.
+    pub fn assign(&mut self, name: &str, value: impl Into<String>) -> Result<(), ReadonlyError> {
+        self.check_assignable(name)?;
+        self.entry(name).value = Value::Set(value.into());
+        Ok(())
+    }
+
+    /// `export name[=value]`: add the export attribute, and set the value when
+    /// there is one. Without a value an unset variable stays unset.
+    pub fn export(&mut self, name: &str, value: Option<String>) -> Result<(), ReadonlyError> {
+        if value.is_some() {
+            self.check_assignable(name)?;
+        }
+
+        let var = self.entry(name);
+        var.attr.exported = true;
+        if let Some(value) = value {
+            var.value = Value::Set(value);
+        }
+        Ok(())
+    }
+
+    /// `readonly name[=value]`: add the readonly attribute, and set the value
+    /// when there is one. A variable that is already readonly can't get a value.
+    pub fn set_readonly(&mut self, name: &str, value: Option<String>) -> Result<(), ReadonlyError> {
+        if value.is_some() {
+            self.check_assignable(name)?;
+        }
+
+        let var = self.entry(name);
+        var.attr.readonly = true;
+        if let Some(value) = value {
+            var.value = Value::Set(value);
+        }
+        Ok(())
+    }
+
+    /// `unset name`: remove the variable, value and attributes. A variable that
+    /// doesn't exist is not an error.
+    pub fn unset(&mut self, name: &str) -> Result<(), ReadonlyError> {
+        self.check_assignable(name)?;
+        self.vars.remove(name);
+        Ok(())
+    }
+
+    /// Every variable, sorted by name, also the ones that have only attributes.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Var)> {
-        self.env.iter().map(|(name, var)| (name.as_str(), var))
+        self.vars.iter().map(|(name, var)| (name.as_str(), var))
     }
 
-    /// The variables passed down to the environment of the children.
+    /// The variables passed down to the environment of the children: exported
+    /// and set.
     pub fn exported(&self) -> impl Iterator<Item = (&str, &str)> {
         self.iter()
             .filter(|(_, var)| var.attr.exported)
-            .map(|(name, var)| (name, var.value.as_str()))
+            .filter_map(|(name, var)| Some((name, var.value.as_str()?)))
+    }
+
+    /// The variable, created unset and without attributes when missing. The
+    /// caller gives it a value or an attribute right away.
+    fn entry(&mut self, name: &str) -> &mut Var {
+        self.vars.entry(name.to_string()).or_insert(Var {
+            value: Value::Unset,
+            attr: VarAttr::default(),
+        })
     }
 }
 
 impl Shell {
     /// Set variables, exported, until the returned guard is dropped (the
-    /// `VAR=x` prefixes of a regular built-in, §2.9.1).
+    /// `VAR=x` prefixes of a regular built-in, §2.9.1). A readonly variable is
+    /// an error, and the ones already set are put back.
     pub fn set_temporarily<'a>(
         &mut self,
         vars: impl IntoIterator<Item = (&'a str, String)>,
-    ) -> TempVarsGuard<'_> {
-        let mut saved = Vec::new();
+    ) -> Result<TempVarsGuard<'_>, ReadonlyError> {
+        // Filled one variable at a time: on an error, dropping it restores the
+        // ones before.
+        let mut guard = TempVarsGuard {
+            shell: self,
+            saved: Vec::new(),
+        };
 
         for (name, value) in vars {
-            saved.push((name.to_string(), self.env.env.get(name).cloned()));
-            self.env
-                .upsert(name, value, Some(VarAttr { exported: true }));
+            let env = &mut guard.shell.env;
+            env.check_assignable(name)?;
+
+            // Not readonly, it was checked.
+            let attr = VarAttr {
+                exported: true,
+                readonly: false,
+            };
+            let old = env.vars.insert(
+                name.to_string(),
+                Var {
+                    value: Value::Set(value),
+                    attr,
+                },
+            );
+            guard.saved.push((name.to_string(), old));
         }
 
-        TempVarsGuard { shell: self, saved }
+        Ok(guard)
     }
 
     /// Make sure the shell is running interactively as the foreground job
@@ -259,96 +385,251 @@ impl DerefMut for TempVarsGuard<'_> {
 
 impl Drop for TempVarsGuard<'_> {
     fn drop(&mut self) {
-        let env = &mut self.shell.env.env;
+        let vars = &mut self.shell.env.vars;
 
         // Backwards: with `x=1 x=2 cmd` the first saved value is the original.
         for (name, var) in self.saved.drain(..).rev() {
             match var {
-                Some(var) => env.insert(name, var),
-                None => env.remove(&name),
+                Some(var) => vars.insert(name, var),
+                None => vars.remove(&name),
             };
         }
     }
+}
+
+impl fmt::Display for ReadonlyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: readonly variable", self.name)
+    }
+}
+
+/// Quote a value so that the shell reads it back as it is: between single
+/// quotes, each `'` written as `'\''`. For the listings of `set`, `export -p`
+/// and `readonly -p`.
+pub fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn upsert_keeps_attributes_when_none() {
-        let mut vars = ShellEnv::default();
+    const EXPORTED: VarAttr = VarAttr {
+        exported: true,
+        readonly: false,
+    };
 
-        vars.upsert("A", "1", Some(VarAttr { exported: true }));
-        vars.upsert("A", "2", None);
-        vars.upsert("B", "3", None);
-
-        assert_eq!(vars.get("A"), Some("2"));
-        assert_eq!(vars.get("B"), Some("3"));
-        assert_eq!(vars.get("C"), None);
-
-        let attr = |name| vars.iter().find(|(n, _)| *n == name).unwrap().1.attr;
-        assert!(attr("A").exported);
-        assert!(!attr("B").exported);
+    fn set(value: &str, attr: VarAttr) -> Option<Var> {
+        Some(Var {
+            value: Value::Set(value.into()),
+            attr,
+        })
     }
 
-    #[test]
-    fn env_vars_are_external() {
-        let vars = ShellEnv::from_env();
-        let path = env::var("PATH").expect("PATH is set in the test environment");
-
-        assert_eq!(vars.get("PATH"), Some(path.as_str()));
-        assert!(vars.iter().all(|(_, var)| var.attr.exported));
+    fn unset(attr: VarAttr) -> Option<Var> {
+        Some(Var {
+            value: Value::Unset,
+            attr,
+        })
     }
 
-    #[test]
-    fn only_external_vars_are_exported() {
-        let mut vars = ShellEnv::default();
-
-        vars.upsert("ENV", "1", Some(VarAttr { exported: true }));
-        vars.upsert("LOCAL", "2", None);
-        // An assignment to an exported variable keeps it exported.
-        vars.upsert("ENV", "3", None);
-
-        let exported: Vec<_> = vars.exported().collect();
-        assert_eq!(exported, [("ENV", "3")]);
-    }
-
-    #[test]
-    fn temporary_variables_are_restored_on_drop() {
-        let mut env = ShellEnv::default();
-        env.upsert("KEPT", "old", None);
-        let mut shell = Shell {
+    fn shell(env: ShellEnv) -> Shell {
+        Shell {
             pgid: Pid::from_raw(0),
             terminal: libc::STDIN_FILENO,
             is_interactive: false,
             tmodes: None,
             env,
-        };
+        }
+    }
 
-        let var = |env: &ShellEnv, name| env.env.get(name).cloned();
+    #[test]
+    fn assign_keeps_the_attributes() {
+        let mut env = ShellEnv::default();
+
+        env.export("A", Some("1".into())).unwrap();
+        env.assign("A", "2").unwrap();
+        env.assign("B", "3").unwrap();
+
+        assert_eq!(env.var("A").cloned(), set("2", EXPORTED));
+        assert_eq!(env.var("B").cloned(), set("3", VarAttr::default()));
+        assert_eq!(env.var("C"), None);
+    }
+
+    #[test]
+    fn null_is_not_unset() {
+        let mut env = ShellEnv::default();
+
+        env.assign("X", "").unwrap();
+
+        assert_eq!(env.get("X"), Some(""));
+        assert_eq!(env.var("X").cloned(), set("", VarAttr::default()));
+    }
+
+    #[test]
+    fn env_vars_are_external() {
+        let env = ShellEnv::from_env();
+        let path = env::var("PATH").expect("PATH is set in the test environment");
+
+        assert_eq!(env.get("PATH"), Some(path.as_str()));
+        assert!(env.iter().all(|(_, var)| var.attr == EXPORTED));
+        assert!(
+            env.iter()
+                .all(|(_, var)| matches!(var.value, Value::Set(_)))
+        );
+    }
+
+    #[test]
+    fn only_exported_set_vars_are_passed_down() {
+        let mut env = ShellEnv::default();
+
+        env.export("ENV", Some("1".into())).unwrap();
+        env.assign("LOCAL", "2").unwrap();
+        env.export("NO_VALUE", None).unwrap();
+        // An assignment to an exported variable keeps it exported.
+        env.assign("ENV", "3").unwrap();
+
+        let exported: Vec<_> = env.exported().collect();
+        assert_eq!(exported, [("ENV", "3")]);
+    }
+
+    #[test]
+    fn export_without_a_value_keeps_it_unset() {
+        let mut env = ShellEnv::default();
+
+        env.export("X", None).unwrap();
+
+        assert_eq!(env.get("X"), None);
+        assert_eq!(env.var("X").cloned(), unset(EXPORTED));
+
+        // Exported as soon as it gets a value.
+        env.assign("X", "1").unwrap();
+        assert_eq!(env.var("X").cloned(), set("1", EXPORTED));
+        assert_eq!(env.exported().collect::<Vec<_>>(), [("X", "1")]);
+    }
+
+    #[test]
+    fn unset_removes_the_value_and_the_attributes() {
+        let mut env = ShellEnv::default();
+        env.export("X", Some("1".into())).unwrap();
+
+        env.unset("X").unwrap();
+        assert_eq!(env.var("X"), None);
+
+        env.assign("X", "2").unwrap();
+        assert_eq!(env.var("X").cloned(), set("2", VarAttr::default()));
+
+        // Nothing to unset is not an error.
+        assert_eq!(env.unset("NOPE"), Ok(()));
+    }
+
+    #[test]
+    fn a_readonly_variable_cant_change() {
+        let mut env = ShellEnv::default();
+        env.set_readonly("X", Some("1".into())).unwrap();
+        let readonly = VarAttr {
+            exported: false,
+            readonly: true,
+        };
+        let error = Err(ReadonlyError { name: "X".into() });
+
+        assert_eq!(env.assign("X", "2"), error);
+        assert_eq!(env.unset("X"), error);
+        assert_eq!(env.export("X", Some("2".into())), error);
+        assert_eq!(env.set_readonly("X", Some("2".into())), error);
+        assert_eq!(env.var("X").cloned(), set("1", readonly));
+        let message = ReadonlyError { name: "X".into() }.to_string();
+        assert_eq!(message, "X: readonly variable");
+
+        // The attributes can still be added.
+        assert_eq!(env.set_readonly("X", None), Ok(()));
+        assert_eq!(env.export("X", None), Ok(()));
+        let both = VarAttr {
+            exported: true,
+            readonly: true,
+        };
+        assert_eq!(env.var("X").cloned(), set("1", both));
+    }
+
+    #[test]
+    fn a_readonly_unset_variable_stays_unset() {
+        let mut env = ShellEnv::default();
+
+        env.set_readonly("X", None).unwrap();
+
+        assert!(env.assign("X", "1").is_err());
+        assert!(env.unset("X").is_err());
+        let readonly = VarAttr {
+            exported: false,
+            readonly: true,
+        };
+        assert_eq!(env.var("X").cloned(), unset(readonly));
+    }
+
+    #[test]
+    fn variables_are_sorted() {
+        let mut env = ShellEnv::default();
+        for name in ["b", "C", "a", "B"] {
+            env.assign(name, "").unwrap();
+        }
+
+        let names: Vec<_> = env.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["B", "C", "a", "b"]);
+    }
+
+    #[test]
+    fn temporary_variables_are_restored_on_drop() {
+        let mut env = ShellEnv::default();
+        env.assign("KEPT", "old").unwrap();
+        let mut shell = shell(env);
 
         {
-            let guard = shell.set_temporarily([
-                ("KEPT", "new".to_string()),
-                ("NEW", "1".to_string()),
-                ("NEW", "2".to_string()),
-            ]);
+            let guard = shell
+                .set_temporarily([
+                    ("KEPT", "new".to_string()),
+                    ("NEW", "1".to_string()),
+                    ("NEW", "2".to_string()),
+                ])
+                .unwrap();
 
-            assert_eq!(guard.env.get("KEPT"), Some("new"));
-            assert_eq!(guard.env.get("NEW"), Some("2"));
             // Exported while the command runs.
-            assert!(var(&guard.env, "KEPT").unwrap().attr.exported);
-            assert!(var(&guard.env, "NEW").unwrap().attr.exported);
+            assert_eq!(guard.env.var("KEPT").cloned(), set("new", EXPORTED));
+            assert_eq!(guard.env.var("NEW").cloned(), set("2", EXPORTED));
         }
 
         assert_eq!(
-            var(&shell.env, "KEPT"),
-            Some(Var {
-                value: "old".into(),
-                attr: VarAttr { exported: false },
-            })
+            shell.env.var("KEPT").cloned(),
+            set("old", VarAttr::default())
         );
-        assert_eq!(shell.env.get("NEW"), None);
+        assert_eq!(shell.env.var("NEW"), None);
+    }
+
+    #[test]
+    fn a_readonly_temporary_variable_is_refused() {
+        let mut env = ShellEnv::default();
+        env.assign("A", "old").unwrap();
+        env.set_readonly("RO", Some("1".into())).unwrap();
+        let mut shell = shell(env);
+
+        let result = shell.set_temporarily([
+            ("A", "new".to_string()),
+            ("B", "new".to_string()),
+            ("RO", "2".to_string()),
+        ]);
+
+        assert_eq!(result.err(), Some(ReadonlyError { name: "RO".into() }));
+        // The ones set before the error are put back.
+        assert_eq!(shell.env.var("A").cloned(), set("old", VarAttr::default()));
+        assert_eq!(shell.env.var("B"), None);
+        assert_eq!(shell.env.get("RO"), Some("1"));
+    }
+
+    #[test]
+    fn values_are_quoted_for_reinput() {
+        assert_eq!(quote(""), "''");
+        assert_eq!(quote("abc"), "'abc'");
+        assert_eq!(quote("a b"), "'a b'");
+        assert_eq!(quote("it's"), r"'it'\''s'");
+        assert_eq!(quote("$x `y` \\"), r"'$x `y` \'");
     }
 }

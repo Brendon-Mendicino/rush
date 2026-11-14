@@ -8,7 +8,7 @@ use clap::Parser;
 use crate::{
     builtin::{Builtin, BuiltinResult, Context, Error, Status},
     nix,
-    shell::{ShellEnv, VarAttr},
+    shell::ShellEnv,
 };
 
 /// Change the working directory.
@@ -49,8 +49,6 @@ pub(super) struct Args {
     /// The new working directory, `-` for `$OLDPWD`.
     directory: Option<String>,
 }
-
-const EXPORTED: Option<VarAttr> = Some(VarAttr { exported: true });
 
 pub fn cd(bi: &mut Builtin) -> BuiltinResult {
     let args: Args = bi.parse()?;
@@ -100,11 +98,14 @@ fn change_dir(args: &Args, env: &mut ShellEnv) -> Result<Option<String>, Error> 
     // unspecified: it is left as it is.
     let new_pwd = logical.or_else(|| current_dir().ok());
 
+    // Exported. A readonly one is an error, after the directory changed.
     if let Some(old_pwd) = old_pwd {
-        env.upsert("OLDPWD", old_pwd, EXPORTED);
+        env.export("OLDPWD", Some(old_pwd))
+            .map_err(|e| Error::from(e.to_string()))?;
     }
     if let Some(new_pwd) = &new_pwd {
-        env.upsert("PWD", new_pwd.as_str(), EXPORTED);
+        env.export("PWD", Some(new_pwd.clone()))
+            .map_err(|e| Error::from(e.to_string()))?;
     }
 
     Ok(print.then(|| new_pwd.unwrap_or(curpath)))

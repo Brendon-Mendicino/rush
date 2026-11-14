@@ -2,7 +2,7 @@ use crate::{
     builtin::{self, Builtin, BuiltinDef, Kind, Status},
     job::{Job, JobBuilder, JobExit, JobTable},
     nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
-    shell::{JOB_CONTROL_SIGNALS, Shell},
+    shell::{JOB_CONTROL_SIGNALS, ReadonlyError, Shell},
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
     waiter::{WaitResult, Waiter},
@@ -528,12 +528,15 @@ impl Executor {
         // The `VAR=x` prefixes (§2.9.1), assigned once the redirections are in
         // place: a failed redirection leaves the variables untouched. A special
         // built-in's stay in the shell (keeping the attributes of an existing
-        // variable); a regular built-in's are exported while it runs.
+        // variable); a regular built-in's are exported while it runs. A readonly
+        // one is an error, and the built-in doesn't run.
         let assignments = cmd.envs.iter().map(|var| (var.key, var.value_text()));
         let temporary = match def.kind {
             Kind::Special => {
                 for (name, value) in assignments {
-                    self.shell.env.upsert(name, value, None);
+                    if let Err(e) = self.shell.env.assign(name, value) {
+                        return Self::assignment_error(e, self.exits_on_assignment_error(false));
+                    }
                 }
                 Vec::new()
             }
@@ -548,7 +551,11 @@ impl Executor {
         let result = {
             // Restored when the block ends, before the result is carried out:
             // the shell code of `eval` doesn't see a regular built-in's prefixes.
-            let mut shell = self.shell.set_temporarily(temporary);
+            let exit = self.exits_on_assignment_error(false);
+            let mut shell = match self.shell.set_temporarily(temporary) {
+                Ok(shell) => shell,
+                Err(e) => return Self::assignment_error(e, exit),
+            };
 
             let bi = Builtin {
                 stdin: &mut stdin,
@@ -590,7 +597,7 @@ impl Executor {
             // Leave the current process: the shell itself, or the forked child of
             // a pipeline command, a subshell, `&` or `$(...)`.
             // TODO: unwind instead, for the EXIT trap (BUILTINS.md 0.2).
-            Ok(Status::Exit(code)) => self.exit_shell(code),
+            Ok(Status::Exit(code)) => Self::exit_shell(code),
             // TODO: unwind the loops and functions. No built-in returns these yet.
             Ok(Status::Return(code)) => JobExit::Exited(code),
             Ok(Status::Break(_) | Status::Continue(_)) => JobExit::Exited(0),
@@ -603,13 +610,35 @@ impl Executor {
     /// started it goes on. Otherwise it is only the status.
     fn builtin_error(&self, kind: Kind, code: i32) -> JobExit {
         if kind == Kind::Special && !self.shell.is_interactive {
-            self.exit_shell(code);
+            Self::exit_shell(code);
         }
         JobExit::Exited(code)
     }
 
+    /// An assignment to a readonly variable: a variable assignment error
+    /// (§2.8.1), which exits a non-interactive shell whatever the command
+    /// (`exit`, see [`Executor::exits_on_assignment_error`]). Otherwise the
+    /// command fails.
+    ///
+    /// Not a method: it is also called while a [`TempVarsGuard`](crate::shell::TempVarsGuard) borrows the
+    /// shell.
+    fn assignment_error(e: ReadonlyError, exit: bool) -> JobExit {
+        eprintln!("rush: {e}");
+        if exit {
+            Self::exit_shell(1);
+        }
+        JobExit::Exited(1)
+    }
+
+    /// A variable assignment error exits a non-interactive shell, but not when
+    /// the shell only stands in for a child (`in_child`: a program of a pipeline
+    /// is in a subshell environment of its own), which then fails.
+    fn exits_on_assignment_error(&self, in_child: bool) -> bool {
+        !self.shell.is_interactive && !in_child
+    }
+
     /// End the current process (the shell, or a forked child) with `code`.
-    fn exit_shell(&self, code: i32) -> ! {
+    fn exit_shell(code: i32) -> ! {
         let _ = io::stdout().flush();
         nix::_exit(code)
     }
@@ -1075,7 +1104,21 @@ impl Executor {
         };
 
         match builtin::find(expanded.program.as_str()) {
-            None => self.simple_command(&expanded, state),
+            // The prefixes go to the program's environment only, but a readonly
+            // one is an error all the same (§2.9.1): the program doesn't run.
+            None => {
+                let readonly = expanded
+                    .envs
+                    .iter()
+                    .find_map(|var| self.shell.env.check_assignable(var.key).err());
+                match readonly {
+                    Some(e) => {
+                        let exit = self.exits_on_assignment_error(state.in_pipeline);
+                        CommandRun::Done(Self::assignment_error(e, exit))
+                    }
+                    None => self.simple_command(&expanded, state),
+                }
+            }
             // A built-in in a pipeline gets its own process like any other command:
             // it must not change or exit the shell. `fork_child` applies its
             // redirections to the child (a redirection error ends the child),
@@ -1139,10 +1182,14 @@ impl Executor {
             return CommandRun::Done(JobExit::Exited(0));
         }
 
-        // `None` keeps the attributes of an existing variable: assigning an
-        // exported variable changes the environment of the next commands.
+        // An exported variable keeps the attribute: assigning it changes the
+        // environment of the next commands. A readonly one stops the assignments
+        // (the ones before stay).
         for var in &assignment.envs {
-            self.shell.env.upsert(var.key, var.value_text(), None);
+            if let Err(e) = self.shell.env.assign(var.key, var.value_text()) {
+                let exit = self.exits_on_assignment_error(false);
+                return CommandRun::Done(Self::assignment_error(e, exit));
+            }
         }
 
         CommandRun::Done(JobExit::Exited(0))
