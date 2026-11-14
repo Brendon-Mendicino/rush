@@ -71,11 +71,33 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
 - [x] `fg`: current job or `%` job ID → `Waiter::fg`; put back under the same number if it stops again
 - [x] `bg`: current job or `%` job IDs → `Waiter::bg`
 
+## 10. Error handling (application-wide)
+- [ ] One `error` module (`src/error.rs`) for every kind of error the shell can meet, and the conversions between them, instead of an error type per module and messages printed where they happen.
+  - Today's types to fold in, or convert from:
+    - `builtin::Error` (`Usage(clap::Error)` / `Failure { status, message }`) and its `From` for `io::Error`, `String`, `&str`, `clap::Error`, `ReadonlyError`
+    - `shell::ReadonlyError`
+    - `job::JobIdError`
+    - `executor::RedirectError` and `executor::SyntaxError`
+    - the spawn failures turned into statuses by `spawn_failure` (127/126)
+    - raw `io::Error`s from `nix.rs`
+  - Each error carries its kind as POSIX §2.8.1 sorts them, because that decides whether a non-interactive shell exits:
+    - shell language syntax error
+    - special built-in utility error
+    - other utility error
+    - redirection error (special built-in, compound command, function, other)
+    - variable assignment error
+    - expansion error
+    - command not found
+  - Each error also carries its exit status (1, 2, 126, 127…) and the message, `rush: [<command>: ]<message>`, using the strerror text from `nix::error_message`.
+  - `From` impls are the conversions, so `?` works across modules.
+  - One place decides the consequence: report, then exit (non-interactive, or a forked child) or go on with the status. It replaces `Executor::builtin_error`, `Executor::assignment_error`, `redirection_failure` and the ~20 `eprintln!("rush: …")` calls in the executor.
+
 ## Beyond parity (not done in testsh either)
+- [ ] The grammar rules that are only `unimplemented!` stubs in `syntax.rs` (in the order of §2.10.2): `for_clause`/`name`/`in`/`wordlist`, `case_clause` and its items/`pattern`, `if_clause`/`else_part`, `while_clause`/`until_clause`/`do_group`, `brace_group`, `function_definition`/`function_body`/`fname`, `io_here`/`here_end`, `sequential_sep`. They need the AST nodes, the reserved words (§2.4, recognized by the rules in §2.10.2) and the `DSEMI` `;;`, `DLESS` `<<`, `DLESSDASH` `<<-` and `CLOBBER` `>|` tokens in the tokenizer, then wiring into `command`/`compound_command` and the executor.
 - [ ] Heredocs `<<` / `<<-` (`io_here` is `unimplemented!` in both)
 - [ ] Special parameters `$?`, `$$`, `$!`
 - [ ] Double-quoted strings (tokenizer has it commented out)
-- [ ] `export` builtin / stage 4 envs (mark vars external)
+- [x] `export` builtin / stage 4 envs (mark vars external): `export`, `readonly`, `unset` (see `BUILTINS.md`)
 - [ ] Parser rule 7b (assignment-word handling, `syntax.rs` TODO)
 - [x] `fg %n` / `bg %n` job selection (testsh always uses the last job): every XBD §3.204 form
 - [x] More tests: `fg`/`bg` and the job table (`tests/builtins/{jobs,fg,bg}.rs`, `tests/job_control.rs`)

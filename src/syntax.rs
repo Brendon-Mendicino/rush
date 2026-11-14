@@ -521,8 +521,8 @@ impl SyntaxTree {
     /// BNF:
     ///
     /// ```
-    /// list ::=                and_or
-    ///        | list separator and_or
+    /// list ::=                   and_or
+    ///        | list separator_op and_or
     ///        ;
     /// ```
     pub fn list<'a, T>(tok: &T) -> Option<SequentialList<'a>>
@@ -699,12 +699,15 @@ impl SyntaxTree {
     /// command ::= simple_command
     ///           | compound_command
     ///           | compound_command redirect_list
+    ///           | function_definition
     ///           ;
     /// ```
     pub fn command<'a, T>(tok: &T) -> Option<Command<'a>>
     where
         T: Tokenizer<'a>,
     {
+        // TODO: `function_definition`, once `Self::function_definition` is
+        // implemented.
         if let Some(simple_command) = Self::simple_command(tok) {
             return Some(simple_command);
         }
@@ -738,7 +741,10 @@ impl SyntaxTree {
     where
         T: Tokenizer<'a>,
     {
-        // TODO: modify return value with appropriate variant
+        // TODO: modify return value with appropriate variant, and try the other
+        // alternatives once they are implemented: `Self::brace_group`,
+        // `Self::for_clause`, `Self::case_clause`, `Self::if_clause`,
+        // `Self::while_clause`, `Self::until_clause`.
         Self::subshell(tok)
     }
 
@@ -850,6 +856,285 @@ impl SyntaxTree {
         }
 
         Some(retval)
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// for_clause ::= For name                                     do_group
+    ///              | For name                       sequential_sep do_group
+    ///              | For name linebreak in          sequential_sep do_group
+    ///              | For name linebreak in wordlist sequential_sep do_group
+    ///              ;
+    /// ```
+    pub fn for_clause<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("for_clause: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// name ::= NAME                                   Apply rule 5
+    ///        ;
+    /// ```
+    pub fn name<'a, T>(_tok: &T) -> Option<Token<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("name: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// in ::= In                                       Apply rule 6
+    ///      ;
+    /// ```
+    pub fn r#in<'a, T>(_tok: &T) -> Option<Token<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("in: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// wordlist ::= wordlist WORD
+    ///            |          WORD
+    ///            ;
+    /// ```
+    pub fn wordlist<'a, T>(_tok: &T) -> Vec<Word<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("wordlist: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// case_clause ::= Case WORD linebreak in linebreak case_list    Esac
+    ///               | Case WORD linebreak in linebreak case_list_ns Esac
+    ///               | Case WORD linebreak in linebreak              Esac
+    ///               ;
+    /// ```
+    pub fn case_clause<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("case_clause: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// case_list_ns ::= case_list case_item_ns
+    ///                |           case_item_ns
+    ///                ;
+    /// ```
+    pub fn case_list_ns<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("case_list_ns: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// case_list ::= case_list case_item
+    ///             |           case_item
+    ///             ;
+    /// ```
+    pub fn case_list<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("case_list: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// case_item_ns ::=     pattern ')' linebreak
+    ///                |     pattern ')' compound_list
+    ///                | '(' pattern ')' linebreak
+    ///                | '(' pattern ')' compound_list
+    ///                ;
+    /// ```
+    pub fn case_item_ns<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("case_item_ns: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// case_item ::=     pattern ')' linebreak     DSEMI linebreak
+    ///             |     pattern ')' compound_list DSEMI linebreak
+    ///             | '(' pattern ')' linebreak     DSEMI linebreak
+    ///             | '(' pattern ')' compound_list DSEMI linebreak
+    ///             ;
+    /// ```
+    pub fn case_item<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("case_item: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// pattern ::=             WORD                Apply rule 4
+    ///           | pattern '|' WORD                Do not apply rule 4
+    ///           ;
+    /// ```
+    pub fn pattern<'a, T>(_tok: &T) -> Option<Vec<Word<'a>>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("pattern: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// if_clause ::= If compound_list Then compound_list else_part Fi
+    ///             | If compound_list Then compound_list           Fi
+    ///             ;
+    /// ```
+    pub fn if_clause<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("if_clause: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// else_part ::= Elif compound_list Then compound_list
+    ///             | Elif compound_list Then compound_list else_part
+    ///             | Else compound_list
+    ///             ;
+    /// ```
+    pub fn else_part<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("else_part: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// while_clause ::= While compound_list do_group
+    ///                ;
+    /// ```
+    pub fn while_clause<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("while_clause: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// until_clause ::= Until compound_list do_group
+    ///                ;
+    /// ```
+    pub fn until_clause<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("until_clause: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// function_definition ::= fname '(' ')' linebreak function_body
+    ///                       ;
+    /// ```
+    pub fn function_definition<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("function_definition: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// function_body ::= compound_command                  Apply rule 9
+    ///                 | compound_command redirect_list    Apply rule 9
+    ///                 ;
+    /// ```
+    pub fn function_body<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("function_body: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// fname ::= NAME                                  Apply rule 8
+    ///         ;
+    /// ```
+    pub fn fname<'a, T>(_tok: &T) -> Option<Token<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("fname: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// brace_group ::= Lbrace compound_list Rbrace
+    ///               ;
+    /// ```
+    pub fn brace_group<'a, T>(_tok: &T) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        // TODO: the AST node, `()` until it exists.
+        unimplemented!("brace_group: not implemented")
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// do_group ::= Do compound_list Done              Apply rule 6
+    ///            ;
+    /// ```
+    pub fn do_group<'a, T>(_tok: &T) -> Option<List<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("do_group: not implemented")
     }
 
     /// BNF:
@@ -1142,17 +1427,10 @@ impl SyntaxTree {
         Some(redirect)
     }
 
-    pub fn io_here<'a, T>(_tok: &T) -> Option<Redirect<'a>>
-    where
-        T: Tokenizer<'a>,
-    {
-        unimplemented!("not implemented");
-    }
-
     /// BNF:
     ///
     /// ```
-    /// filename ::= WORD
+    /// filename ::= WORD                           Apply rule 2
     ///            ;
     /// ```
     pub fn filename<'a, T>(tok: &T) -> Option<Token<'a>>
@@ -1165,31 +1443,28 @@ impl SyntaxTree {
     /// BNF:
     ///
     /// ```
-    /// separator ::= separator_op linebreak
-    ///             | newline_list
-    ///             ;
+    /// io_here ::= DLESS     here_end
+    ///           | DLESSDASH here_end
+    ///           ;
     /// ```
-    pub fn separator<'a, T>(tok: &T) -> Option<Token<'a>>
+    pub fn io_here<'a, T>(_tok: &T) -> Option<Redirect<'a>>
     where
         T: Tokenizer<'a>,
     {
-        let sep = Self::separator_op(tok);
-        if sep.is_some() {
-            Self::linebreak(tok);
-            return sep;
-        }
+        unimplemented!("io_here: not implemented")
+    }
 
-        let newlines = Self::newline_list(tok);
-        if newlines {
-            return Some(Token {
-                t_type: TokenType::NewLine,
-                value: "",
-                start: 0,
-                end: 0,
-            });
-        }
-
-        None
+    /// BNF:
+    ///
+    /// ```
+    /// here_end ::= WORD                               Apply rule 3
+    ///            ;
+    /// ```
+    pub fn here_end<'a, T>(_tok: &T) -> Option<Word<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("here_end: not implemented")
     }
 
     /// BNF:
@@ -1249,6 +1524,51 @@ impl SyntaxTree {
         None
     }
 
+    /// BNF:
+    ///
+    /// ```
+    /// separator ::= separator_op linebreak
+    ///             | newline_list
+    ///             ;
+    /// ```
+    pub fn separator<'a, T>(tok: &T) -> Option<Token<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sep = Self::separator_op(tok);
+        if sep.is_some() {
+            Self::linebreak(tok);
+            return sep;
+        }
+
+        let newlines = Self::newline_list(tok);
+        if newlines {
+            return Some(Token {
+                t_type: TokenType::NewLine,
+                value: "",
+                start: 0,
+                end: 0,
+            });
+        }
+
+        None
+    }
+
+    /// BNF:
+    ///
+    /// ```
+    /// sequential_sep ::= ';' linebreak
+    ///                  | newline_list
+    ///                  ;
+    /// ```
+    pub fn sequential_sep<'a, T>(_tok: &T) -> Option<Token<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        unimplemented!("sequential_sep: not implemented")
+    }
+
+    /// The `WORD` terminal: a plain or quoted word, or a substitution.
     pub fn word<'a, T>(tok: &T) -> Option<Word<'a>>
     where
         T: Tokenizer<'a>,
@@ -1274,6 +1594,7 @@ impl SyntaxTree {
         None
     }
 
+    /// The `ASSIGNMENT_WORD` terminal: `name=value`, with a valid name.
     pub fn assignment_word<'a, T>(tok: &T) -> Option<AssignmentWord<'a>>
     where
         T: Tokenizer<'a>,
