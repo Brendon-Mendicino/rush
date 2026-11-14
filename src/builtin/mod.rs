@@ -10,7 +10,8 @@ use clap::{Arg, ArgAction, CommandFactory};
 use crate::{
     job::{JobId, JobTable},
     nix,
-    shell::Shell,
+    shell::{self, ReadonlyError, Shell, Value, VarAttr},
+    syntax,
 };
 
 // Special built-ins (POSIX §2.14).
@@ -156,6 +157,13 @@ impl From<&str> for Error {
     }
 }
 
+/// A change to a readonly variable: `X: readonly variable`.
+impl From<ReadonlyError> for Error {
+    fn from(e: ReadonlyError) -> Self {
+        Self::new(1, e.to_string())
+    }
+}
+
 /// Say what an io error was about: `cd: nope: No such file or directory`.
 pub trait Context<T> {
     fn context(self, what: impl Display) -> Result<T, Error>;
@@ -254,6 +262,43 @@ fn find_job(jobs: &JobTable, id: Option<&JobId>) -> Result<usize, String> {
         Some(id) => jobs.find(id).map_err(|e| format!("{id}: {e}")),
         None => jobs.current().ok_or_else(|| "no current job".to_string()),
     }
+}
+
+/// `name` can be the name of a variable.
+fn check_name(name: &str) -> Result<(), Error> {
+    if syntax::is_valid_name(name) {
+        Ok(())
+    } else {
+        Err(format!("{name}: not a valid identifier").into())
+    }
+}
+
+/// An operand `name[=word]` of `export` and `readonly`: the name, and the value
+/// when there is one (`X=` gives an empty one).
+fn declaration(arg: &str) -> Result<(&str, Option<String>), Error> {
+    let (name, value) = match arg.split_once('=') {
+        Some((name, value)) => (name, Some(value.to_string())),
+        None => (arg, None),
+    };
+    check_name(name)?;
+    Ok((name, value))
+}
+
+/// The listing of `export -p` and `readonly -p`: `<keyword> name='value'`, or
+/// `<keyword> name` when it is unset, for the variables with the attribute,
+/// sorted by name. The values are quoted for reinput.
+fn print_declarations(
+    bi: &mut Builtin,
+    keyword: &str,
+    has: impl Fn(&VarAttr) -> bool,
+) -> Result<(), Error> {
+    for (name, var) in bi.shell.env.iter().filter(|(_, var)| has(&var.attr)) {
+        match &var.value {
+            Value::Set(value) => writeln!(bi.stdout, "{keyword} {name}={}", shell::quote(value))?,
+            Value::Unset => writeln!(bi.stdout, "{keyword} {name}")?,
+        }
+    }
+    Ok(())
 }
 
 /// Body of the built-ins that are not implemented yet: report it and fail. Not an

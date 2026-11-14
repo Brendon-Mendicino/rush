@@ -29,6 +29,22 @@ fn last_prefix_wins() {
 }
 
 #[test]
+fn names_and_values_can_be_utf8() {
+    let output = run_shell("città=Röma printenv città\n変数=値 printenv 変数\n");
+
+    assert_eq!(stdout(&output), "Röma\n値\n");
+}
+
+#[test]
+fn utf8_vars_are_inherited() {
+    let mut command = shell_command(Path::new(env!("CARGO_TARGET_TMPDIR")));
+    command.env("RUSH_ÀÉ", "ñ");
+    let output = run(command, "printenv RUSH_ÀÉ\n");
+
+    assert_eq!(stdout(&output), "ñ\n");
+}
+
+#[test]
 fn exported_vars_are_inherited() {
     let output = run_with_outer("printenv RUSH_OUTER\n");
 

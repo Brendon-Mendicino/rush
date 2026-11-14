@@ -3,10 +3,10 @@
 
 use crate::common::{run_shell, stderr, stdout};
 
-const NOT_IMPLEMENTED: [&str; 23] = [
+const NOT_IMPLEMENTED: [&str; 20] = [
     // Special built-ins.
-    "break", "continue", ".", "export", "readonly", "return", "set", "shift", "times", "trap",
-    "unset", // Regular built-ins.
+    "break", "continue", ".", "return", "set", "shift", "times", "trap",
+    // Regular built-ins.
     "alias", "command", "fc", "getopts", "hash", "read", "type", "ulimit", "umask", "unalias",
     "wait", // Also with arguments.
     "set -e",

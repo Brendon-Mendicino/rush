@@ -109,9 +109,9 @@ fn only_the_pipeline_command_exits() {
 
 #[test]
 fn a_stub_does_not_exit() {
-    let output = run_shell("export X\necho after\n");
+    let output = run_shell("trap\necho after\n");
 
-    assert!(stderr(&output).contains("rush: export: not implemented yet"));
+    assert!(stderr(&output).contains("rush: trap: not implemented yet"));
     assert_eq!(stdout(&output), "after\n");
 }
 

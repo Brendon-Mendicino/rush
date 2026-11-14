@@ -196,14 +196,14 @@ impl<'a> AssignmentWord<'a> {
     }
 }
 
-/// A shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+/// A shell variable name: a letter or `_`, then letters, digits and `_`. Letters
+/// and digits are Unicode ones, not only ASCII as in POSIX (XBD §3.235): names
+/// and values are UTF-8 (`città=Roma`).
 pub fn is_valid_name(name: &str) -> bool {
     let mut chars = name.chars();
 
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 impl<'a> SimpleCommand<'a> {
@@ -1323,10 +1323,10 @@ mod tests {
 
     #[test]
     fn valid_names() {
-        for name in ["a", "_a1", "MY_VAR", "_"] {
+        for name in ["a", "_a1", "MY_VAR", "_", "é", "città", "ñ_2", "変数"] {
             assert!(is_valid_name(name), "{name}");
         }
-        for name in ["", "1a", "a-b", "./x", "é"] {
+        for name in ["", "1a", "a-b", "./x", "a b", "a=", "٣x", "x€"] {
             assert!(!is_valid_name(name), "{name}");
         }
     }

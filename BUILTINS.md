@@ -55,6 +55,7 @@ Problems with this setup, found by reading the code:
 | special vs regular | The prefix and error rules of 0.6 are tested in `tests/builtins/special.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
 | `pwd` | Complete. Tests are in `tests/builtins/pwd.rs`. |
+| `export`, `readonly`, `unset` | Complete (`unset -f` waits for functions). The first invalid name or readonly variable stops the built-in, and a script exits (special built-in error). The `-p` listings quote every value (`export X='v'`), but rush can't read them back yet: the tokenizer doesn't join `X='a b'` into one word. Tests are in `tests/builtins/{export,readonly,unset}.rs`; the readonly assignment errors are tested in `readonly.rs`. |
 | `help` | Not POSIX, like bash's. `help` lists the built-ins with the first line of their help, `help name...` prints their help, the same as `name --help`. Tests are in `tests/builtins/help.rs`. |
 | `jobs`, `fg`, `bg` | Complete on top of the job table (0.1), apart from what needs `wait`/`$!`/`kill` (Phase 2). Tests are in `tests/builtins/{jobs,fg,bg}.rs`, the shell's own job reports in `tests/job_control.rs`. |
 | `kill`/`newgrp` | The stub exists but is **not registered** in `BUILTINS`. PATH finds `/usr/bin/*`, which is fine for `kill <pid>`, but `kill %1` and similar can't work. |
@@ -88,7 +89,7 @@ Problems with this setup, found by reading the code:
   - Operations: `assign` (keeps the attributes), `export(name, Option<value>)`, `set_readonly(name, Option<value>)`, `unset`, `check_assignable`. Changing or unsetting a readonly variable returns a `ReadonlyError` (`X: readonly variable`).
   - A readonly variable is a *variable assignment error* (§2.8.1, `Executor::assignment_error`): in an assignment, in the prefix of a special or regular built-in and in the prefix of a program (§2.9.1: the program doesn't run). A non-interactive shell exits with 1, an interactive one fails with 1; for a program in a pipeline, only that command fails. `cd` with a readonly `PWD`/`OLDPWD` fails after changing directory.
   - `shell::quote` formats a value for reinput (`'...'` with `'\''`).
-  - Still to do: the `export`, `readonly` and `unset` built-ins (Phase 1), and with `readonly` the end-to-end tests of the assignment errors (only unit tests for now: no script can create a readonly variable yet).
+  - The `export`, `readonly` and `unset` built-ins use it; the assignment errors are tested end to end in `tests/builtins/readonly.rs`.
 - [ ] **0.9 Shell state that's missing:** positional parameters and `$#`/`$@`/`$*`; a last-status field for `$?` (the executor currently only passes it to the prompt); `$$`, `$!`; option flags (`set -e -u -x -C -f -n -v -a -b -m`, `-o name`); an alias table; a trap table; and a hash table. Also set `PWD` at startup (canonical cwd), which the `sh` spec requires.
 
 ### Phase 1: built-ins that need no new grammar
@@ -185,20 +186,22 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] drop clap's `--help`
 
 #### `export name[=word]...` / `export -p`
-- [ ] give each name the export attribute; `name=word` also assigns
-- [ ] `export X` with X unset: mark it exported with no value (needs `Option` value)
-- [ ] invalid name (`syntax::is_valid_name`) → error, exit >0
-- [ ] assigning to a readonly variable → error
-- [ ] `-p`: `export name='value'` for set variables, `export name` for unset ones, sorted, quoted for reinput
-- [ ] no arguments: unspecified, so behave like `-p`
-- [ ] support `--`
+- [x] give each name the export attribute; `name=word` also assigns
+- [x] `export X` with X unset: mark it exported with no value
+- [x] invalid name (`syntax::is_valid_name`; UTF-8 letters and digits are allowed) → error, exit >0
+- [x] assigning to a readonly variable → error
+- [x] `-p`: `export name='value'` for set variables, `export name` for unset ones, sorted, quoted for reinput
+- [x] no arguments: unspecified, so behave like `-p`
+- [x] support `--`
+- [ ] the `-p` output can be read back (needs the tokenizer to join `X='a b'`)
 
 #### `readonly name[=word]...` / `readonly -p`
-- [ ] add `readonly` to `VarAttr`; `name=word` assigns first
-- [ ] any later assignment (`x=1`, `x=1 cmd`, `read x`, `getopts`, `export x=`, `for x`) → variable assignment error
-- [ ] `unset x` on a readonly variable → error
-- [ ] `-p`: `readonly name='value'` / `readonly name`, sorted and quoted
-- [ ] no arguments → behave like `-p`
+- [x] add `readonly` to `VarAttr`; `name=word` assigns first
+- [x] any later assignment (`x=1`, `x=1 cmd`, `export x=`) → variable assignment error
+- [ ] the same for `read x`, `getopts` and `for x`, once they exist
+- [x] `unset x` on a readonly variable → error
+- [x] `-p`: `readonly name='value'` / `readonly name`, sorted and quoted
+- [x] no arguments → behave like `-p`
 
 #### `return [n]`
 - [ ] needs functions / dot scripts (phase 3)
@@ -248,10 +251,10 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] handling: a `sigaction` handler sets an atomic flag or writes to a self-pipe, and pending traps run between commands and while waiting
 
 #### `unset [-fv] name...`
-- [ ] `-v` (default): remove the variable and its export; a name that isn't set is not an error
-- [ ] `-f`: remove a function (once functions exist)
-- [ ] readonly variable → error, exit >0
-- [ ] support `--`
+- [x] `-v` (default): remove the variable and its export; a name that isn't set is not an error
+- [ ] `-f`: remove a function (once functions exist; for now a no-op)
+- [x] readonly variable → error, exit >0
+- [x] support `--`
 
 ### Regular built-ins [docs/utilities/*.html]
 

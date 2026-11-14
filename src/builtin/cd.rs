@@ -100,12 +100,10 @@ fn change_dir(args: &Args, env: &mut ShellEnv) -> Result<Option<String>, Error> 
 
     // Exported. A readonly one is an error, after the directory changed.
     if let Some(old_pwd) = old_pwd {
-        env.export("OLDPWD", Some(old_pwd))
-            .map_err(|e| Error::from(e.to_string()))?;
+        env.export("OLDPWD", Some(old_pwd))?;
     }
     if let Some(new_pwd) = &new_pwd {
-        env.export("PWD", Some(new_pwd.clone()))
-            .map_err(|e| Error::from(e.to_string()))?;
+        env.export("PWD", Some(new_pwd.clone()))?;
     }
 
     Ok(print.then(|| new_pwd.unwrap_or(curpath)))
