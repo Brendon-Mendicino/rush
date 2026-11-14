@@ -28,7 +28,7 @@ use crate::{
 ///   >0  no job control, or JOB_ID names no job
 #[derive(Debug, Parser)]
 #[command(verbatim_doc_comment, override_usage = "fg [job_id]")]
-struct Args {
+pub(super) struct Args {
     #[arg(value_parser = parse_job_id)]
     job_id: Option<JobId>,
 }

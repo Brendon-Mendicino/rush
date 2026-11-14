@@ -29,7 +29,7 @@ use crate::{
 ///   >0  a JOB_ID names no job
 #[derive(Debug, Parser)]
 #[command(verbatim_doc_comment, override_usage = "jobs [-l|-p] [job_id...]")]
-struct Args {
+pub(super) struct Args {
     /// Also print the process ID of each job (its process group leader).
     #[arg(short = 'l', conflicts_with = "pids")]
     long: bool,

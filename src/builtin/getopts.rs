@@ -6,7 +6,19 @@
 //!
 //! Not implemented yet. Spec: `docs/utilities/getopts.html`.
 
+use clap::Parser;
+
 use crate::builtin::{Builtin, BuiltinResult, not_implemented};
+
+/// Parse utility options.
+///
+/// Not implemented yet.
+#[derive(Debug, Parser)]
+#[command(
+    verbatim_doc_comment,
+    override_usage = "getopts optstring name [arg...]"
+)]
+pub(super) struct Args {}
 
 pub fn getopts(bi: &mut Builtin) -> BuiltinResult {
     not_implemented(bi)

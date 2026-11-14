@@ -12,6 +12,7 @@ mod exec;
 mod exit;
 mod r#false;
 mod fg;
+mod help;
 mod jobs;
 mod not_implemented;
 mod pipeline;

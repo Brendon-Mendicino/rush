@@ -5,6 +5,8 @@ use std::{
     sync::LazyLock,
 };
 
+use clap::{Arg, ArgAction, CommandFactory};
+
 use crate::{
     job::{JobId, JobTable},
     nix,
@@ -38,6 +40,7 @@ mod fc;
 mod fg;
 mod getopts;
 mod hash;
+mod help;
 mod jobs;
 mod pwd;
 mod read;
@@ -179,7 +182,24 @@ pub type FnBuiltin = fn(&mut Builtin) -> BuiltinResult;
 /// For a special built-in that is a "special built-in utility error" (POSIX
 /// §2.8.1), which exits a non-interactive shell; a diagnostic after which the
 /// built-in goes on (`bi.report` and `Ok(Status::FAILURE)`) is not.
+///
+/// `--help` as the first argument prints the help of the built-in instead of
+/// running it, like bash: also for the built-ins that don't parse their
+/// arguments (`: --help`, `eval --help`).
 pub fn run(f: FnBuiltin, mut bi: Builtin) -> Result<Status, i32> {
+    if bi.args.get(1) == Some(&"--help")
+        && let Some(mut cmd) = help_command(bi.args[0])
+    {
+        return match write!(bi.stdout, "{}", cmd.render_long_help()).and_then(|_| bi.stdout.flush())
+        {
+            Ok(()) => Ok(Status::SUCCESS),
+            Err(e) => {
+                let _ = bi.report(nix::error_message(&e));
+                Err(1)
+            }
+        };
+    }
+
     let result = f(&mut bi).and_then(|status| {
         bi.stdout.flush()?;
         Ok(status)
@@ -258,6 +278,9 @@ pub enum Kind {
 pub struct BuiltinDef {
     pub kind: Kind,
     pub run: FnBuiltin,
+    /// The clap command of its `Args`, where its help comes from. Every
+    /// built-in has one, also the ones that don't parse their arguments.
+    pub command: fn() -> clap::Command,
 }
 
 /// The built-in called `name`, if any. The command search (§2.9.1) finds a
@@ -267,63 +290,132 @@ pub fn find(name: &str) -> Option<BuiltinDef> {
     BUILTINS.get(name).copied()
 }
 
+/// The clap command of the built-in called `name`, ready to render its help.
+pub fn help_command(name: &str) -> Option<clap::Command> {
+    find(name).map(|def| command(name, (def.command)()))
+}
+
+/// The settings every built-in's clap command shares, the POSIX Utility Syntax
+/// Guidelines as far as clap goes. clap already groups flags (`-LP`), takes an
+/// option-argument attached or separate (`-ofoo`, `-o foo`), ends the options
+/// at `--` and takes a lone `-` as an operand. On top of that:
+/// - the usage and errors show the name of the built-in, not `rush`;
+/// - only `--help` prints the help: `-h` is an invalid option, as for any
+///   POSIX utility that doesn't define it;
+/// - an option can be repeated (`pwd -PP`), the last one wins.
+///
+/// TODO: what clap can't do (a workaround later, BUILTINS.md 0.7): options
+/// after an operand are still options (`cd dir -P`), where POSIX takes them as
+/// operands; `+x` options (`set +x`); `getopts` needs its own parser.
+fn command(name: &str, cmd: clap::Command) -> clap::Command {
+    cmd.name(name.to_string())
+        .bin_name(name.to_string())
+        .disable_help_flag(true)
+        .arg(
+            Arg::new("help")
+                .long("help")
+                .action(ArgAction::Help)
+                .help("Print help"),
+        )
+        .args_override_self(true)
+}
+
 static BUILTINS: LazyLock<HashMap<&str, BuiltinDef>> = LazyLock::new(|| {
-    let special: [(&str, FnBuiltin); _] = [
-        ("break", self::r#break::r#break),
-        (":", self::colon::colon),
-        ("continue", self::r#continue::r#continue),
-        (".", self::dot::dot),
-        ("eval", self::eval::eval),
-        ("exec", self::exec::exec),
-        ("exit", self::exit::exit),
-        ("export", self::export::export),
-        ("readonly", self::readonly::readonly),
-        ("return", self::r#return::r#return),
-        ("set", self::set::set),
-        ("shift", self::shift::shift),
-        ("times", self::times::times),
-        ("trap", self::trap::trap),
-        ("unset", self::unset::unset),
+    type Entry = (&'static str, FnBuiltin, fn() -> clap::Command);
+
+    let special: [Entry; _] = [
+        (
+            "break",
+            self::r#break::r#break,
+            self::r#break::Args::command,
+        ),
+        (":", self::colon::colon, self::colon::Args::command),
+        (
+            "continue",
+            self::r#continue::r#continue,
+            self::r#continue::Args::command,
+        ),
+        (".", self::dot::dot, self::dot::Args::command),
+        ("eval", self::eval::eval, self::eval::Args::command),
+        ("exec", self::exec::exec, self::exec::Args::command),
+        ("exit", self::exit::exit, self::exit::Args::command),
+        ("export", self::export::export, self::export::Args::command),
+        (
+            "readonly",
+            self::readonly::readonly,
+            self::readonly::Args::command,
+        ),
+        (
+            "return",
+            self::r#return::r#return,
+            self::r#return::Args::command,
+        ),
+        ("set", self::set::set, self::set::Args::command),
+        ("shift", self::shift::shift, self::shift::Args::command),
+        ("times", self::times::times, self::times::Args::command),
+        ("trap", self::trap::trap, self::trap::Args::command),
+        ("unset", self::unset::unset, self::unset::Args::command),
     ];
-    let regular: [(&str, FnBuiltin); _] = [
-        ("alias", self::alias::alias),
-        ("bg", self::bg::bg),
-        ("cd", self::cd::cd),
-        ("command", self::command::command),
-        ("false", self::r#false::r#false),
-        ("fc", self::fc::fc),
-        ("fg", self::fg::fg),
-        ("getopts", self::getopts::getopts),
-        ("hash", self::hash::hash),
-        ("jobs", self::jobs::jobs),
-        ("pwd", self::pwd::pwd),
-        ("read", self::read::read),
-        ("true", self::r#true::r#true),
-        ("type", self::r#type::r#type),
-        ("ulimit", self::ulimit::ulimit),
-        ("umask", self::umask::umask),
-        ("unalias", self::unalias::unalias),
-        ("wait", self::wait::wait),
+    let regular: [Entry; _] = [
+        ("alias", self::alias::alias, self::alias::Args::command),
+        ("bg", self::bg::bg, self::bg::Args::command),
+        ("cd", self::cd::cd, self::cd::Args::command),
+        (
+            "command",
+            self::command::command,
+            self::command::Args::command,
+        ),
+        (
+            "false",
+            self::r#false::r#false,
+            self::r#false::Args::command,
+        ),
+        ("fc", self::fc::fc, self::fc::Args::command),
+        ("fg", self::fg::fg, self::fg::Args::command),
+        (
+            "getopts",
+            self::getopts::getopts,
+            self::getopts::Args::command,
+        ),
+        ("hash", self::hash::hash, self::hash::Args::command),
+        // Not POSIX: like bash's.
+        ("help", self::help::help, self::help::Args::command),
+        ("jobs", self::jobs::jobs, self::jobs::Args::command),
+        ("pwd", self::pwd::pwd, self::pwd::Args::command),
+        ("read", self::read::read, self::read::Args::command),
+        ("true", self::r#true::r#true, self::r#true::Args::command),
+        ("type", self::r#type::r#type, self::r#type::Args::command),
+        ("ulimit", self::ulimit::ulimit, self::ulimit::Args::command),
+        ("umask", self::umask::umask, self::umask::Args::command),
+        (
+            "unalias",
+            self::unalias::unalias,
+            self::unalias::Args::command,
+        ),
+        ("wait", self::wait::wait, self::wait::Args::command),
     ];
 
-    let special = special.map(|(name, run)| (name, Kind::Special, run));
-    let regular = regular.map(|(name, run)| (name, Kind::Regular, run));
+    let special = special.map(|(name, run, command)| (name, Kind::Special, run, command));
+    let regular = regular.map(|(name, run, command)| (name, Kind::Regular, run, command));
 
     special
         .into_iter()
         .chain(regular)
-        .map(|(name, kind, run)| (name, BuiltinDef { kind, run }))
+        .map(|(name, kind, run, command)| (name, BuiltinDef { kind, run, command }))
         .collect()
 });
 
 impl Builtin<'_, '_, '_, '_, '_> {
     /// Parse the arguments, `args[0]` is the name of the built-in. The errors, and
     /// `--help`, are printed by [`run`].
+    ///
+    /// The command gets the settings shared by every built-in, see [`command`].
     pub(self) fn parse<T>(&self) -> Result<T, Error>
     where
         T: clap::Parser,
     {
-        Ok(T::try_parse_from(self.args)?)
+        let mut matches = command(self.args[0], T::command()).try_get_matches_from(self.args)?;
+        Ok(T::from_arg_matches_mut(&mut matches)?)
     }
 
     /// Write a diagnostic, `rush: <name>: <message>`, without stopping the built-in:
@@ -516,6 +608,52 @@ mod tests {
     }
 
     #[test]
+    fn a_flag_can_be_repeated() {
+        for args in [&["name", "-ff"][..], &["name", "-f", "-f"]] {
+            assert_eq!(run_builtin(parses, args).status, Ok(Status::SUCCESS));
+        }
+    }
+
+    #[test]
+    fn dash_h_is_not_help() {
+        let output = run_builtin(parses, &["name", "-h"]);
+
+        assert_eq!(output.status, Err(2));
+        assert!(output.stderr.contains("unexpected argument '-h'"));
+        assert_eq!(output.stdout, "");
+    }
+
+    #[test]
+    fn help_works_without_parsing() {
+        // `:` never parses its arguments: `run` prints its help.
+        let output = run_builtin(colon::colon, &[":", "--help"]);
+
+        assert_eq!(output.status, Ok(Status::SUCCESS));
+        assert!(output.stdout.contains("Usage: : [argument...]"));
+        assert!(output.all_flushed);
+
+        // Only as the first argument.
+        let output = run_builtin(colon::colon, &[":", "x", "--help"]);
+        assert_eq!(output.stdout, "");
+    }
+
+    #[test]
+    fn every_builtin_has_a_help() {
+        for name in BUILTINS.keys() {
+            let mut cmd = help_command(name).unwrap();
+
+            let about = cmd.get_about().map(ToString::to_string).unwrap_or_default();
+            assert!(about.ends_with('.'), "{name}: {about:?}");
+
+            let usage = cmd.render_usage().to_string();
+            assert!(
+                usage.starts_with(&format!("Usage: {name}")),
+                "{name}: {usage:?}"
+            );
+        }
+    }
+
+    #[test]
     fn job_ids_are_parsed() {
         for (s, id) in [
             ("%", JobId::Current),
@@ -564,7 +702,9 @@ mod tests {
         for name in [":", "eval", "exec", "exit", "export", "set", "unset", "."] {
             assert_eq!(kind(name), Some(Kind::Special), "{name}");
         }
-        for name in ["cd", "pwd", "true", "false", "jobs", "fg", "bg", "wait"] {
+        for name in [
+            "cd", "pwd", "true", "false", "jobs", "fg", "bg", "wait", "help",
+        ] {
             assert_eq!(kind(name), Some(Kind::Regular), "{name}");
         }
         assert_eq!(kind("ls"), None);

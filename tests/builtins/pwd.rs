@@ -64,6 +64,36 @@ fn the_last_of_l_and_p_wins() {
 }
 
 #[test]
+fn options_can_be_grouped_and_repeated() {
+    let dir = dir_with_symlink("pwd_grouped_options");
+    let link = dir.join("link");
+
+    let output = run_shell_in(
+        &format!("cd {}\npwd -LP\npwd -PL\npwd -PP\n", link.display()),
+        &dir,
+    );
+
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "{0}/real/child\n{1}\n{0}/real/child\n",
+            real(&dir),
+            link.display()
+        )
+    );
+}
+
+#[test]
+fn dash_h_is_an_invalid_option() {
+    let dir = test_dir("pwd_dash_h");
+
+    let output = run_shell_in("pwd -h || echo failed\n", &dir);
+
+    assert_eq!(stdout(&output), "failed\n");
+    assert!(stderr(&output).contains("unexpected argument '-h'"));
+}
+
+#[test]
 fn a_stale_pwd_from_the_environment_is_ignored() {
     let dir = test_dir("pwd_stale");
 

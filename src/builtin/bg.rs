@@ -28,7 +28,7 @@ use crate::{
 ///   >0  no job control, or a JOB_ID names no job or a job that terminated
 #[derive(Debug, Parser)]
 #[command(verbatim_doc_comment, override_usage = "bg [job_id...]")]
-struct Args {
+pub(super) struct Args {
     #[arg(value_parser = parse_job_id)]
     job_ids: Vec<JobId>,
 }

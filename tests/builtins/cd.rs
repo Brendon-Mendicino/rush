@@ -39,6 +39,16 @@ fn changes_to_an_absolute_directory() {
 }
 
 #[test]
+fn double_dash_ends_the_options() {
+    let dir = test_dir("cd_double_dash");
+    let target = mkdir(dir.join("-P"));
+
+    let output = run_shell_in("cd -- -P\npwd -P\n", &dir);
+
+    assert_eq!(stdout(&output), format!("{}\n", real(&target)));
+}
+
+#[test]
 fn changes_to_a_relative_directory() {
     let dir = test_dir("cd_relative");
     let sub = mkdir(dir.join("a/b"));

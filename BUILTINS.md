@@ -45,7 +45,7 @@ Problems with this setup, found by reading the code:
 
 | Built-in | Status |
 |---|---|
-| `cd` | Complete, apart from the POSIX option parser (Phase 0.7). Tests are in `tests/builtins/cd.rs`. |
+| `cd` | Complete, apart from options after the operand (`cd dir -P`, see 0.7). Tests are in `tests/builtins/cd.rs`. |
 | `exit` | `exit [n]` returns `Status::Exit`, and the executor ends the current process: the shell, or only the forked child in a subshell or a pipeline. With no argument it should use `$?`, not 0. Tests are in `tests/builtins/exit.rs`. |
 | `env` | **Not a POSIX built-in.** It ignores its arguments (`env A=1 cmd` doesn't work), prints unexported variables too, and its order is random (HashMap). → Remove it so `/usr/bin/env` runs. Its listing job belongs to `set` and `export -p`. |
 | all the others | Stubs in `src/builtin/<name>.rs` (synopsis + spec link) that print `rush: <name>: not implemented yet` and return 1. They're listed in `tests/builtins/not_implemented.rs`; remove a name from there once it's implemented. |
@@ -55,6 +55,7 @@ Problems with this setup, found by reading the code:
 | special vs regular | The prefix and error rules of 0.6 are tested in `tests/builtins/special.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
 | `pwd` | Complete. Tests are in `tests/builtins/pwd.rs`. |
+| `help` | Not POSIX, like bash's. `help` lists the built-ins with the first line of their help, `help name...` prints their help, the same as `name --help`. Tests are in `tests/builtins/help.rs`. |
 | `jobs`, `fg`, `bg` | Complete on top of the job table (0.1), apart from what needs `wait`/`$!`/`kill` (Phase 2). Tests are in `tests/builtins/{jobs,fg,bg}.rs`, the shell's own job reports in `tests/job_control.rs`. |
 | `kill`/`newgrp` | The stub exists but is **not registered** in `BUILTINS`. PATH finds `/usr/bin/*`, which is fine for `kill <pid>`, but `kill %1` and similar can't work. |
 
@@ -80,7 +81,9 @@ Problems with this setup, found by reading the code:
   - Regular built-ins: the prefixes are set exported while the built-in runs and put back afterwards (`Shell::set_temporarily` returns a `TempVarsGuard`, which restores them when dropped). TODO: what happens when the built-in itself changes one of them (`PWD=/x cd`, `VAR=x read VAR`, a `command unset VAR`), see the doc of `TempVarsGuard`. Their errors never exit the shell.
   - "Error" is an `Err` returned by the built-in (`builtin::run` gives back `Err(status)`); `bi.report` followed by `Ok(Status::FAILURE)` is a failure but not an error. The stubs work that way, so a special built-in that isn't implemented yet doesn't exit a script.
   - Still to do: `command` must strip the special properties (§2.9.1); a syntax error in the script itself should exit a non-interactive shell too (§2.8.1), today it is reported and the shell goes on; variable assignment errors (readonly, 0.8).
-- [ ] **0.7 POSIX option parser.** Write a small getopt in `builtin/mod.rs` that follows Utility Syntax Guidelines 3–10: grouped `-abc`, option arguments attached or separate, `--`, and a bare `-` counts as an operand. It should also allow `+x` for `set`. Use it instead of clap for the POSIX built-ins, and reuse it in `getopts`.
+- [x] **0.7 POSIX option syntax.** clap is kept: it already follows most of the Utility Syntax Guidelines 3–10 (grouped `-abc`, option-arguments attached or separate, `--`, a bare `-` as an operand). The settings every built-in shares are in one place, `builtin::command`: the built-in's name in the usage and errors, `--help` only (`-h` is an invalid option), and repeated options allowed, the last one wins (`pwd -PP`).
+  - Every built-in, stubs included, has a clap `Args` struct, also when it doesn't parse its arguments (`:`, `true`, `false`, `eval`, `exec`): its doc comment is the help text. `BuiltinDef.command` keeps it, for `help` (a new built-in, like bash's) and for `--help`, which `builtin::run` handles as the first argument of any built-in.
+  - Still to do, with a workaround outside clap: options after an operand are still options (`cd dir -P`), where POSIX takes them as operands; `+x` options for `set`; `getopts` needs its own parser.
 - [ ] **0.8 Variables model (`shell.rs`).**
   - `Var.value: Option<String>`, because `export X` with X unset must mark it exported without giving it a value.
   - Add `VarAttr.readonly`. Assigning to a readonly variable is a *variable assignment error*: a non-interactive shell exits, and an interactive one prints an error with status ≠ 0.

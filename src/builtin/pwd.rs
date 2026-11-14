@@ -25,7 +25,7 @@ use crate::builtin::{Builtin, BuiltinResult, ENDL, Status, cd};
 ///   >0  an error occurred, nothing is written to standard output
 #[derive(Debug, Parser)]
 #[command(verbatim_doc_comment, override_usage = "pwd [-L|-P]")]
-struct Args {
+pub(super) struct Args {
     /// Print $PWD if it names the working directory (default).
     #[arg(short = 'L', overrides_with = "physical")]
     logical: bool,

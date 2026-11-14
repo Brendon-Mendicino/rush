@@ -39,7 +39,7 @@ use crate::{
     verbatim_doc_comment,
     override_usage = "cd [-L|-P] [directory]\n       cd -"
 )]
-struct Args {
+pub(super) struct Args {
     /// Handle `..` logically, before resolving symbolic links (default).
     #[arg(short = 'L', overrides_with = "physical")]
     logical: bool,
