@@ -305,3 +305,36 @@ fn ctrl_c_interrupts_a_command_substitution() {
     sh.send("echo alive\n");
     sh.stdout.expect("alive\r\n");
 }
+
+#[test]
+fn ctrl_c_in_the_condition_stops_the_if() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("if sleep 30; then echo then; else echo else; fi\n");
+    sh.wait_foreground_job("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    assert!(
+        !output.contains("then") && !output.contains("else"),
+        "a part of the if ran: {output:?}"
+    );
+    assert!(output.contains(RED), "the status is 130");
+}
+
+#[test]
+fn ctrl_z_in_an_if_stops_only_the_command() {
+    let mut sh = InteractiveShell::spawn();
+
+    // The if runs in the shell: its commands are jobs of their own.
+    sh.send("if true; then sleep 30; echo after; fi\n");
+    let pgid = sh.wait_foreground_job("sleep");
+    sh.send("\x1a");
+
+    sh.stderr.expect("[1] + Stopped (SIGTSTP) sleep 30\n");
+    sh.stdout.expect("after\r\n");
+    sh.expect_prompt();
+    assert_eq!(sh.foreground_pgid(), sh.pid());
+
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}

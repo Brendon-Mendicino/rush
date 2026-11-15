@@ -89,6 +89,18 @@ impl From<JobExit> for ExecStatus {
     }
 }
 
+/// The status of shell code run without a process of its own (`eval`, a
+/// compound command), as the exit of its pipeline's command.
+fn job_exit(status: ExecStatus) -> JobExit {
+    match status {
+        ExecStatus::Exited(code) => JobExit::Exited(code),
+        // Keeps an interruption visible to the and-or list around it.
+        ExecStatus::Signaled(sig) => JobExit::Signaled(sig),
+        // The job that stopped is already in the background jobs.
+        status @ ExecStatus::Stopped(_) => JobExit::Exited(status.code()),
+    }
+}
+
 /// Report a command that could not be spawned. The status follows other shells:
 /// 127 when the program does not exist, 126 when it cannot be executed.
 fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
@@ -635,11 +647,7 @@ impl Executor {
             Ok(Status::Eval(program)) => match self.execute_str(&program) {
                 // `eval` of something that can't be parsed: an error of `eval`.
                 Err(SyntaxError) => self.builtin_error(def.kind, ExecStatus::SYNTAX_ERROR.code()),
-                Ok(ExecStatus::Exited(code)) => JobExit::Exited(code),
-                // Keeps an interruption visible to the and-or list around `eval`.
-                Ok(ExecStatus::Signaled(sig)) => JobExit::Signaled(sig),
-                // The job is already in the background jobs.
-                Ok(status @ ExecStatus::Stopped(_)) => JobExit::Exited(status.code()),
+                Ok(status) => job_exit(status),
             },
             Ok(Status::Exec(argv)) => {
                 let has_command = !argv.is_empty();
@@ -1050,8 +1058,13 @@ impl Executor {
     }
 
     /// `( list )`: run the list in a forked shell.
-    fn subshell(&mut self, subshell: &Subshell, state: PipelineState) -> CommandRun {
-        let redirections = match self.expand_redirects(&subshell.redirections) {
+    fn subshell(
+        &mut self,
+        subshell: &Subshell,
+        redirections: &[Redirect],
+        state: PipelineState,
+    ) -> CommandRun {
+        let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
             Err(e) => return redirection_failure(e),
         };
@@ -1059,6 +1072,107 @@ impl Executor {
         self.fork_child(SpawnType::Subshell, state, &redirections, |executor| {
             executor.list(&subshell.seq_list)
         })
+    }
+
+    /// A compound command with its redirections. A subshell always gets its own
+    /// process; the others run in the shell, so that what they change stays
+    /// (`if true; then X=1; fi`), unless they are part of a pipeline, where each
+    /// command has its own process.
+    fn compound(
+        &mut self,
+        command: &CompoundCommand,
+        redirections: &[Redirect],
+        state: PipelineState,
+    ) -> CommandRun {
+        if let CompoundCommand::Subshell(subshell) = command {
+            return self.subshell(subshell, redirections, state);
+        }
+
+        let redirections = match self.expand_redirects(redirections) {
+            Ok(redirections) => redirections,
+            Err(e) => return CommandRun::Done(self.compound_redirection_error(e)),
+        };
+
+        // Like a built-in in a pipeline: `fork_child` applies the redirections
+        // to the child, a redirection error ends it.
+        if state.in_pipeline {
+            return self.fork_child(SpawnType::Subshell, state, &redirections, |executor| {
+                executor.compound_body(command)
+            });
+        }
+
+        let controller =
+            match RedirectController::from_redirects(&redirections, &self.shell.internal_fds()) {
+                Ok(controller) => controller,
+                Err(e) => return CommandRun::Done(self.compound_redirection_error(e)),
+            };
+        let guard = match RedirectGuard::apply(&controller, &mut self.shell) {
+            Ok(guard) => guard,
+            Err(e) => {
+                return CommandRun::Done(self.compound_redirection_error(nix::error_message(&e)));
+            }
+        };
+
+        let status = self.compound_body(command);
+        // The redirections are undone before the next command.
+        drop(guard);
+
+        CommandRun::Done(job_exit(status))
+    }
+
+    /// Run a compound command in the current process, its redirections already
+    /// in place.
+    fn compound_body(&mut self, command: &CompoundCommand) -> ExecStatus {
+        match command {
+            CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
+            CompoundCommand::If(clause) => self.if_clause(clause),
+        }
+    }
+
+    /// A redirection of a compound command failed: an error that exits a
+    /// non-interactive shell (§2.8.1, "Redirection error with compound
+    /// commands"). The command doesn't run.
+    // TODO: one place for the consequences of every error (TODO.md §10).
+    fn compound_redirection_error(&self, message: impl fmt::Display) -> JobExit {
+        eprintln!("rush: {message}");
+        if !self.shell.is_interactive {
+            Self::exit_shell(1);
+        }
+        JobExit::Exited(1)
+    }
+
+    /// `if`: the body of the first condition that succeeds runs, or the `else`
+    /// part. The status is the one of the body that ran, 0 when none did
+    /// (§2.9.4).
+    fn if_clause(&mut self, clause: &IfClause) -> ExecStatus {
+        self.conditional(&clause.condition, &clause.body, clause.else_part.as_deref())
+    }
+
+    /// `condition; then body; else_part`, for the `if` and each `elif`.
+    fn conditional(
+        &mut self,
+        condition: &List,
+        body: &List,
+        else_part: Option<&ElsePart>,
+    ) -> ExecStatus {
+        let status = self.list(condition);
+
+        // Interrupted (Ctrl-C): nothing else runs, like in an and-or list.
+        if status.interrupted() {
+            return status;
+        }
+
+        if !status.failure() {
+            return self.list(body);
+        }
+
+        match else_part {
+            Some(ElsePart::Elif(elif)) => {
+                self.conditional(&elif.condition, &elif.body, elif.else_part.as_deref())
+            }
+            Some(ElsePart::Else(els)) => self.list(&els.body),
+            None => ExecStatus::SUCCESS,
+        }
     }
 
     /// `list &`: run the list in a forked shell without waiting for it.
@@ -1370,7 +1484,10 @@ impl Executor {
         match command {
             Command::SimpleAssignment(assignment) => self.simple_assignment(assignment, state),
             Command::UnsubCommand(command) => self.unsub_command(command, state),
-            Command::Subshell(subshell) => self.subshell(subshell, state),
+            Command::Compound {
+                command,
+                redirections,
+            } => self.compound(command, redirections, state),
         }
     }
 

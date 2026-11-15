@@ -85,7 +85,19 @@ pub struct UnsubCommand<'a> {
 pub enum Command<'a> {
     SimpleAssignment(SimpleAssignment<'a>),
     UnsubCommand(UnsubCommand<'a>),
+    /// `compound_command redirect_list`: the redirections apply to the whole
+    /// compound command.
+    Compound {
+        command: CompoundCommand<'a>,
+        redirections: Vec<Redirect<'a>>,
+    },
+}
+
+/// The compound commands parsed so far (§2.9.4).
+#[derive(Debug, Clone)]
+pub enum CompoundCommand<'a> {
     Subshell(Subshell<'a>),
+    If(IfClause<'a>),
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +148,31 @@ pub struct Subshell<'a> {
     pub open_round: Token<'a>,
     pub close_round: Token<'a>,
     pub seq_list: Box<List<'a>>,
-    pub redirections: Vec<Redirect<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfClause<'a> {
+    pub condition: List<'a>,
+    pub body: List<'a>,
+    pub else_part: Option<Box<ElsePart<'a>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ElifClause<'a> {
+    pub condition: List<'a>,
+    pub body: List<'a>,
+    pub else_part: Option<Box<ElsePart<'a>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ElseClause<'a> {
+    pub body: List<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ElsePart<'a> {
+    Elif(ElifClause<'a>),
+    Else(ElseClause<'a>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +219,32 @@ pub struct CmdSub<'a> {
 #[derive(Debug, Clone)]
 pub struct SyntaxTree {}
 
+/// The reserved words (§2.4), named like the grammar's terminals (§2.10.2).
+/// Recognized only unquoted, as a whole word, where a command starts or where
+/// the grammar expects one of them (`then`, `fi`...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedWord {
+    /// `!`
+    Bang,
+    /// `{`
+    Lbrace,
+    /// `}`
+    Rbrace,
+    Case,
+    Do,
+    Done,
+    Elif,
+    Else,
+    Esac,
+    Fi,
+    For,
+    If,
+    In,
+    Then,
+    Until,
+    While,
+}
+
 /// A shell variable name: a letter or `_`, then letters, digits and `_`. Letters
 /// and digits are Unicode ones, not only ASCII as in POSIX (XBD §3.235): names
 /// and values are UTF-8 (`città=Roma`).
@@ -192,6 +254,44 @@ pub fn is_valid_name(name: &str) -> bool {
 
     chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
         && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+impl ReservedWord {
+    /// The reserved word spelled `text`, if any.
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "!" => Self::Bang,
+            "{" => Self::Lbrace,
+            "}" => Self::Rbrace,
+            "case" => Self::Case,
+            "do" => Self::Do,
+            "done" => Self::Done,
+            "elif" => Self::Elif,
+            "else" => Self::Else,
+            "esac" => Self::Esac,
+            "fi" => Self::Fi,
+            "for" => Self::For,
+            "if" => Self::If,
+            "in" => Self::In,
+            "then" => Self::Then,
+            "until" => Self::Until,
+            "while" => Self::While,
+            _ => return None,
+        })
+    }
+}
+
+/// The reserved word `word` is, if any: one unquoted literal with exactly its
+/// text. `'if'`, `\if` and `if'x'` are ordinary words.
+fn reserved(word: &Word<'_>) -> Option<ReservedWord> {
+    let [WordPart::Literal(token)] = word.parts.as_slice() else {
+        return None;
+    };
+    if token.t_type != TokenType::Literal {
+        return None;
+    }
+
+    ReservedWord::parse(token.value)
 }
 
 // ------------------------------------
@@ -311,11 +411,60 @@ impl fmt::Display for UnsubCommand<'_> {
 
 impl fmt::Display for Subshell<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "({})", self.seq_list)?;
-        for redirect in &self.redirections {
-            write!(f, " {redirect}")?;
+        write!(f, "({})", self.seq_list)
+    }
+}
+
+/// Write a compound list followed by its separator: `; `, or only a blank after
+/// an asynchronous list, which already ends with its `&`.
+fn write_terminated(f: &mut fmt::Formatter<'_>, list: &List<'_>) -> fmt::Result {
+    match list {
+        List::AsyncList(_) => write!(f, "{list} "),
+        List::SequentialList(_) => write!(f, "{list}; "),
+    }
+}
+
+impl fmt::Display for IfClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("if ")?;
+        write_terminated(f, &self.condition)?;
+        f.write_str("then ")?;
+        write_terminated(f, &self.body)?;
+        if let Some(else_part) = &self.else_part {
+            write!(f, "{else_part}")?;
         }
-        Ok(())
+        f.write_str("fi")
+    }
+}
+
+/// Followed by a blank, ready for the next `elif`, `else` or `fi`.
+impl fmt::Display for ElsePart<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ElsePart::Elif(elif) => {
+                f.write_str("elif ")?;
+                write_terminated(f, &elif.condition)?;
+                f.write_str("then ")?;
+                write_terminated(f, &elif.body)?;
+                if let Some(else_part) = &elif.else_part {
+                    write!(f, "{else_part}")?;
+                }
+                Ok(())
+            }
+            ElsePart::Else(els) => {
+                f.write_str("else ")?;
+                write_terminated(f, &els.body)
+            }
+        }
+    }
+}
+
+impl fmt::Display for CompoundCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompoundCommand::Subshell(subshell) => write!(f, "{subshell}"),
+            CompoundCommand::If(clause) => write!(f, "{clause}"),
+        }
     }
 }
 
@@ -324,7 +473,16 @@ impl fmt::Display for Command<'_> {
         match self {
             Command::SimpleAssignment(assignment) => write!(f, "{assignment}"),
             Command::UnsubCommand(command) => write!(f, "{command}"),
-            Command::Subshell(subshell) => write!(f, "{subshell}"),
+            Command::Compound {
+                command,
+                redirections,
+            } => {
+                write!(f, "{command}")?;
+                for redirect in redirections {
+                    write!(f, " {redirect}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -696,14 +854,13 @@ impl SyntaxTree {
             return Some(simple_command);
         }
 
-        if let Some(mut subshell) = Self::compound_command(tok) {
-            let redirect_list = Self::redirect_list(tok);
+        if let Some(command) = Self::compound_command(tok) {
+            let redirections = Self::redirect_list(tok).unwrap_or_default();
 
-            if let Some(redirections) = redirect_list {
-                subshell.redirections = redirections;
-            }
-
-            return Some(Command::Subshell(subshell));
+            return Some(Command::Compound {
+                command,
+                redirections,
+            });
         }
 
         None
@@ -721,15 +878,18 @@ impl SyntaxTree {
     ///                    | until_clause
     ///                    ;
     /// ```
-    pub fn compound_command<'a, T>(tok: &T) -> Option<Subshell<'a>>
+    pub fn compound_command<'a, T>(tok: &T) -> Option<CompoundCommand<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: modify return value with appropriate variant, and try the other
-        // alternatives once they are implemented: `Self::brace_group`,
-        // `Self::for_clause`, `Self::case_clause`, `Self::if_clause`,
+        // TODO: try the other alternatives once they are implemented:
+        // `Self::brace_group`, `Self::for_clause`, `Self::case_clause`,
         // `Self::while_clause`, `Self::until_clause`.
-        Self::subshell(tok)
+        if let Some(subshell) = Self::subshell(tok) {
+            return Some(CompoundCommand::Subshell(subshell));
+        }
+
+        Self::if_clause(tok).map(CompoundCommand::If)
     }
 
     /// BNF:
@@ -756,7 +916,6 @@ impl SyntaxTree {
             open_round,
             close_round,
             seq_list: Box::new(compound_list),
-            redirections: vec![],
         })
     }
 
@@ -1000,12 +1159,26 @@ impl SyntaxTree {
     ///             | If compound_list Then compound_list           Fi
     ///             ;
     /// ```
-    pub fn if_clause<'a, T>(_tok: &T) -> Option<()>
+    pub fn if_clause<'a, T>(tok: &T) -> Option<IfClause<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("if_clause: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::If)?;
+        let condition = Self::compound_list(&sub_tok)?;
+        Self::reserved_word(&sub_tok, ReservedWord::Then)?;
+        let body = Self::compound_list(&sub_tok)?;
+        let else_part = Self::else_part(&sub_tok).map(Box::new);
+        Self::reserved_word(&sub_tok, ReservedWord::Fi)?;
+
+        tok.merge(sub_tok);
+
+        Some(IfClause {
+            condition,
+            body,
+            else_part,
+        })
     }
 
     /// BNF:
@@ -1016,12 +1189,33 @@ impl SyntaxTree {
     ///             | Else compound_list
     ///             ;
     /// ```
-    pub fn else_part<'a, T>(_tok: &T) -> Option<()>
+    pub fn else_part<'a, T>(tok: &T) -> Option<ElsePart<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("else_part: not implemented")
+        let sub_tok = tok.clone();
+
+        let else_part = if Self::reserved_word(&sub_tok, ReservedWord::Elif).is_some() {
+            let condition = Self::compound_list(&sub_tok)?;
+            Self::reserved_word(&sub_tok, ReservedWord::Then)?;
+            let body = Self::compound_list(&sub_tok)?;
+            let else_part = Self::else_part(&sub_tok).map(Box::new);
+
+            ElsePart::Elif(ElifClause {
+                condition,
+                body,
+                else_part,
+            })
+        } else {
+            Self::reserved_word(&sub_tok, ReservedWord::Else)?;
+            let body = Self::compound_list(&sub_tok)?;
+
+            ElsePart::Else(ElseClause { body })
+        };
+
+        tok.merge(sub_tok);
+
+        Some(else_part)
     }
 
     /// BNF:
@@ -1211,7 +1405,16 @@ impl SyntaxTree {
     where
         T: Tokenizer<'a>,
     {
-        Self::word(tok)
+        let sub_tok = tok.clone();
+
+        // Rule 7a (and 1): a reserved word where a command starts is not a
+        // WORD, so `then` ends the condition of an `if`. After a prefix it is
+        // (rule 7b, `cmd_word`): `X=1 if` runs a command named `if`.
+        let word = Self::word(&sub_tok).filter(|word| reserved(word).is_none())?;
+
+        tok.merge(sub_tok);
+
+        Some(word)
     }
 
     /// BNF:
@@ -1648,6 +1851,24 @@ impl SyntaxTree {
         }
     }
 
+    /// The reserved word `expected` (`If`, `Then`, `Fi`... in the grammar): a
+    /// word that is exactly its text, unquoted.
+    fn reserved_word<'a, T>(tok: &T, expected: ReservedWord) -> Option<()>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sub_tok = tok.clone();
+
+        let word = Self::word(&sub_tok)?;
+        if reserved(&word) != Some(expected) {
+            return None;
+        }
+
+        tok.merge(sub_tok);
+
+        Some(())
+    }
+
     /// The `ASSIGNMENT_WORD` terminal (rule 7b): a word whose first part is
     /// unquoted text with an `=` after a valid name, `name=value`. The rest of
     /// the word, from after the `=`, is the value.
@@ -1858,6 +2079,99 @@ mod tests {
             "x=1 y=2",
         ] {
             assert_eq!(reprint(input), input);
+        }
+    }
+
+    #[test]
+    fn if_clauses_print_back() {
+        for input in [
+            "if a; then b; fi",
+            "if a; then b; elif c; then d; else e; fi >f",
+            "if if a; then b; fi; then c; fi",
+            "if a & then b & fi",
+            "if a; then b; fi | if c; then d; fi && e",
+        ] {
+            assert_eq!(reprint(input), input);
+        }
+
+        let lines = vec![
+            "if a\n".to_string(),
+            "then\n".to_string(),
+            "  b; c\n".to_string(),
+            "else d\n".to_string(),
+            "fi\n".to_string(),
+        ];
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).unwrap();
+        assert!(tok.next_is_eof());
+        assert_eq!(
+            program.child.commands[0].to_string(),
+            "if a; then b; c; else d; fi"
+        );
+    }
+
+    #[test]
+    fn elif_is_an_else_part_with_its_own_else_part() {
+        let tok = UnbufferedTokenizer::new("if a; then b; elif c; then d; else e; fi");
+        let Some(Command::Compound {
+            command: CompoundCommand::If(clause),
+            ..
+        }) = SyntaxTree::command(&tok)
+        else {
+            panic!("an if expected");
+        };
+
+        let Some(ElsePart::Elif(elif)) = clause.else_part.as_deref() else {
+            panic!("an elif expected");
+        };
+        assert_eq!(elif.condition.to_string(), "c");
+        assert_eq!(elif.body.to_string(), "d");
+        assert!(matches!(
+            elif.else_part.as_deref(),
+            Some(ElsePart::Else(ElseClause { body })) if body.to_string() == "e"
+        ));
+    }
+
+    /// The whole input is one program.
+    fn parses(input: &str) -> bool {
+        let lines = vec![format!("{input}\n")];
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        SyntaxTree::program(&tok).is_some() && tok.next_is_eof()
+    }
+
+    #[test]
+    fn reserved_words_are_not_command_names() {
+        for input in [
+            "then x",
+            "fi",
+            "a; fi",
+            "if a; then b",
+            "if a; b; fi",
+            "if; then a; fi",
+            "if a; then; fi",
+            "if a; then b; else; fi",
+            "if a; then b; fi fi",
+        ] {
+            assert!(!parses(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn reserved_words_only_unquoted_and_whole() {
+        for input in [
+            "echo if then fi",
+            "'if' x",
+            "\\fi",
+            "X=1 if",
+            "iffy",
+            "fi'x'",
+        ] {
+            let tok = UnbufferedTokenizer::new(input);
+            assert!(
+                matches!(SyntaxTree::command(&tok), Some(Command::UnsubCommand(_))),
+                "{input}"
+            );
+            assert!(tok.next_is_eof(), "{input}");
         }
     }
 
