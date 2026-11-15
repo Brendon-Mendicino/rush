@@ -62,3 +62,31 @@ fn failing_command_gives_an_empty_word() {
     // `echo '' after`
     assert_eq!(stdout(&output), " after\n");
 }
+
+#[test]
+fn the_value_of_an_assignment() {
+    let output = run_shell(
+        "X=$(echo hi) printenv X\nX=\"$(echo 1) 2\" printenv X\nX=a'b c'$(echo d) printenv X\n",
+    );
+
+    assert_eq!(stdout(&output), "hi\n1 2\nab cd\n");
+}
+
+#[test]
+fn a_variable_ends_with_its_name() {
+    let mut command = shell_command(Path::new(env!("CARGO_TARGET_TMPDIR")));
+    command.env("RUSH_V", "v");
+    let output = run(
+        command,
+        "echo $RUSH_V/x ${RUSH_V}y \"$RUSH_V\" [$RUSH_UNSET]\n",
+    );
+
+    assert_eq!(stdout(&output), "v/x vy v []\n");
+}
+
+#[test]
+fn a_shell_variable_expands_too() {
+    let output = run_shell("X=1\necho $X\nexport Y='a b'\nprintenv Y\n");
+
+    assert_eq!(stdout(&output), "1\na b\n");
+}

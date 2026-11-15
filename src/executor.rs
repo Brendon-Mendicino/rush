@@ -114,6 +114,31 @@ fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
     }
 }
 
+/// The program inside `` `...` ``: without the backquotes, and with the
+/// backslashes that escape `$`, `` ` `` and `\\` removed (also `"` inside double
+/// quotes); the others stay (§2.6.3).
+fn backquoted_program(raw: &str, quoted: bool) -> String {
+    let inner = raw
+        .strip_prefix('`')
+        .and_then(|raw| raw.strip_suffix('`'))
+        .unwrap_or(raw);
+
+    let mut program = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escaped = chars
+            .peek()
+            .is_some_and(|&next| matches!(next, '$' | '`' | '\\') || (quoted && next == '"'));
+        if c == '\\' && escaped {
+            program.extend(chars.next());
+        } else {
+            program.push(c);
+        }
+    }
+
+    program
+}
+
 /// Lines keep their newline: a continuation line ends with "\\\n" (or "\\\r\n").
 /// Cut it and paste the next line on it.
 fn join_continuations(input: &[String]) -> Vec<String> {
@@ -182,11 +207,41 @@ enum RedirectOp {
     Close(RawFd),
 }
 
+/// A redirection after the expansion of its word: a file to open, an fd to
+/// duplicate or to close.
+#[derive(Debug, Clone)]
+enum Redirection {
+    File {
+        fd: RawFd,
+        kind: OpenKind,
+        path: String,
+    },
+    /// `fd>&src`, `fd<&src`
+    Dup { fd: RawFd, src: RawFd },
+    /// `fd>&-`, `fd<&-`
+    Close { fd: RawFd },
+}
+
+/// A simple command after the expansion of its words.
+#[derive(Debug, Clone)]
+struct SimpleCommand {
+    program: String,
+    arguments: Vec<String>,
+    redirections: Vec<Redirection>,
+    /// The `VAR=x` prefixes: name and expanded value.
+    envs: Vec<(String, String)>,
+}
+
 /// A redirection that cannot be set up; the command is not run.
 #[derive(Debug)]
 enum RedirectError {
-    Open { filename: String, err: io::Error },
+    Open {
+        filename: String,
+        err: io::Error,
+    },
     BadFd(RawFd),
+    /// The word of `>&`/`<&` is neither an fd nor `-`.
+    BadTarget(String),
 }
 
 impl fmt::Display for RedirectError {
@@ -196,6 +251,13 @@ impl fmt::Display for RedirectError {
                 write!(f, "{filename}: {}", nix::error_message(err))
             }
             Self::BadFd(fd) => write!(f, "{fd}: Bad file descriptor"),
+            // Digits that don't fit an fd.
+            Self::BadTarget(word)
+                if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                write!(f, "{word}: Bad file descriptor")
+            }
+            Self::BadTarget(word) => write!(f, "{word}: ambiguous redirect"),
         }
     }
 }
@@ -274,11 +336,11 @@ unsafe impl Send for ApplyerPtr {}
 unsafe impl Sync for ApplyerPtr {}
 
 impl RedirectController {
-    fn add_redirect(&mut self, redirect: &Redirect) -> Result<(), RedirectError> {
+    fn add_redirect(&mut self, redirect: &Redirection) -> Result<(), RedirectError> {
         match redirect {
-            Redirect::FileRedirect(file_redirect) => {
-                let file = self.open(file_redirect)?;
-                let dst = file_redirect.redirect_fd;
+            Redirection::File { fd, kind, path } => {
+                let file = self.open(*kind, path)?;
+                let dst = *fd;
 
                 self.ops.push(RedirectOp::Dup {
                     src: file.as_raw_fd(),
@@ -287,9 +349,7 @@ impl RedirectController {
                 self.files.push(file);
                 self.redirected.insert(dst, true);
             }
-            Redirect::FdRedirect(dup_fd) => {
-                let src = dup_fd.fd_replacer;
-
+            &Redirection::Dup { fd, src } => {
                 // Either opened by an earlier redirection of this command, or
                 // inherited from the shell, but not one of the shell's own fds.
                 // The opened files are above `floor`, so `src` can't be one of them.
@@ -302,25 +362,22 @@ impl RedirectController {
                     return Err(RedirectError::BadFd(src));
                 }
 
-                self.ops.push(RedirectOp::Dup {
-                    src,
-                    dst: dup_fd.fd_to_replace,
-                });
-                self.redirected.insert(dup_fd.fd_to_replace, true);
+                self.ops.push(RedirectOp::Dup { src, dst: fd });
+                self.redirected.insert(fd, true);
             }
-            Redirect::CloseFd(close_fd) => {
-                self.ops.push(RedirectOp::Close(close_fd.fd));
-                self.redirected.insert(close_fd.fd, false);
+            &Redirection::Close { fd } => {
+                self.ops.push(RedirectOp::Close(fd));
+                self.redirected.insert(fd, false);
             }
         }
 
         Ok(())
     }
 
-    fn open(&self, redirect: &FileRedirect) -> Result<OwnedFd, RedirectError> {
+    fn open(&self, kind: OpenKind, path: &str) -> Result<OwnedFd, RedirectError> {
         let mut options = File::options();
 
-        match redirect.file_kind {
+        match kind {
             OpenKind::Read => options.read(true),
             OpenKind::Replace => options.create(true).write(true).truncate(true),
             OpenKind::Append => options.create(true).append(true),
@@ -329,7 +386,7 @@ impl RedirectController {
         // rw-rw-r--, before the umask
         options.mode(0o664);
 
-        let filename = redirect.filename.text();
+        let filename = path.to_string();
         let file = match options.open(&filename) {
             Ok(file) => file,
             Err(err) => return Err(RedirectError::Open { filename, err }),
@@ -355,7 +412,7 @@ impl RedirectController {
         }
     }
 
-    fn add_redirects(&mut self, redirections: &[Redirect]) -> Result<(), RedirectError> {
+    fn add_redirects(&mut self, redirections: &[Redirection]) -> Result<(), RedirectError> {
         for redirect in redirections {
             self.add_redirect(redirect)?;
         }
@@ -365,7 +422,7 @@ impl RedirectController {
 
     /// `internal` are the shell's own fds ([`Shell::internal_fds`]).
     fn from_redirects(
-        redirections: &[Redirect],
+        redirections: &[Redirection],
         internal: &[RawFd],
     ) -> Result<Self, RedirectError> {
         let highest = redirections
@@ -383,11 +440,11 @@ impl RedirectController {
     }
 
     /// The fds a redirection names: its target, and the source of `n>&m`.
-    fn named_fds(redirect: &Redirect) -> impl Iterator<Item = RawFd> {
-        let (target, source) = match redirect {
-            Redirect::FileRedirect(file) => (file.redirect_fd, None),
-            Redirect::FdRedirect(dup) => (dup.fd_to_replace, Some(dup.fd_replacer)),
-            Redirect::CloseFd(close) => (close.fd, None),
+    fn named_fds(redirect: &Redirection) -> impl Iterator<Item = RawFd> {
+        let (target, source) = match *redirect {
+            Redirection::File { fd, .. } => (fd, None),
+            Redirection::Dup { fd, src } => (fd, Some(src)),
+            Redirection::Close { fd } => (fd, None),
         };
 
         iter::once(target).chain(source)
@@ -530,7 +587,10 @@ impl Executor {
         // built-in's stay in the shell (keeping the attributes of an existing
         // variable); a regular built-in's are exported while it runs. A readonly
         // one is an error, and the built-in doesn't run.
-        let assignments = cmd.envs.iter().map(|var| (var.key, var.value_text()));
+        let assignments = cmd
+            .envs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone()));
         let temporary = match def.kind {
             Kind::Special => {
                 for (name, value) in assignments {
@@ -758,12 +818,10 @@ impl Executor {
     /// command's `VAR=x` prefixes. `env` keeps the last value of a key, so a prefix
     /// overrides a shell variable and the last prefix wins. The program is looked up
     /// in this `PATH`.
-    fn set_command_env(&self, command: &mut process::Command, assignments: &[AssignmentWord]) {
+    fn set_command_env(&self, command: &mut process::Command, assignments: &[(String, String)]) {
         command.env_clear();
         command.envs(self.shell.env.exported());
-        for assignment in assignments {
-            command.env(assignment.key, assignment.value_text());
-        }
+        command.envs(assignments.iter().map(|(name, value)| (name, value)));
     }
 
     /// `exec`: without a command, keep the redirections in the current process;
@@ -772,7 +830,7 @@ impl Executor {
     /// forked child (a pipeline command) this affects only the child.
     fn exec(
         &self,
-        envs: &[AssignmentWord],
+        envs: &[(String, String)],
         argv: &[String],
         redirections: RedirectGuard,
     ) -> JobExit {
@@ -826,7 +884,7 @@ impl Executor {
         &mut self,
         spawn_type: SpawnType,
         state: PipelineState,
-        redirections: &[Redirect],
+        redirections: &[Redirection],
         body: impl FnOnce(&mut Self) -> ExecStatus,
     ) -> CommandRun {
         // TODO: check again if this function can be simplified in the future, maybe using more
@@ -993,12 +1051,14 @@ impl Executor {
 
     /// `( list )`: run the list in a forked shell.
     fn subshell(&mut self, subshell: &Subshell, state: PipelineState) -> CommandRun {
-        self.fork_child(
-            SpawnType::Subshell,
-            state,
-            &subshell.redirections,
-            |executor| executor.list(&subshell.seq_list),
-        )
+        let redirections = match self.expand_redirects(&subshell.redirections) {
+            Ok(redirections) => redirections,
+            Err(e) => return redirection_failure(e),
+        };
+
+        self.fork_child(SpawnType::Subshell, state, &redirections, |executor| {
+            executor.list(&subshell.seq_list)
+        })
     }
 
     /// `list &`: run the list in a forked shell without waiting for it.
@@ -1035,6 +1095,12 @@ impl Executor {
     /// `$(list)`: the output of the list run in a forked shell, without the
     /// trailing newlines.
     fn cmdsub(&mut self, cmdsub: &CmdSub) -> String {
+        self.command_output(|executor| executor.list(&cmdsub.seq_list))
+    }
+
+    /// The output of `body` run in a forked shell, without the trailing
+    /// newlines: `$(...)` and `` `...` ``.
+    fn command_output(&mut self, body: impl FnOnce(&mut Self) -> ExecStatus) -> String {
         let (mut reader, writer) = match io::pipe() {
             Ok(pipe) => pipe,
             Err(e) => {
@@ -1054,9 +1120,7 @@ impl Executor {
         // The write end is moved into the child's state: once `fork_child`
         // returns the parent has no copy left, and the read gets EOF when the
         // child is done.
-        let run = self.fork_child(SpawnType::CmdSub, state, &[], |executor| {
-            executor.list(&cmdsub.seq_list)
-        });
+        let run = self.fork_child(SpawnType::CmdSub, state, &[], body);
 
         // Read everything before waiting: a child blocked on a full pipe would
         // never exit.
@@ -1078,13 +1142,94 @@ impl Executor {
         output.trim_end_matches('\n').to_string()
     }
 
-    /// The text of a word, after substitutions.
+    /// The text of a word: its parts expanded (parameters, command
+    /// substitutions) and the quotes removed, glued together.
+    ///
+    /// TODO: one field per word for now: field splitting of the unquoted
+    /// expansions, and pathname, tilde and arithmetic expansion, are missing.
     fn expand_word(&mut self, word: &Word) -> String {
-        match word {
-            Word::Token(token) => token.text(),
-            Word::Substitution(Substitution::CmdSub(cmdsub)) => self.cmdsub(cmdsub),
-            Word::Substitution(Substitution::VarSub(_)) => todo!(),
+        let mut text = String::new();
+        for part in &word.parts {
+            self.expand_part(part, false, &mut text);
         }
+        text
+    }
+
+    /// Append the expansion of `part` to `text`; `quoted` inside double quotes.
+    fn expand_part(&mut self, part: &WordPart, quoted: bool, text: &mut String) {
+        match part {
+            // The token type says which escapes apply (`Literal` or `DqText`).
+            WordPart::Literal(token) => text.push_str(&token.text()),
+            WordPart::SingleQuoted(texts) => {
+                for token in texts {
+                    text.push_str(token.value);
+                }
+            }
+            WordPart::DoubleQuoted(parts) => {
+                for part in parts {
+                    self.expand_part(part, true, text);
+                }
+            }
+            WordPart::Param(token) => text.push_str(&self.parameter(token.value)),
+            WordPart::CmdSub(cmdsub) => text.push_str(&self.cmdsub(cmdsub)),
+            WordPart::Backquoted(token) => {
+                let program = backquoted_program(token.value, quoted);
+                let output = self.command_output(|executor| {
+                    executor
+                        .execute_str(&program)
+                        .unwrap_or(ExecStatus::SYNTAX_ERROR)
+                });
+                text.push_str(&output);
+            }
+        }
+    }
+
+    /// The value of `$name` or `${name}`: empty when unset.
+    ///
+    /// TODO: the special (`$?`, `$$`, `$!`, `$#`, `$@`, `$*`, `$-`, `$0`) and
+    /// positional parameters (0.9), and the `${...}` operators.
+    fn parameter(&self, raw: &str) -> String {
+        let name = raw.trim_start_matches('$');
+        let name = name
+            .strip_prefix('{')
+            .and_then(|name| name.strip_suffix('}'))
+            .unwrap_or(name);
+
+        if !is_valid_name(name) {
+            todo!("{raw}: not implemented");
+        }
+
+        self.shell.env.get(name).unwrap_or_default().to_string()
+    }
+
+    /// The redirections with their words expanded: the file names, and the fds
+    /// of `>&`/`<&`, which must be a number or `-`.
+    fn expand_redirects(
+        &mut self,
+        redirects: &[Redirect],
+    ) -> Result<Vec<Redirection>, RedirectError> {
+        redirects
+            .iter()
+            .map(|redirect| match redirect {
+                Redirect::FileRedirect(file) => Ok(Redirection::File {
+                    fd: file.redirect_fd,
+                    kind: file.file_kind,
+                    path: self.expand_word(&file.filename),
+                }),
+                Redirect::Dup(dup) => {
+                    let target = self.expand_word(&dup.target);
+                    if target == "-" {
+                        return Ok(Redirection::Close { fd: dup.fd });
+                    }
+
+                    let digits = !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit());
+                    match target.parse() {
+                        Ok(src) if digits => Ok(Redirection::Dup { fd: dup.fd, src }),
+                        _ => Err(RedirectError::BadTarget(target)),
+                    }
+                }
+            })
+            .collect()
     }
 
     fn unsub_command(&mut self, cmd: &UnsubCommand, state: PipelineState) -> CommandRun {
@@ -1096,21 +1241,42 @@ impl Executor {
             .map(|word| self.expand_word(word))
             .collect::<Vec<_>>();
 
+        let envs = cmd
+            .envs
+            .iter()
+            .map(|var| (var.key.to_string(), self.expand_word(&var.value)))
+            .collect();
+
+        let def = builtin::find(&program);
+
+        // A failed redirection of a special built-in in the shell itself exits a
+        // non-interactive shell (§2.8.1), like when it can't be applied below.
+        let redirections = match self.expand_redirects(&cmd.redirections) {
+            Ok(redirections) => redirections,
+            Err(e) => match def {
+                Some(def) if !state.in_pipeline => {
+                    eprintln!("rush: {e}");
+                    return CommandRun::Done(self.builtin_error(def.kind, 1));
+                }
+                _ => return redirection_failure(e),
+            },
+        };
+
         let expanded = SimpleCommand {
             program,
             arguments,
-            redirections: cmd.redirections.clone(),
-            envs: cmd.envs.clone(),
+            redirections,
+            envs,
         };
 
-        match builtin::find(expanded.program.as_str()) {
+        match def {
             // The prefixes go to the program's environment only, but a readonly
             // one is an error all the same (§2.9.1): the program doesn't run.
             None => {
                 let readonly = expanded
                     .envs
                     .iter()
-                    .find_map(|var| self.shell.env.check_assignable(var.key).err());
+                    .find_map(|(name, _)| self.shell.env.check_assignable(name).err());
                 match readonly {
                     Some(e) => {
                         let exit = self.exits_on_assignment_error(state.in_pipeline);
@@ -1170,8 +1336,12 @@ impl Executor {
         // The redirections are still performed (`a=1 >file` creates the file),
         // and when they fail the variables are left untouched. The files are
         // closed when the controller is dropped.
+        let redirections = match self.expand_redirects(&assignment.redirections) {
+            Ok(redirections) => redirections,
+            Err(e) => return redirection_failure(e),
+        };
         if let Err(e) =
-            RedirectController::from_redirects(&assignment.redirections, &self.shell.internal_fds())
+            RedirectController::from_redirects(&redirections, &self.shell.internal_fds())
         {
             return redirection_failure(e);
         }
@@ -1186,7 +1356,8 @@ impl Executor {
         // environment of the next commands. A readonly one stops the assignments
         // (the ones before stay).
         for var in &assignment.envs {
-            if let Err(e) = self.shell.env.assign(var.key, var.value_text()) {
+            let value = self.expand_word(&var.value);
+            if let Err(e) = self.shell.env.assign(var.key, value) {
                 let exit = self.exits_on_assignment_error(false);
                 return CommandRun::Done(Self::assignment_error(e, exit));
             }

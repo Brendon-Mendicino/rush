@@ -58,8 +58,11 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 - [x] Beyond the C++: forked children run without job control (`is_interactive = false`: their commands stay in the job's group, they never touch the terminal); without job control jobs are waited by pid, not by group (`Waiter::wait_completed`, `update_status`), so a background job sharing the shell's group cannot be reaped by a foreground wait; background jobs are reaped before each command in non-interactive mode too
 
 ## 8. Variable substitution
-- [ ] `$NAME` → shell var value, empty if unset (`Executor::varsub`)
-- [ ] Substitution in program name and arguments (`unsub_command`, replace the `todo!()`s)
+- [x] `$NAME` / `${NAME}` → shell var value, empty if unset (`Executor::parameter`), also inside double quotes
+- [x] Substitution in program name, arguments, `VAR=x` values and redirection targets (`Executor::expand_word`, `expand_redirects`)
+- [ ] Special and positional parameters (`$?` `$$` `$!` `$#` `$@` `$*` `$-` `$0`–`$9`): still `todo!()`
+- [ ] `${...}` operators (`${x:-y}`, `${#x}`…) and nesting inside `${ }`
+- [ ] Field splitting of unquoted expansions (`IFS`), pathname expansion (`*`, `?`, `[`), tilde expansion, arithmetic `$(( ))`: today each word gives one field, as written
 
 ## 9. Builtins (`builtin.cpp`)
 The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this section only tracks parity with the C++ ones.
@@ -93,11 +96,13 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
   - One place decides the consequence: report, then exit (non-interactive, or a forked child) or go on with the status. It replaces `Executor::builtin_error`, `Executor::assignment_error`, `redirection_failure` and the ~20 `eprintln!("rush: …")` calls in the executor.
 
 ## Beyond parity (not done in testsh either)
-- [ ] The grammar rules that are only `unimplemented!` stubs in `syntax.rs` (in the order of §2.10.2): `for_clause`/`name`/`in`/`wordlist`, `case_clause` and its items/`pattern`, `if_clause`/`else_part`, `while_clause`/`until_clause`/`do_group`, `brace_group`, `function_definition`/`function_body`/`fname`, `io_here`/`here_end`, `sequential_sep`. They need the AST nodes, the reserved words (§2.4, recognized by the rules in §2.10.2) and the `DSEMI` `;;`, `DLESS` `<<`, `DLESSDASH` `<<-` and `CLOBBER` `>|` tokens in the tokenizer, then wiring into `command`/`compound_command` and the executor.
+- [ ] The grammar rules that are only `unimplemented!` stubs in `syntax.rs` (in the order of §2.10.2): `for_clause`/`name`/`in`/`wordlist`, `case_clause` and its items/`pattern`, `if_clause`/`else_part`, `while_clause`/`until_clause`/`do_group`, `brace_group`, `function_definition`/`function_body`/`fname`, `io_here`/`here_end`, `sequential_sep`. They need the AST nodes and the reserved words (§2.4, recognized by the rules in §2.10.2), then wiring into `command`/`compound_command` and the executor. The `;;`, `<<`, `<<-` and `>|` tokens exist (`>|` acts as `>` until noclobber, `set -C`).
+- [ ] The REPL reads one more line only after `\`, `&&`, `||` and `|`: input that ends inside a quote, `(`, `$(` or a backquote is a syntax error at the end of the line, although the tokenizer and the parser handle a quote that spans the buffered lines (`eval`, `-c` strings once they exist).
+- [ ] A `#` right after `$(...)` starts a comment (`$(a)#b`), where POSIX keeps it in the word: the tokenizer can't tell the `)` of `$(...)` from the one of a subshell.
 - [ ] Heredocs `<<` / `<<-` (`io_here` is `unimplemented!` in both)
 - [ ] Special parameters `$?`, `$$`, `$!`
-- [ ] Double-quoted strings (tokenizer has it commented out)
+- [x] Quoting (§2.2): `'...'`, `"..."` (with `$`, `$(...)` and backquotes inside), `\`; the parts of a word glued into one (`a'b'$(c)`), `# comments`, tabs as blanks
 - [x] `export` builtin / stage 4 envs (mark vars external): `export`, `readonly`, `unset` (see `BUILTINS.md`)
-- [ ] Parser rule 7b (assignment-word handling, `syntax.rs` TODO)
+- [x] Parser rule 7b (assignment-word handling): `name=` unquoted at the start of the first part, the rest of the word is the value (`X=$(cmd)`, `X='a b'`)
 - [x] `fg %n` / `bg %n` job selection (testsh always uses the last job): every XBD §3.204 form
 - [x] More tests: `fg`/`bg` and the job table (`tests/builtins/{jobs,fg,bg}.rs`, `tests/job_control.rs`)

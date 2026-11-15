@@ -115,3 +115,10 @@ fn ctrl_z_counts_as_a_failure() {
 
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
+
+#[test]
+fn a_final_semicolon_runs_in_the_foreground() {
+    let output = run_shell("sleep 0.2;\njobs\necho done\n");
+
+    assert_eq!(stdout(&output), "done\n");
+}

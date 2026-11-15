@@ -114,3 +114,16 @@ fn stops_at_the_first_invalid_name() {
     sh.send("printenv C || echo unset\n");
     sh.stdout.expect("unset\r\n");
 }
+
+#[test]
+fn p_can_be_read_back() {
+    let output = run_shell("export RUSH_Q='a b'\\''c' RUSH_E=\nexport -p\n");
+    let lines = listed(&stdout(&output), &["RUSH_Q", "RUSH_E"]);
+    assert_eq!(lines, ["export RUSH_E=''", r"export RUSH_Q='a b'\''c'"]);
+
+    let output = run_shell(&format!(
+        "{}\nprintenv RUSH_Q\nprintenv RUSH_E && echo set\n",
+        lines.join("\n")
+    ));
+    assert_eq!(stdout(&output), "a b'c\n\nset\n");
+}

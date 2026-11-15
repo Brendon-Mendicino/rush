@@ -55,7 +55,7 @@ Problems with this setup, found by reading the code:
 | special vs regular | The prefix and error rules of 0.6 are tested in `tests/builtins/special.rs`. |
 | `true`, `false` | Complete. Tests are in `tests/builtins/{true,false}.rs`. |
 | `pwd` | Complete. Tests are in `tests/builtins/pwd.rs`. |
-| `export`, `readonly`, `unset` | Complete (`unset -f` waits for functions). The first invalid name or readonly variable stops the built-in, and a script exits (special built-in error). The `-p` listings quote every value (`export X='v'`), but rush can't read them back yet: the tokenizer doesn't join `X='a b'` into one word. Tests are in `tests/builtins/{export,readonly,unset}.rs`; the readonly assignment errors are tested in `readonly.rs`. |
+| `export`, `readonly`, `unset` | Complete (`unset -f` waits for functions). The first invalid name or readonly variable stops the built-in, and a script exits (special built-in error). The `-p` listings quote every value (`export X='v'`), and rush reads them back. Tests are in `tests/builtins/{export,readonly,unset}.rs`; the readonly assignment errors are tested in `readonly.rs`. |
 | `help` | Not POSIX, like bash's. `help` lists the built-ins with the first line of their help, `help name...` prints their help, the same as `name --help`. Tests are in `tests/builtins/help.rs`. |
 | `jobs`, `fg`, `bg` | Complete on top of the job table (0.1), apart from what needs `wait`/`$!`/`kill` (Phase 2). Tests are in `tests/builtins/{jobs,fg,bg}.rs`, the shell's own job reports in `tests/job_control.rs`. |
 | `kill`/`newgrp` | The stub exists but is **not registered** in `BUILTINS`. PATH finds `/usr/bin/*`, which is fine for `kill <pid>`, but `kill %1` and similar can't work. |
@@ -193,7 +193,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] `-p`: `export name='value'` for set variables, `export name` for unset ones, sorted, quoted for reinput
 - [x] no arguments: unspecified, so behave like `-p`
 - [x] support `--`
-- [ ] the `-p` output can be read back (needs the tokenizer to join `X='a b'`)
+- [x] the `-p` output can be read back
 
 #### `readonly name[=word]...` / `readonly -p`
 - [x] add `readonly` to `VarAttr`; `name=word` assigns first

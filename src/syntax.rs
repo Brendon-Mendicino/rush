@@ -1,6 +1,6 @@
 use std::{fmt, vec};
 
-use crate::tokenizer::{Token, TokenType, Tokenizer};
+use crate::tokenizer::{Mode, Token, TokenType, Tokenizer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenKind {
@@ -10,54 +10,65 @@ pub enum OpenKind {
     Rw,
 }
 
+/// `name=value` before a command (rule 7b): the name, and the value, a word
+/// of its own (`X=$(cmd)`, `X=a'b c'`).
 #[derive(Debug, Clone)]
 pub struct AssignmentWord<'a> {
-    pub whole: Token<'a>,
     pub key: &'a str,
-    pub value: &'a str,
+    pub value: Word<'a>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileRedirect<'a> {
     pub redirect_fd: i32,
     pub file_kind: OpenKind,
-    pub filename: Token<'a>,
+    /// Expanded when the command runs (rule 2).
+    pub filename: Word<'a>,
 }
 
+/// `n<&word` / `n>&word`: duplicate the fd `word` expands to, or close `n` when
+/// it is `-`. Resolved when the command runs, after the expansion.
 #[derive(Debug, Clone)]
-pub struct FdRedirect {
-    pub fd_to_replace: i32,
-    pub fd_replacer: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct CloseFd {
+pub struct DupRedirect<'a> {
     pub fd: i32,
+    /// `>&` (the default fd is 1) rather than `<&` (0).
+    pub output: bool,
+    pub target: Word<'a>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Redirect<'a> {
     FileRedirect(FileRedirect<'a>),
-    FdRedirect(FdRedirect),
-    CloseFd(CloseFd),
+    Dup(DupRedirect<'a>),
 }
 
+/// One piece of a word (§2.2, §2.6). The pieces are glued, without blanks:
+/// `a'b c'"$x"$(d)` is one word of four parts.
 #[derive(Debug, Clone)]
-pub enum Word<'a> {
-    Substitution(Substitution<'a>),
-    Token(Token<'a>),
+pub enum WordPart<'a> {
+    /// Unquoted text (`TokenType::Literal`, or the digits of a glued
+    /// `IoNumber`).
+    Literal(Token<'a>),
+    /// The text between single quotes (`TokenType::SqText`): none for `''`,
+    /// one token per line when it spans lines.
+    SingleQuoted(Vec<Token<'a>>),
+    /// Between double quotes: `DqText`, `Param`, `CmdSub` and `Backquoted`.
+    DoubleQuoted(Vec<WordPart<'a>>),
+    /// `$name`, `${...}`, `$1`, `$?`...
+    Param(Token<'a>),
+    CmdSub(CmdSub<'a>),
+    /// `` `...` ``, the token with its backquotes.
+    Backquoted(Token<'a>),
+}
+
+/// A word: its parts, at least one.
+#[derive(Debug, Clone)]
+pub struct Word<'a> {
+    pub parts: Vec<WordPart<'a>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SimpleAssignment<'a> {
-    pub redirections: Vec<Redirect<'a>>,
-    pub envs: Vec<AssignmentWord<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SimpleCommand<'a> {
-    pub program: String,
-    pub arguments: Vec<String>,
     pub redirections: Vec<Redirect<'a>>,
     pub envs: Vec<AssignmentWord<'a>>,
 }
@@ -159,17 +170,6 @@ pub enum CmdPre<'a> {
 // ------------------------------------
 
 #[derive(Debug, Clone)]
-pub enum Substitution<'a> {
-    VarSub(VarSub<'a>),
-    CmdSub(CmdSub<'a>),
-}
-
-#[derive(Debug, Clone)]
-pub struct VarSub<'a> {
-    pub token: Token<'a>,
-}
-
-#[derive(Debug, Clone)]
 pub struct CmdSub<'a> {
     pub and_open: Token<'a>,
     pub close_round: Token<'a>,
@@ -183,45 +183,15 @@ pub struct CmdSub<'a> {
 #[derive(Debug, Clone)]
 pub struct SyntaxTree {}
 
-impl<'a> AssignmentWord<'a> {
-    /// The value with the backslash escapes removed (`a=x\ y` → `x y`); `value`
-    /// is the raw text of the token.
-    pub fn value_text(&self) -> String {
-        let text = self.whole.text();
-
-        match text.split_once('=') {
-            Some((_, value)) => value.to_string(),
-            None => String::new(),
-        }
-    }
-}
-
 /// A shell variable name: a letter or `_`, then letters, digits and `_`. Letters
 /// and digits are Unicode ones, not only ASCII as in POSIX (XBD §3.235): names
 /// and values are UTF-8 (`città=Roma`).
 pub fn is_valid_name(name: &str) -> bool {
+    // TODO: add error from this function
     let mut chars = name.chars();
 
     chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
         && chars.all(|c| c.is_alphanumeric() || c == '_')
-}
-
-impl<'a> SimpleCommand<'a> {
-    pub fn text(&self) -> String {
-        let cmd = self.program.to_string();
-
-        let total_len = cmd.len() + self.arguments.iter().map(|s| s.len()).sum::<usize>();
-
-        let mut text = String::with_capacity(total_len);
-
-        text.push_str(&cmd);
-
-        for s in &self.arguments {
-            text.push_str(s);
-        }
-
-        text
-    }
 }
 
 // ------------------------------------
@@ -244,17 +214,42 @@ fn join<T: fmt::Display>(f: &mut fmt::Formatter<'_>, items: &[T], sep: &str) -> 
 
 impl fmt::Display for AssignmentWord<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.whole.value)
+        write!(f, "{}={}", self.key, self.value)
+    }
+}
+
+/// The raw text: quotes, `$`, backslashes and backquotes as they were written.
+impl fmt::Display for WordPart<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WordPart::Literal(token) | WordPart::Param(token) | WordPart::Backquoted(token) => {
+                f.write_str(token.value)
+            }
+            WordPart::SingleQuoted(texts) => {
+                f.write_str("'")?;
+                for text in texts {
+                    f.write_str(text.value)?;
+                }
+                f.write_str("'")
+            }
+            WordPart::DoubleQuoted(parts) => {
+                f.write_str("\"")?;
+                for part in parts {
+                    write!(f, "{part}")?;
+                }
+                f.write_str("\"")
+            }
+            WordPart::CmdSub(cmd) => write!(f, "{cmd}"),
+        }
     }
 }
 
 impl fmt::Display for Word<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Word::Token(token) => f.write_str(token.value),
-            Word::Substitution(Substitution::VarSub(var)) => f.write_str(var.token.value),
-            Word::Substitution(Substitution::CmdSub(cmd)) => write!(f, "{cmd}"),
+        for part in &self.parts {
+            write!(f, "{part}")?;
         }
+        Ok(())
     }
 }
 
@@ -275,19 +270,10 @@ impl fmt::Display for Redirect<'_> {
                     OpenKind::Append => (">>", 1),
                     OpenKind::Rw => ("<>", 0),
                 };
-                (
-                    file.redirect_fd,
-                    default,
-                    op,
-                    file.filename.value.to_string(),
-                )
+                (file.redirect_fd, default, op, file.filename.to_string())
             }
-            Redirect::FdRedirect(dup) if dup.fd_to_replace == 0 => {
-                (0, 0, "<&", dup.fd_replacer.to_string())
-            }
-            Redirect::FdRedirect(dup) => (dup.fd_to_replace, 1, ">&", dup.fd_replacer.to_string()),
-            Redirect::CloseFd(close) if close.fd == 0 => (0, 0, "<&", "-".to_string()),
-            Redirect::CloseFd(close) => (close.fd, 1, ">&", "-".to_string()),
+            Redirect::Dup(dup) if dup.output => (dup.fd, 1, ">&", dup.target.to_string()),
+            Redirect::Dup(dup) => (dup.fd, 0, "<&", dup.target.to_string()),
         };
 
         if fd != default {
@@ -508,14 +494,12 @@ impl SyntaxTree {
     {
         let list = Self::list(tok)?;
 
-        // Advance the tokenizer if the next token is a SEMI.
-        // If the next token is a SEMI, the tokenizer will be automatically
-        // advanced by the function.
-        if Self::separator_op(tok).is_some() {
-            return Some(List::AsyncList(list.into()));
+        // Only a final `&` runs the last and-or list in the background; a `;`
+        // ends it like a newline.
+        match Self::separator_op(tok) {
+            Some(sep) if sep.t_type == TokenType::Andper => Some(List::AsyncList(list.into())),
+            _ => Some(List::SequentialList(list)),
         }
-
-        Some(List::SequentialList(list))
     }
 
     /// BNF:
@@ -1357,8 +1341,7 @@ impl SyntaxTree {
         if let Some(new_redirect_fd) = new_redirect_fd {
             match &mut redirect {
                 Redirect::FileRedirect(file) => file.redirect_fd = new_redirect_fd,
-                Redirect::FdRedirect(fd) => fd.fd_to_replace = new_redirect_fd,
-                Redirect::CloseFd(close) => close.fd = new_redirect_fd,
+                Redirect::Dup(dup) => dup.fd = new_redirect_fd,
             }
         }
 
@@ -1397,7 +1380,9 @@ impl SyntaxTree {
                 file_kind: OpenKind::Read,
                 filename,
             }),
-            TokenType::Great => Redirect::FileRedirect(FileRedirect {
+            // TODO: `>|` overrides noclobber (`set -C`), which doesn't exist
+            // yet: for now it is `>`.
+            TokenType::Great | TokenType::Clobber => Redirect::FileRedirect(FileRedirect {
                 // TODO: change to handle fds
                 redirect_fd: 1,
                 file_kind: OpenKind::Replace,
@@ -1415,10 +1400,16 @@ impl SyntaxTree {
                 file_kind: OpenKind::Rw,
                 filename,
             }),
-            // TODO: change to handle fds
-            TokenType::Lessand => Self::convert_and_redirect(0, filename),
-            // TODO: change to handle fds
-            TokenType::Greatand => Self::convert_and_redirect(1, filename),
+            TokenType::Lessand => Redirect::Dup(DupRedirect {
+                fd: 0,
+                output: false,
+                target: filename,
+            }),
+            TokenType::Greatand => Redirect::Dup(DupRedirect {
+                fd: 1,
+                output: true,
+                target: filename,
+            }),
             _ => return None,
         };
 
@@ -1433,11 +1424,11 @@ impl SyntaxTree {
     /// filename ::= WORD                           Apply rule 2
     ///            ;
     /// ```
-    pub fn filename<'a, T>(tok: &T) -> Option<Token<'a>>
+    pub fn filename<'a, T>(tok: &T) -> Option<Word<'a>>
     where
         T: Tokenizer<'a>,
     {
-        tok.next_if_type(TokenType::Word)
+        Self::word(tok)
     }
 
     /// BNF:
@@ -1548,6 +1539,7 @@ impl SyntaxTree {
                 value: "",
                 start: 0,
                 end: 0,
+                glued: false,
             });
         }
 
@@ -1568,72 +1560,136 @@ impl SyntaxTree {
         unimplemented!("sequential_sep: not implemented")
     }
 
-    /// The `WORD` terminal: a plain or quoted word, or a substitution.
+    /// The `WORD` terminal: one part, then every part glued to it (§2.3): plain
+    /// text, quotes, parameters and command substitutions with no blank between
+    /// them.
     pub fn word<'a, T>(tok: &T) -> Option<Word<'a>>
     where
         T: Tokenizer<'a>,
     {
-        if let Some(word) = tok.next_if_type(TokenType::Word) {
-            return Some(Word::Token(word));
+        let first = Self::word_part(tok, true)?;
+        let mut parts = vec![first];
+
+        while tok.peek().is_some_and(|token| token.glued) {
+            let Some(part) = Self::word_part(tok, false) else {
+                break;
+            };
+            parts.push(part);
         }
 
-        if let Some(quoted) = tok.next_if_type(TokenType::QuotedWord) {
-            return Some(Word::Token(quoted));
-        }
-
-        if let Some(var_sub) = tok.next_if_type(TokenType::DollWord) {
-            return Some(Word::Substitution(Substitution::VarSub(VarSub {
-                token: var_sub,
-            })));
-        }
-
-        if let Some(cmd_sub) = Self::cmdsub(tok) {
-            return Some(Word::Substitution(Substitution::CmdSub(cmd_sub)));
-        }
-
-        None
+        Some(Word { parts })
     }
 
-    /// The `ASSIGNMENT_WORD` terminal: `name=value`, with a valid name.
+    /// One part of a word, outside quotes. `glued` digits before `<`/`>` are
+    /// part of the word (`'a'2>f`), not an `IO_NUMBER`; a word can't start
+    /// with them.
+    fn word_part<'a, T>(tok: &T, first: bool) -> Option<WordPart<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sub_tok = tok.clone();
+        let token = sub_tok.peek()?;
+
+        let part = match token.t_type {
+            TokenType::Literal => WordPart::Literal(sub_tok.next_token()?),
+            TokenType::IoNumber if !first => WordPart::Literal(sub_tok.next_token()?),
+            TokenType::Param => WordPart::Param(sub_tok.next_token()?),
+            TokenType::Backquoted => WordPart::Backquoted(sub_tok.next_token()?),
+            TokenType::Andopen => WordPart::CmdSub(Self::cmdsub(&sub_tok)?),
+            TokenType::SQuote => {
+                sub_tok.next_token()?;
+                let texts = std::iter::from_fn(|| {
+                    sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SqText)
+                })
+                .collect();
+                // An unterminated quote is a syntax error.
+                sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SQuote)?;
+                WordPart::SingleQuoted(texts)
+            }
+            TokenType::DQuote => {
+                sub_tok.next_token()?;
+                WordPart::DoubleQuoted(Self::double_quoted(&sub_tok)?)
+            }
+            _ => return None,
+        };
+
+        tok.merge(sub_tok);
+        Some(part)
+    }
+
+    /// The parts between double quotes, after the opening `"`, up to and with
+    /// the closing one. `None` when it is missing.
+    fn double_quoted<'a, T>(tok: &T) -> Option<Vec<WordPart<'a>>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sub_tok = tok.clone();
+        let mut parts = Vec::new();
+
+        loop {
+            let token = sub_tok.peek_in(Mode::DoubleQuoted)?;
+            let part = match token.t_type {
+                TokenType::DQuote => {
+                    sub_tok.next_token_in(Mode::DoubleQuoted)?;
+                    tok.merge(sub_tok);
+                    return Some(parts);
+                }
+                TokenType::DqText => WordPart::Literal(sub_tok.next_token_in(Mode::DoubleQuoted)?),
+                TokenType::Param => WordPart::Param(sub_tok.next_token_in(Mode::DoubleQuoted)?),
+                TokenType::Backquoted => {
+                    WordPart::Backquoted(sub_tok.next_token_in(Mode::DoubleQuoted)?)
+                }
+                // `$(` is the same token in both modes, the content is parsed
+                // outside quotes.
+                TokenType::Andopen => WordPart::CmdSub(Self::cmdsub(&sub_tok)?),
+                _ => return None,
+            };
+            parts.push(part);
+        }
+    }
+
+    /// The `ASSIGNMENT_WORD` terminal (rule 7b): a word whose first part is
+    /// unquoted text with an `=` after a valid name, `name=value`. The rest of
+    /// the word, from after the `=`, is the value.
     pub fn assignment_word<'a, T>(tok: &T) -> Option<AssignmentWord<'a>>
     where
         T: Tokenizer<'a>,
     {
         let sub_tok = tok.clone();
-        let eq = "=";
 
-        let word = sub_tok.next_if_type(TokenType::Word)?;
+        let word = Self::word(&sub_tok)?;
+        let mut parts = word.parts.into_iter();
 
-        let (key, value) = word.value.split_once(eq)?;
+        let Some(WordPart::Literal(first)) = parts.next() else {
+            return None;
+        };
+        if first.t_type != TokenType::Literal {
+            return None;
+        }
 
-        // TODO: shall i remove this?
-        // Otherwise it is an ordinary word (`=x`, `a-b=1`, `./x=1`).
+        // Otherwise it is an ordinary word (`=x`, `a-b=1`, `./x=1`, `X\=1`).
+        let (key, value) = first.value.split_once('=')?;
         if !is_valid_name(key) {
             return None;
         }
 
+        let mut value_parts = Vec::new();
+        if !value.is_empty() {
+            let offset = key.len() + 1;
+            value_parts.push(WordPart::Literal(Token {
+                value,
+                start: first.start + offset,
+                ..first
+            }));
+        }
+        value_parts.extend(parts);
+
         tok.merge(sub_tok);
 
         Some(AssignmentWord {
-            whole: word,
             key,
-            value,
+            value: Word { parts: value_parts },
         })
-    }
-
-    pub fn convert_and_redirect<'a>(default_fd: i32, filename: Token<'a>) -> Redirect<'a> {
-        assert!(!filename.value.is_empty(), "filename must not be empty!");
-
-        if let Ok(fd) = filename.value.parse::<i32>() {
-            Redirect::FdRedirect(FdRedirect {
-                fd_to_replace: default_fd,
-                fd_replacer: fd,
-            })
-        } else if filename.value == "-" {
-            Redirect::CloseFd(CloseFd { fd: default_fd })
-        } else {
-            panic!("Redirect is not a number or dash! fd={:#?}", filename);
-        }
     }
 }
 
@@ -1657,10 +1713,114 @@ mod tests {
         let tok = UnbufferedTokenizer::new("MY_VAR=a\\ b");
         let word = SyntaxTree::assignment_word(&tok).unwrap();
         assert_eq!(word.key, "MY_VAR");
-        assert_eq!(word.value_text(), "a b");
+        assert_eq!(word.value.to_string(), "a\\ b");
 
-        let tok = UnbufferedTokenizer::new("=x");
-        assert!(SyntaxTree::assignment_word(&tok).is_none());
+        for input in ["=x", "'X'=1", "X\\=1", "a-b=1", "$X=1"] {
+            let tok = UnbufferedTokenizer::new(input);
+            assert!(SyntaxTree::assignment_word(&tok).is_none(), "{input}");
+        }
+    }
+
+    #[test]
+    fn the_value_of_an_assignment_is_a_word() {
+        for (input, value, parts) in [
+            ("X=a'b c'", "a'b c'", 2),
+            ("X=$(c)", "$(c)", 1),
+            ("X=\"$y\"z", "\"$y\"z", 2),
+            ("X=", "", 0),
+        ] {
+            let tok = UnbufferedTokenizer::new(input);
+            let word = SyntaxTree::assignment_word(&tok).expect(input);
+            assert_eq!(word.key, "X");
+            assert_eq!(word.value.to_string(), value, "{input}");
+            assert_eq!(word.value.parts.len(), parts, "{input}");
+        }
+    }
+
+    #[test]
+    fn glued_parts_make_one_word() {
+        let tok = UnbufferedTokenizer::new("a'b'\"c $d\"$(e)f g");
+        let word = SyntaxTree::word(&tok).unwrap();
+
+        assert_eq!(word.to_string(), "a'b'\"c $d\"$(e)f");
+        assert!(matches!(
+            word.parts.as_slice(),
+            [
+                WordPart::Literal(_),
+                WordPart::SingleQuoted(_),
+                WordPart::DoubleQuoted(inner),
+                WordPart::CmdSub(_),
+                WordPart::Literal(_),
+            ] if inner.len() == 2
+        ));
+        assert_eq!(SyntaxTree::word(&tok).unwrap().to_string(), "g");
+    }
+
+    #[test]
+    fn an_unterminated_quote_is_not_a_word() {
+        for input in ["'abc", "\"abc", "a\"b"] {
+            let tok = UnbufferedTokenizer::new(input);
+            let word = SyntaxTree::word(&tok);
+            assert!(word.is_none_or(|w| w.to_string() != input), "{input}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_word_spans_lines() {
+        let lines = vec![
+            "echo 'a\n".to_string(),
+            "b'\"c\n".to_string(),
+            "d\"\n".to_string(),
+        ];
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).unwrap();
+        assert!(tok.next_is_eof());
+
+        let [command @ List::SequentialList(_)] = program.child.commands.as_slice() else {
+            panic!("one command expected");
+        };
+        assert_eq!(command.to_string(), "echo 'a\nb'\"c\nd\"");
+    }
+
+    #[test]
+    fn dup_targets_are_words() {
+        let tok = UnbufferedTokenizer::new("2>&$(n) <&- 3>&foo");
+        let redirects: Vec<_> = std::iter::from_fn(|| SyntaxTree::io_redirect(&tok)).collect();
+
+        assert!(matches!(
+            redirects.as_slice(),
+            [
+                Redirect::Dup(DupRedirect {
+                    fd: 2,
+                    output: true,
+                    ..
+                }),
+                Redirect::Dup(DupRedirect {
+                    fd: 0,
+                    output: false,
+                    ..
+                }),
+                Redirect::Dup(DupRedirect {
+                    fd: 3,
+                    output: true,
+                    ..
+                }),
+            ]
+        ));
+        let targets: Vec<_> = redirects.iter().map(ToString::to_string).collect();
+        assert_eq!(targets, ["2>&$(n)", "<&-", "3>&foo"]);
+    }
+
+    #[test]
+    fn a_final_semicolon_is_not_async() {
+        let lines = vec!["a;\n".to_string(), "b &\n".to_string()];
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).unwrap();
+
+        assert!(matches!(
+            program.child.commands.as_slice(),
+            [List::SequentialList(_), List::AsyncList(_)]
+        ));
     }
 
     /// Parse a whole program and print it back.
@@ -1689,6 +1849,9 @@ mod tests {
             "(a; b) >f",
             "x=1 cmd 2>&1",
             "echo $(ls) $HOME 'q w' a\\ b",
+            "echo a'b'\"c $d\"$(e) `f` ${g}h ''",
+            "X='a b' Y=$(c) cmd >'f g' 2>&$(n)",
+            "echo * ? [x] { } € !x a#b",
             "a; b &",
             "a & b",
             "a <in >>out 3<>rw <&3 4>&- 2>err",
@@ -1701,6 +1864,7 @@ mod tests {
     #[test]
     fn blanks_are_normalized() {
         assert_eq!(reprint("a   |b"), "a | b");
+        assert_eq!(reprint("a\tb # comment"), "a b");
         assert_eq!(reprint("0<in 1>out"), "<in >out");
     }
 }

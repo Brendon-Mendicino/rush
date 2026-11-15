@@ -235,3 +235,40 @@ fn the_terminal_copy_is_not_open_for_the_user() {
     sh.stderr.expect("rush: 10: Bad file descriptor");
     sh.expect_prompt();
 }
+
+#[test]
+fn the_target_is_a_word() {
+    let dir = test_dir("redirect_target_word");
+
+    let output = run_shell_in(
+        "echo a >'a b'\necho b >$(echo f)g\necho c >\"q\"r\ncat 'a b' fg qr\n",
+        &dir,
+    );
+
+    assert_eq!(stdout(&output), "a\nb\nc\n");
+}
+
+#[test]
+fn a_dup_target_that_is_not_an_fd_fails() {
+    let output = run_shell("echo a 1>&foo || echo failed\necho b >&99999999999 || echo failed\n");
+
+    assert_eq!(stdout(&output), "failed\nfailed\n");
+    assert!(stderr(&output).contains("rush: foo: ambiguous redirect"));
+    assert!(stderr(&output).contains("rush: 99999999999: Bad file descriptor"));
+}
+
+#[test]
+fn a_dup_target_can_be_expanded() {
+    let output = run_shell("echo a 2>&1 1>&$(echo 2) | cat\necho b >&$(echo -) || echo closed\n");
+
+    assert_eq!(stdout(&output), "a\nclosed\n");
+}
+
+#[test]
+fn clobber_truncates_like_great() {
+    let dir = test_dir("redirect_clobber");
+
+    let output = run_shell_in("echo long >f\necho x >|f\ncat f\n", &dir);
+
+    assert_eq!(stdout(&output), "x\n");
+}
