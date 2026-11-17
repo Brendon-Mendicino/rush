@@ -136,6 +136,16 @@ impl<'s> Waiter<'s> {
         res
     }
 
+    /// After a pipeline with no process to wait for (one command that ran in the
+    /// shell, or that could not be spawned after its child took the terminal):
+    /// with job control, give the terminal back to the shell, as [`Waiter::wait`]
+    /// does after a job.
+    pub fn reclaim(&self) {
+        if self.shell.is_interactive {
+            self.reclaim_terminal(None);
+        }
+    }
+
     /// Put the shell back in the foreground and restore its terminal modes.
     ///
     /// When the job got stopped its current modes are saved, so that [`Waiter::fg`]

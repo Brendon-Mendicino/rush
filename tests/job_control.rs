@@ -307,6 +307,20 @@ fn ctrl_c_interrupts_a_command_substitution() {
 }
 
 #[test]
+fn ctrl_c_stops_the_rest_of_the_list() {
+    let mut sh = InteractiveShell::spawn();
+
+    // Like dash and bash: the commands after the interrupted one don't run.
+    sh.send("sleep 30; echo after\n");
+    sh.wait_foreground_job("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    assert!(!output.contains("after"), "the list went on: {output:?}");
+    assert!(output.contains(RED), "the status is 130");
+}
+
+#[test]
 fn ctrl_c_in_the_condition_stops_the_if() {
     let mut sh = InteractiveShell::spawn();
 
@@ -318,6 +332,26 @@ fn ctrl_c_in_the_condition_stops_the_if() {
     assert!(
         !output.contains("then") && !output.contains("else"),
         "a part of the if ran: {output:?}"
+    );
+    assert!(output.contains(RED), "the status is 130");
+}
+
+#[test]
+fn ctrl_c_stops_a_for_loop() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("for i in 1 2 3; do sleep 30; echo $i; done\n");
+    sh.wait_foreground_job("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    // The numbers would be lines of their own (the prompt's color code has
+    // digits too).
+    assert!(
+        !["1\r\n", "2\r\n", "3\r\n"]
+            .iter()
+            .any(|n| output.contains(n)),
+        "the loop went on: {output:?}"
     );
     assert!(output.contains(RED), "the status is 130");
 }

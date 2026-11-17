@@ -5,8 +5,10 @@
 mod common;
 
 mod bg;
+mod r#break;
 mod cd;
 mod colon;
+mod r#continue;
 mod eval;
 mod exec;
 mod exit;

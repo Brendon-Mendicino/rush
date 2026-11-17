@@ -255,6 +255,17 @@ fn parse_job_id(s: &str) -> Result<JobId, String> {
     })
 }
 
+/// The loop count of `break` and `continue`, as their clap `value_parser`: a
+/// positive integer. Through clap an error is a usage error, status 2, which
+/// exits a script (a special built-in error), like in dash.
+fn parse_loop_count(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err(format!("{s}: loop count out of range")),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("{s}: numeric argument required")),
+    }
+}
+
 /// The job `id` names, or the current job: for `fg` and `bg`. The error is the
 /// diagnostic.
 fn find_job(jobs: &JobTable, id: Option<&JobId>) -> Result<usize, String> {

@@ -15,6 +15,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     iter,
+    ops::{Deref, DerefMut},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{fs::OpenOptionsExt, process::CommandExt},
@@ -41,6 +42,17 @@ pub enum ExecStatus {
     Signaled(Signal),
     /// The job got stopped and was moved to the background jobs.
     Stopped(Signal),
+    /// A `break`/`continue` on its way to its loop: the commands around it
+    /// don't run until the loop takes it. `$?` is 0, the status of the
+    /// built-in.
+    Jump(LoopControl),
+}
+
+/// `break n` / `continue n` (§2.14): `n >= 1` levels of enclosing loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopControl {
+    Break(usize),
+    Continue(usize),
 }
 
 impl ExecStatus {
@@ -54,14 +66,16 @@ impl ExecStatus {
         match self {
             Self::Exited(code) => code,
             Self::Signaled(sig) | Self::Stopped(sig) => 128 + sig as i32,
+            Self::Jump(_) => 0,
         }
     }
 
     /// Negates the output of the command
     pub fn not(self) -> ExecStatus {
         match self {
-            // Keep the interruption visible to `&&` and `||`.
-            status if status.interrupted() => status,
+            // Keep the interruption visible to `&&` and `||`, and the jump on
+            // its way to its loop.
+            status if status.interrupted() || status.jump() => status,
             status if status.failure() => Self::SUCCESS,
             _ => Self::FAILURE,
         }
@@ -73,12 +87,39 @@ impl ExecStatus {
         matches!(self, Self::Signaled(Signal::SIGINT))
     }
 
+    /// A `break`/`continue` is on its way to its loop: the rest of the list
+    /// must not run.
+    pub fn jump(self) -> bool {
+        matches!(self, Self::Jump(_))
+    }
+
     /// Indicates whether the command exit is considered a failure
     pub fn failure(&self) -> bool {
         match self {
             Self::Stopped(_) | Self::Signaled(_) => true,
-            Self::Exited(0) => false,
+            Self::Exited(0) | Self::Jump(_) => false,
             Self::Exited(_) => true,
+        }
+    }
+}
+
+impl LoopControl {
+    /// At most `depth` levels: past the enclosing loops it means the outermost
+    /// one (§2.14).
+    fn clamp(self, depth: usize) -> Self {
+        match self {
+            Self::Break(n) => Self::Break(n.min(depth)),
+            Self::Continue(n) => Self::Continue(n.min(depth)),
+        }
+    }
+
+    /// The jump a loop passes on after taking one level: `None` when it was
+    /// for this loop.
+    fn outer(self) -> Option<Self> {
+        match self {
+            Self::Break(1) | Self::Continue(1) => None,
+            Self::Break(n) => Some(Self::Break(n - 1)),
+            Self::Continue(n) => Some(Self::Continue(n - 1)),
         }
     }
 }
@@ -92,15 +133,17 @@ impl From<JobExit> for ExecStatus {
     }
 }
 
-/// The status of shell code run without a process of its own (`eval`, a
-/// compound command), as the exit of its pipeline's command.
+/// The status of the last command of a pipeline of more than one command,
+/// when it ran without a process (it could not be spawned, an assignment), as
+/// the exit of the job (`JobBuilder::build_not_spawned`).
 fn job_exit(status: ExecStatus) -> JobExit {
     match status {
         ExecStatus::Exited(code) => JobExit::Exited(code),
         // Keeps an interruption visible to the and-or list around it.
         ExecStatus::Signaled(sig) => JobExit::Signaled(sig),
-        // The job that stopped is already in the background jobs.
-        status @ ExecStatus::Stopped(_) => JobExit::Exited(status.code()),
+        // The job that stopped is already in the background jobs. A jump never
+        // gets here: every command of such a pipeline is forked.
+        status @ (ExecStatus::Stopped(_) | ExecStatus::Jump(_)) => JobExit::Exited(status.code()),
     }
 }
 
@@ -113,25 +156,25 @@ fn not_implemented(name: &str) -> ExecStatus {
 
 /// Report a command that could not be spawned. The status follows other shells:
 /// 127 when the program does not exist, 126 when it cannot be executed.
-fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
+fn spawn_failure(program: &str, err: &io::Error) -> ExecStatus {
     let message = nix::error_message(err);
 
     match err.kind() {
         io::ErrorKind::NotFound if !program.contains('/') => {
             eprintln!("rush: {program}: command not found");
-            JobExit::Exited(127)
+            ExecStatus::Exited(127)
         }
         io::ErrorKind::NotFound => {
             eprintln!("rush: {program}: {message}");
-            JobExit::Exited(127)
+            ExecStatus::Exited(127)
         }
         io::ErrorKind::PermissionDenied => {
             eprintln!("rush: {program}: {message}");
-            JobExit::Exited(126)
+            ExecStatus::Exited(126)
         }
         _ => {
             eprintln!("rush: {program}: {message}");
-            JobExit::Exited(1)
+            ExecStatus::Exited(1)
         }
     }
 }
@@ -198,6 +241,11 @@ pub struct Executor {
     /// expanded started: the status of a command without a command name
     /// (`X=$(false)`, §2.9.1).
     cmdsub_status: Option<ExecStatus>,
+    /// The loops running in this process, counted by [`LoopGuard`]: a
+    /// `break n` goes at most this far, and does nothing outside a loop. A
+    /// forked child keeps the count, so a `break` in `( )` inside a loop stops
+    /// the subshell's list, like in dash.
+    loop_depth: usize,
 }
 
 /// Where the shell reads its commands, a line at a time.
@@ -365,8 +413,26 @@ enum CommandRun {
     /// A child process, to be waited as part of the job.
     Spawned(Spawned),
     /// The command finished without a process: it ran in the shell (an
-    /// assignment), or it could not be started (the error is already printed).
-    Done(JobExit),
+    /// assignment, a built-in, a compound command; its status can be a jump),
+    /// or it could not be started (the error is already printed).
+    Done(ExecStatus),
+}
+
+/// What `schedule_pipeline` started.
+#[derive(Debug)]
+enum Scheduled {
+    /// Processes to wait for.
+    Job(Job),
+    /// One command that ran in the shell: nothing to wait for, and its status
+    /// can be a jump.
+    Done(ExecStatus),
+}
+
+/// A loop running in this process: `loop_depth` counts it while the guard
+/// lives, and goes down again however the loop ends. The loop runs its body
+/// through it (it derefs to the executor).
+struct LoopGuard<'e> {
+    executor: &'e mut Executor,
 }
 
 /// A spawned command and the process group it ended up in.
@@ -732,6 +798,26 @@ impl Drop for RedirectGuard {
     }
 }
 
+impl Deref for LoopGuard<'_> {
+    type Target = Executor;
+
+    fn deref(&self) -> &Executor {
+        self.executor
+    }
+}
+
+impl DerefMut for LoopGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Executor {
+        self.executor
+    }
+}
+
+impl Drop for LoopGuard<'_> {
+    fn drop(&mut self) {
+        self.executor.loop_depth -= 1;
+    }
+}
+
 impl Executor {
     /// Run the shell as invoked: a script, a `-c` string or the standard input,
     /// to the end. The result is the shell's exit status, the one of its last
@@ -756,6 +842,7 @@ impl Executor {
             shell: Shell::new(may_be_interactive, invocation.name, invocation.positional),
             jobs: JobTable::default(),
             cmdsub_status: None,
+            loop_depth: 0,
         };
 
         for (opt, on) in invocation.options {
@@ -786,7 +873,7 @@ impl Executor {
         cmd: &SimpleCommand,
         def: BuiltinDef,
         redirections: RedirectGuard,
-    ) -> JobExit {
+    ) -> ExecStatus {
         let args: Vec<&str> = iter::once(cmd.program.as_str())
             .chain(cmd.arguments.iter().map(String::as_str))
             .collect();
@@ -840,11 +927,12 @@ impl Executor {
 
         match result {
             Err(code) => self.builtin_error(def.kind, code),
-            Ok(Status::Exited(code)) => JobExit::Exited(code),
+            Ok(Status::Exited(code)) => ExecStatus::Exited(code),
             Ok(Status::Eval(program)) => match self.execute_str(&program) {
                 // `eval` of something that can't be parsed: an error of `eval`.
                 Err(SyntaxError) => self.builtin_error(def.kind, ExecStatus::SYNTAX_ERROR.code()),
-                Ok(status) => job_exit(status),
+                // A jump in it goes on to its loop (`eval break`).
+                Ok(status) => status,
             },
             Ok(Status::Exec(argv)) => {
                 let has_command = !argv.is_empty();
@@ -863,9 +951,11 @@ impl Executor {
             // a pipeline command, a subshell, `&` or `$(...)`.
             // TODO: unwind instead, for the EXIT trap (BUILTINS.md 0.2).
             Ok(Status::Exit(code)) => Self::exit_shell(code),
-            // TODO: unwind the loops and functions. No built-in returns these yet.
-            Ok(Status::Return(code)) => JobExit::Exited(code),
-            Ok(Status::Break(_) | Status::Continue(_)) => JobExit::Exited(0),
+            Ok(Status::Break(n)) => self.jump(LoopControl::Break(n)),
+            Ok(Status::Continue(n)) => self.jump(LoopControl::Continue(n)),
+            // TODO: unwind the functions and dot scripts. No built-in returns it
+            // yet.
+            Ok(Status::Return(code)) => ExecStatus::Exited(code),
         }
     }
 
@@ -874,11 +964,11 @@ impl Executor {
     /// "the shell shall exit from the subshell environment", and the shell that
     /// started it goes on. Otherwise it is only the status.
     // TODO: handled by the application's error handler (TODO.md §10).
-    fn builtin_error(&self, kind: Kind, code: i32) -> JobExit {
+    fn builtin_error(&self, kind: Kind, code: i32) -> ExecStatus {
         if kind == Kind::Special && self.exits(false) {
             Self::exit_shell(code);
         }
-        JobExit::Exited(code)
+        ExecStatus::Exited(code)
     }
 
     /// An error stopped a command before it ran: report it and carry out what
@@ -911,12 +1001,12 @@ impl Executor {
     /// Not a method: it is also called while a
     /// [`TempVarsGuard`](crate::shell::TempVarsGuard) borrows the shell.
     // TODO: handled by the application's error handler (TODO.md §10).
-    fn fail(message: impl fmt::Display, exit: bool) -> JobExit {
+    fn fail(message: impl fmt::Display, exit: bool) -> ExecStatus {
         eprintln!("rush: {message}");
         if exit {
             Self::exit_shell(1);
         }
-        JobExit::Exited(1)
+        ExecStatus::FAILURE
     }
 
     /// End the current process (the shell, or a forked child) with `code`.
@@ -1055,11 +1145,11 @@ impl Executor {
         envs: &[(String, String)],
         argv: &[String],
         redirections: RedirectGuard,
-    ) -> JobExit {
+    ) -> ExecStatus {
         // TODO: review the code flow
         let Some((program, arguments)) = argv.split_first() else {
             redirections.keep();
-            return JobExit::Exited(0);
+            return ExecStatus::SUCCESS;
         };
 
         // What the shell already wrote goes where it was meant to.
@@ -1133,7 +1223,7 @@ impl Executor {
                 Ok((reader, writer)) => (Some(OwnedFd::from(reader)), Some(OwnedFd::from(writer))),
                 Err(e) => {
                     eprintln!("rush: pipe: {}", nix::error_message(&e));
-                    return CommandRun::Done(JobExit::Exited(1));
+                    return CommandRun::Done(ExecStatus::FAILURE);
                 }
             },
             Output::Fd(fd) => (None, Some(fd)),
@@ -1167,7 +1257,7 @@ impl Executor {
             Ok(ForkResult::Parent(pid)) => pid,
             Err(e) => {
                 eprintln!("rush: fork: {}", nix::error_message(&e));
-                return CommandRun::Done(JobExit::Exited(1));
+                return CommandRun::Done(ExecStatus::FAILURE);
             }
         };
 
@@ -1304,7 +1394,7 @@ impl Executor {
         // The redirections are undone before the next command.
         drop(guard);
 
-        CommandRun::Done(job_exit(status))
+        CommandRun::Done(status)
     }
 
     /// Run a compound command in the current process, its redirections already
@@ -1315,7 +1405,7 @@ impl Executor {
             CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
             CompoundCommand::If(clause) => self.if_clause(clause),
             // TODO: run them (TODO.md).
-            CompoundCommand::For(_) => not_implemented("for"),
+            CompoundCommand::For(clause) => self.for_clause(clause),
             CompoundCommand::Case(_) => not_implemented("case"),
             CompoundCommand::While(_) => not_implemented("while"),
             CompoundCommand::Until(_) => not_implemented("until"),
@@ -1338,8 +1428,9 @@ impl Executor {
     ) -> ExecStatus {
         let status = self.list(condition);
 
-        // Interrupted (Ctrl-C): nothing else runs, like in an and-or list.
-        if status.interrupted() {
+        // Interrupted (Ctrl-C): nothing else runs, like in an and-or list. A
+        // `break`/`continue` in the condition leaves the `if` too.
+        if status.interrupted() || status.jump() {
             return status;
         }
 
@@ -1354,6 +1445,81 @@ impl Executor {
             Some(ElsePart::Else(els)) => self.list(&els.body),
             None => ExecStatus::SUCCESS,
         }
+    }
+
+    /// `for name in words; do body; done` (§2.9.4.2): the body runs once for
+    /// each field of the expanded words (`"$@"` without `in`), with `name` set
+    /// to it. The status is the body's last one, 0 when it never ran.
+    ///
+    /// TODO: the words are not split by `IFS` nor globbed yet, like every word.
+    fn for_clause(&mut self, clause: &ForClause) -> ExecStatus {
+        let values = match &clause.wordlist {
+            None => self.shell.positional.clone(),
+            Some(words) => {
+                let mut values = Vec::new();
+                for word in words {
+                    match self.expand_fields(word) {
+                        Ok(fields) => values.extend(fields),
+                        // TODO: handled by the application's error handler
+                        // (TODO.md §10).
+                        Err(e) => return Self::fail(e, self.exits(false)),
+                    }
+                }
+                values
+            }
+        };
+
+        let mut status = ExecStatus::SUCCESS;
+        let mut executor = self.enter_loop();
+
+        for value in values {
+            // A readonly variable: a variable assignment error.
+            // TODO: handled by the application's error handler (TODO.md §10).
+            if let Err(e) = executor.shell.env.assign(clause.name, value) {
+                status = Self::fail(e, executor.exits(false));
+                break;
+            }
+
+            status = executor.list(&clause.body);
+
+            match status {
+                ExecStatus::Jump(control) => match control.outer() {
+                    // For an outer loop: this one stops, the jump goes up.
+                    Some(outer) => {
+                        status = ExecStatus::Jump(outer);
+                        break;
+                    }
+                    // For this loop: `$?` is 0, the status of the built-in.
+                    None => {
+                        status = ExecStatus::SUCCESS;
+                        if matches!(control, LoopControl::Break(_)) {
+                            break;
+                        }
+                    }
+                },
+                // Interrupted (Ctrl-C): the whole loop stops.
+                status if status.interrupted() => break,
+                _ => {}
+            }
+        }
+
+        status
+    }
+
+    /// Count a loop in `loop_depth` while the returned guard lives.
+    fn enter_loop(&mut self) -> LoopGuard<'_> {
+        self.loop_depth += 1;
+        LoopGuard { executor: self }
+    }
+
+    /// Carry out `break n`/`continue n`: a jump, which goes up as the status
+    /// until the `n`th loop takes it. Outside a loop it does nothing; a count
+    /// past the enclosing loops is the outermost one.
+    fn jump(&self, control: LoopControl) -> ExecStatus {
+        if self.loop_depth == 0 {
+            return ExecStatus::SUCCESS;
+        }
+        ExecStatus::Jump(control.clamp(self.loop_depth))
     }
 
     /// `list &`: run the list in a forked shell without waiting for it.
@@ -1387,7 +1553,7 @@ impl Executor {
                 }
                 ExecStatus::SUCCESS
             }
-            CommandRun::Done(exit) => exit.into(),
+            CommandRun::Done(status) => status,
         }
     }
 
@@ -1431,16 +1597,19 @@ impl Executor {
 
         // Not a job: it can't be stopped (see `SpawnType::CmdSub`), never goes
         // in the job table, and is waited until it completes.
-        let exit = match run {
+        let status = match run {
             CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
-                Waiter::wait_completed(JobBuilder::new().build(pgid, pid)).unwrap_or_else(|e| {
-                    eprintln!("rush: wait: {e}");
-                    JobExit::Exited(1)
-                })
+                match Waiter::wait_completed(JobBuilder::new().build(pgid, pid)) {
+                    Ok(exit) => exit.into(),
+                    Err(e) => {
+                        eprintln!("rush: wait: {e}");
+                        ExecStatus::FAILURE
+                    }
+                }
             }
-            CommandRun::Done(exit) => exit,
+            CommandRun::Done(status) => status,
         };
-        self.cmdsub_status = Some(exit.into());
+        self.cmdsub_status = Some(status);
 
         let output = String::from_utf8_lossy(&output);
         output.trim_end_matches('\n').to_string()
@@ -1806,11 +1975,7 @@ impl Executor {
                 SpawnType::Subshell,
                 state,
                 &expanded.redirections,
-                |executor| {
-                    executor
-                        .run_builtin(&expanded, def, RedirectGuard::none())
-                        .into()
-                },
+                |executor| executor.run_builtin(&expanded, def, RedirectGuard::none()),
             ),
             // Outside a pipeline the built-in runs in the shell: its redirections
             // are applied to the shell while it runs.
@@ -1856,7 +2021,7 @@ impl Executor {
         // Each command of a pipeline runs in its own process: the assignment
         // would only change a child's variables, which are thrown away.
         if state.in_pipeline {
-            return CommandRun::Done(JobExit::Exited(0));
+            return CommandRun::Done(ExecStatus::SUCCESS);
         }
 
         // An exported variable keeps the attribute: assigning it changes the
@@ -1873,7 +2038,7 @@ impl Executor {
         }
 
         let status = self.cmdsub_status.unwrap_or(ExecStatus::SUCCESS);
-        CommandRun::Done(job_exit(status))
+        CommandRun::Done(status)
     }
 
     fn command(&mut self, command: &Command, state: PipelineState) -> CommandRun {
@@ -1887,7 +2052,10 @@ impl Executor {
         }
     }
 
-    fn schedule_pipeline(&mut self, pipeline: &Pipeline, is_foreground: bool) -> Job {
+    /// Start every command of the pipeline. A single command that ran in the
+    /// shell gives its status: nothing is left to wait for, and the status may
+    /// be a jump, which a job's exit can't hold.
+    fn schedule_pipeline(&mut self, pipeline: &Pipeline, is_foreground: bool) -> Scheduled {
         assert!(
             !pipeline.cmds.is_empty(),
             "A pipeline must always contain something"
@@ -1935,12 +2103,17 @@ impl Executor {
         };
 
         match self.command(last_cmd, state) {
-            CommandRun::Spawned(Spawned { pid, pgid, .. }) => job_builder.build(pgid, pid),
-            // When nothing was spawned the job is already completed and its pgid
-            // is never waited on.
-            CommandRun::Done(exit) => {
-                job_builder.build_not_spawned(pipeline_pgid.unwrap_or(self.shell.pgid), exit)
+            CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
+                Scheduled::Job(job_builder.build(pgid, pid))
             }
+            CommandRun::Done(status) if inner_cmds.is_empty() => Scheduled::Done(status),
+            // The commands before it still have to be waited for. When nothing
+            // was spawned the job is already completed and its pgid is never
+            // waited on.
+            CommandRun::Done(status) => Scheduled::Job(
+                job_builder
+                    .build_not_spawned(pipeline_pgid.unwrap_or(self.shell.pgid), job_exit(status)),
+            ),
         }
     }
 
@@ -1957,11 +2130,15 @@ impl Executor {
     }
 
     fn wait_pipeline(&mut self, pipeline: &Pipeline) -> ExecStatus {
-        let job = self.schedule_pipeline(pipeline, true);
+        let job = match self.schedule_pipeline(pipeline, true) {
+            Scheduled::Job(job) => job,
+            Scheduled::Done(status) => {
+                Waiter::new(&self.shell).reclaim();
+                return self.pipeline_status(pipeline, status);
+            }
+        };
 
-        let wait_result = Waiter::new(&self.shell).wait(job);
-
-        let exec_status = match wait_result {
+        let exec_status = match Waiter::new(&self.shell).wait(job) {
             Ok(WaitResult::Completed(exit)) => exit.into(),
             Ok(WaitResult::Stopped { job, sig_stop }) => {
                 self.job_stopped(job, sig_stop, pipeline.to_string())
@@ -1972,6 +2149,12 @@ impl Executor {
             }
         };
 
+        self.pipeline_status(pipeline, exec_status)
+    }
+
+    /// The status of the pipeline from the one of its last command: negated
+    /// with `!`, and recorded as `$?`.
+    fn pipeline_status(&mut self, pipeline: &Pipeline, exec_status: ExecStatus) -> ExecStatus {
         let exec_status = if pipeline.negated {
             exec_status.not()
         } else {
@@ -1986,7 +2169,8 @@ impl Executor {
     fn or_list(&mut self, orl: &OrList) -> ExecStatus {
         let left_status = self.op_list(&orl.left);
 
-        // Short-circuit if the lhs execution did not fail, or was interrupted
+        // Short-circuit if the lhs execution did not fail (a `break`/`continue`
+        // is not a failure), or was interrupted
         if !left_status.failure() || left_status.interrupted() {
             return left_status;
         }
@@ -1997,8 +2181,9 @@ impl Executor {
     fn and_list(&mut self, andl: &AndList) -> ExecStatus {
         let left_status = self.op_list(&andl.left);
 
-        // Short-circuit if the lhs execution failed (an interruption is a failure)
-        if left_status.failure() {
+        // Short-circuit if the lhs execution failed (an interruption is a failure),
+        // or on a `break`/`continue`
+        if left_status.failure() || left_status.jump() {
             return left_status;
         }
 
@@ -2013,9 +2198,14 @@ impl Executor {
         }
     }
 
+    /// The commands in order. A command interrupted by Ctrl-C (like in dash
+    /// and bash) or a `break`/`continue` skips the rest.
     fn sequential_list(&mut self, seq: &SequentialList) -> ExecStatus {
         if let Some(left) = &seq.left {
-            self.list(left);
+            let status = self.list(left);
+            if status.interrupted() || status.jump() {
+                return status;
+            }
         }
 
         self.op_list(&seq.right)
@@ -2026,7 +2216,10 @@ impl Executor {
             List::SequentialList(s) => self.sequential_list(s),
             List::AsyncList(async_list) => {
                 if let Some(left) = &async_list.left {
-                    self.list(left);
+                    let status = self.list(left);
+                    if status.interrupted() || status.jump() {
+                        return status;
+                    }
                 }
 
                 self.async_list(&async_list.right)
@@ -2258,11 +2451,41 @@ mod tests {
         let not_found = io::Error::from(io::ErrorKind::NotFound);
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
 
-        assert_eq!(spawn_failure("missing", &not_found), JobExit::Exited(127));
-        assert_eq!(spawn_failure("./missing", &not_found), JobExit::Exited(127));
+        assert_eq!(
+            spawn_failure("missing", &not_found),
+            ExecStatus::Exited(127)
+        );
+        assert_eq!(
+            spawn_failure("./missing", &not_found),
+            ExecStatus::Exited(127)
+        );
         assert_eq!(
             spawn_failure("./not-executable", &denied),
-            JobExit::Exited(126)
+            ExecStatus::Exited(126)
         );
+    }
+
+    #[test]
+    fn a_jump_is_status_zero_and_survives_not() {
+        let jump = ExecStatus::Jump(LoopControl::Break(1));
+
+        assert_eq!(jump.code(), 0);
+        assert!(!jump.failure());
+        assert!(!jump.interrupted());
+        assert_eq!(jump.not(), jump);
+    }
+
+    #[test]
+    fn loop_control_levels() {
+        assert_eq!(LoopControl::Break(1).outer(), None);
+        assert_eq!(LoopControl::Continue(1).outer(), None);
+        assert_eq!(LoopControl::Break(3).outer(), Some(LoopControl::Break(2)));
+        assert_eq!(
+            LoopControl::Continue(2).outer(),
+            Some(LoopControl::Continue(1))
+        );
+
+        assert_eq!(LoopControl::Break(5).clamp(2), LoopControl::Break(2));
+        assert_eq!(LoopControl::Continue(1).clamp(2), LoopControl::Continue(1));
     }
 }

@@ -1,5 +1,6 @@
 //! Compound commands (§2.9.4) other than subshells, which have their own file:
-//! `if`. They run in the shell itself, or in a forked child inside a pipeline.
+//! `if`, `for`. They run in the shell itself, or in a forked child inside a
+//! pipeline. `break` and `continue` are tested with the built-ins.
 
 mod common;
 
@@ -151,11 +152,70 @@ fn an_if_without_fi_is_a_syntax_error() {
 }
 
 #[test]
-fn a_for_loop_is_not_implemented_yet() {
-    let output = run_shell("for x in a; do echo $x; done\necho status $?\n");
+fn for_runs_the_body_for_each_word() {
+    let output = run_shell("x=d; for i in a \"b c\" $x; do echo \"[$i]\"; done\n");
 
-    assert!(stderr(&output).contains("rush: for: not implemented yet"));
-    assert_eq!(stdout(&output), "status 1\n");
+    assert_eq!(stdout(&output), "[a]\n[b c]\n[d]\n");
+}
+
+#[test]
+fn for_without_in_takes_the_positional_parameters() {
+    let output =
+        run_shell("set -- \"a b\" c\nfor i; do echo \"[$i]\"; done\nfor i do echo \"$i\"; done\n");
+
+    assert_eq!(stdout(&output), "[a b]\n[c]\na b\nc\n");
+}
+
+#[test]
+fn for_status_is_the_last_body_status() {
+    let output = run_shell(
+        "for i in 1 2; do false; done; echo $?\nfalse; for i in; do echo no; done; echo $?\n",
+    );
+
+    assert_eq!(stdout(&output), "1\n0\n");
+}
+
+#[test]
+fn the_loop_variable_keeps_its_last_value() {
+    let output = run_shell("for i in 1 2; do :; done; echo $i\n");
+
+    assert_eq!(stdout(&output), "2\n");
+}
+
+#[test]
+fn for_in_a_pipeline_and_redirected() {
+    let dir = test_dir("for_in_a_pipeline_and_redirected");
+    let output = run_shell_in(
+        "for i in a b; do echo $i; done | tr a-z A-Z\nfor i in c d; do echo $i; done >f\ncat f\n",
+        &dir,
+    );
+
+    assert_eq!(stdout(&output), "A\nB\nc\nd\n");
+}
+
+#[test]
+fn nested_for_loops() {
+    let output = run_shell("for i in a b; do for j in 1 2; do echo $i$j; done; done\n");
+
+    assert_eq!(stdout(&output), "a1\na2\nb1\nb2\n");
+}
+
+#[test]
+fn an_expansion_error_in_the_word_list_exits_a_script() {
+    let output = run_shell("for i in a ${u?boom}; do echo $i; done\necho after\n");
+
+    assert!(stderr(&output).contains("rush: u: boom"));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn a_readonly_loop_variable_exits_a_script() {
+    let output = run_shell("readonly r\nfor r in 1; do echo in; done\necho after\n");
+
+    assert!(stderr(&output).contains("rush: r: readonly variable"));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

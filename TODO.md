@@ -107,11 +107,9 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
 - [x] `while`/`until` parsed (`WhileClause`/`UntilClause { condition, body }`, the body from `do_group`), printed back by `Display`
 - [x] `case` parsed (`CaseClause { word, items }`, `CaseItem { patterns, body }`; rule 4 in `case_item_ns`, only without `(`), printed back by `Display`
 - [ ] Running `case` (`compound_body` only says "not implemented yet"): expand the word (no field splitting), match each pattern in order with `pattern::Pattern` (quoted characters match themselves, `Executor::expand_pattern`), run the body of the first match; the status is the body's, 0 when nothing matched or the body is empty
-- [ ] Running the loops (`Executor::compound_body` only says "not implemented yet"):
-  - `for`: assign the name for each field of the expanded words, `"$@"` without `in`, nothing with `in` alone
-  - `while`/`until`: run the body while the condition succeeds (fails for `until`)
-  - the status is the body's last one, 0 when it never ran; a SIGINT stops the loop
-  - `break`/`continue` (`Status::Break`/`Continue` are not unwound yet)
+- [x] Running `for` (`Executor::for_clause`), with `break`/`continue` (`ExecStatus::Jump(LoopControl)`, `Executor::jump`, `LoopGuard` for `loop_depth`); Ctrl-C stops the loop and, like in dash and bash, a sequential list
+- [ ] Running `while`/`until` (`Executor::compound_body` only says "not implemented yet"): run the body while the condition succeeds (fails for `until`), the status is the body's last one, 0 when it never ran; a `break`/`continue` in the condition (a `Jump` status) or after the body (`LoopControl::outer`, like `for_clause`), Ctrl-C stops the loop
+- [ ] Ctrl-Z in a loop: today only the command stops and the loop goes on (bash leaves the loop)
 - [ ] Input that spans lines in the REPL. It reads one more line only after `\`, `&&`, `||` and `|`, so input that ends inside a quote, `(`, `$(`, a backquote or a compound command (`if x; then` / ... / `fi`, the usual layout of a script) is a syntax error at the end of its first line, although the tokenizer and the parser handle it over buffered lines (`eval`, `-c` strings once they exist).
   - The parser returns `Option`, so it can't tell a real syntax error from input that stopped too early. Plan an error type for the syntax tree that says "the end was reached and more characters are needed to understand it" (an open quote, `(`, `$(`, `` ` ``, an `if` without its `fi`...), so that the REPL reads another line (prompt `> `) instead of reporting an error, and reports "unexpected end of file" at the real EOF; it would replace `line_has_continuation`.
   - When the time comes, first look at how other shells handle it: bash (its yacc grammar, the PS2 prompt, "syntax error: unexpected end of file"), dash (`parser.c`, reading more input while a command is incomplete), and how they treat an incomplete `-c`/`eval` string.

@@ -72,7 +72,7 @@ Problems with this setup, found by reading the code:
   - Job IDs (XBD §3.204) are parsed by the built-ins (`builtin::parse_job_id`, a clap `value_parser`) into `JobId` (`Current`, `Previous`, `Number`, `Prefix`, `Contains`); the table only looks them up (`JobTable::find`).
   - The command text is the AST printed back (`Display` for the syntax nodes in `syntax.rs`), like bash does.
   - A forked child keeps a snapshot of the table, so `jobs | cat` and `$(jobs -p)` list the shell's jobs; it can't wait on them, and without job control `fg`/`bg` refuse.
-- [x] **0.2 Control-flow result.** `builtin::Status` is `Exited(i32) | Exit(i32) | Return(i32) | Break(n) | Continue(n) | Eval(String) | Exec(Vec<String>)`; `Eval` and `Exec` are already handled. Done: the type. Still to do: the executor unwinds on it (today `Exit`/`Return` map to their code and `Break`/`Continue` to 0), which lets `exit` stop using `process::exit`. `Executor::run` then ends the loop, runs the EXIT trap, and exits with the code.
+- [x] **0.2 Control-flow result.** `builtin::Status` is `Exited(i32) | Exit(i32) | Return(i32) | Break(n) | Continue(n) | Eval(String) | Exec(Vec<String>)`; `Eval` and `Exec` are already handled. Done: the type, and `Break`/`Continue`, carried out by `Executor::jump` (an `ExecStatus::Jump(LoopControl)` status the enclosing loop takes, see `break`). Still to do: the executor unwinds on `Exit`/`Return` (today `Return` maps to its code), which lets `exit` stop using `process::exit`. `Executor::run` then ends the loop, runs the EXIT trap, and exits with the code.
 - [x] **0.3 Error convention.** Built-ins return `Err(builtin::Error)`, and `builtin::run` writes `rush: <name>: <msg>` on the built-in's stderr with status 1, `Error::new(status, …)` for another status, or 2 for clap usage errors (`--help` → stdout, 0). Use `?`, `.context(what)` on `io::Result`, and `bi.report()` for errors after which the built-in continues. The `128+errno` mapping is gone.
 - [x] **0.4 Redirections for in-process built-ins.** `RedirectGuard::open` opens the files, saves every fd the redirections touch, applies them to the shell with `dup2`, and puts the fds back when the guard is dropped, after the built-in (`run_builtin` owns the guard). `exec` without a command keeps them (`RedirectGuard::keep`). The saved copies, like the files the shell opens, go above the highest fd the command names (`RedirectController::floor`), never on a number the user wrote; the shell's terminal copy is moved out of the way when a redirection targets it (`exec 10>log`).
 - [x] **0.5 Built-ins in pipelines.** When a built-in isn't the only command (`PipelineState::in_pipeline`, set once by `schedule_pipeline` for every command of a pipeline of more than one), `unsub_command` runs it through `fork_child`, which sets up the pipe fds, applies its redirections, puts it in the job's process group and ends it with `_exit(status)`. `Executor::run_builtin` itself doesn't know about pipelines. Built-ins inside `( )`, `&` and `$(...)` run in a forked child too. Tests are in `tests/builtins/pipeline.rs`.
@@ -122,7 +122,6 @@ Still to do for job control:
 | `.` (dot) | executing a file as a program in the current env (can return `Status::Eval(contents)`; `return` must stop it) |
 | `alias`, `unalias` | alias substitution in the tokenizer (§2.3.1), including "value ending in a blank ⇒ check the next word too" |
 | `trap` | signal handling (a self-pipe or flag set by a `sigaction` handler, checked between commands), the EXIT trap, and resetting traps in subshells |
-| `break`, `continue` | `for`/`while`/`until` loops (not in the grammar yet) |
 | `return` | functions and dot scripts |
 
 ### Phase 4: low priority
@@ -146,11 +145,12 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] a failed redirection exits a non-interactive shell (0.6)
 
 #### `break [n]` / `continue [n]`
-- [ ] needs loops (phase 3)
-- [ ] `n` defaults to 1; if `n` > the number of enclosing loops, use the outermost one
-- [ ] `n` not an integer ≥ 1 → exit >0 (special-built-in error)
-- [ ] "enclosing" means lexical: not across a function body, not from a dot script or trap
-- [ ] `continue`: re-run the `while`/`until` condition, or take the next `for` value
+- [x] work in `for` loops (`while`/`until` are not run yet); tests in `tests/builtins/{break,continue}.rs`
+- [x] `n` defaults to 1; if `n` > the number of enclosing loops, use the outermost one (`Executor::jump` clamps it to `loop_depth`, counted by `LoopGuard`); outside a loop they do nothing, status 0 (dash, bash)
+- [x] `n` not an integer ≥ 1 → a usage error, status 2, which exits a script (special-built-in error, like dash): `parse_loop_count`
+- [ ] "enclosing" means lexical: not across a function body, not from a dot script or trap. Moot until functions, `.` and traps exist; `eval break` leaves the loop around it, like in dash and bash. In a forked child (`(break)`, `break | cat`, `$(break)`) only the child stops, like dash
+- [x] `continue`: take the next `for` value
+- [ ] `continue`: re-run the `while`/`until` condition
 
 #### `.` (dot) `. file`
 - [ ] if `file` has no `/`, search PATH (the file doesn't need to be executable); never fall back to the cwd

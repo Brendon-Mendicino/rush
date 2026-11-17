@@ -3,10 +3,8 @@
 
 use crate::common::{run_shell, stderr, stdout};
 
-const NOT_IMPLEMENTED: [&str; 18] = [
+const NOT_IMPLEMENTED: [&str; 16] = [
     // Special built-ins.
-    "break",
-    "continue",
     ".",
     "return",
     "times",
