@@ -80,12 +80,12 @@ fn redirections_apply_to_the_whole_if() {
 }
 
 #[test]
-fn a_failed_redirection_exits_a_non_interactive_shell() {
-    let output = run_shell("if true; then echo body; fi >/nonexistent/f\necho after\n");
+fn a_failed_redirection_fails_the_command() {
+    // §2.8.1: a non-interactive shell "may exit"; like dash and bash, it doesn't.
+    let output = run_shell("if true; then echo body; fi >/nonexistent/f\necho status $?\n");
 
     assert!(stderr(&output).contains("rush: /nonexistent/f: No such file or directory"));
-    assert_eq!(stdout(&output), "");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "status 1\n");
 }
 
 #[test]

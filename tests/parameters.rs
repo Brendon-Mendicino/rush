@@ -212,6 +212,30 @@ fn question_mark_in_a_subshell_exits_only_the_subshell() {
 }
 
 #[test]
+fn an_expansion_error_in_a_pipeline_fails_only_its_command() {
+    // Each command of a pipeline has a subshell environment of its own: the
+    // error ends that one, not the script (dash, bash).
+    let output = run_shell(
+        "echo ${x?boom} | cat; echo after\n\
+         if :; then :; fi >${x?boom} | cat; echo after\n\
+         if :; then :; fi >&foo | cat; echo after\n",
+    );
+
+    assert!(stderr(&output).contains("rush: x: boom"));
+    assert_eq!(stdout(&output), "after\nafter\nafter\n");
+}
+
+#[test]
+fn an_expansion_error_in_a_redirection_exits_a_script() {
+    // Like dash (bash goes on): an expansion error "shall exit" (§2.8.1).
+    let output = run_shell("( : ) >${x?boom}\necho after\n");
+
+    assert!(stderr(&output).contains("rush: x: boom"));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn length() {
     let output = run_shell(
         "x=città; e=\necho ${#x} ${#e} ${#nope}\nset -- a b c\necho ${#} ${##} ${#1} ${#@}\n",

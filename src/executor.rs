@@ -273,6 +273,7 @@ struct SimpleCommand {
 }
 
 /// A redirection that cannot be set up; the command is not run.
+// TODO: handled by the application's error handler (TODO.md §10).
 #[derive(Debug)]
 enum RedirectError {
     Open {
@@ -283,20 +284,34 @@ enum RedirectError {
     /// The word of `>&`/`<&` is neither an fd nor `-`, or a target word gives
     /// no field or more than one (`>$EMPTY`).
     BadTarget(String),
-    /// The expansion of the word failed: not a redirection error, an
-    /// expansion error (`Executor::expansion_failure`).
-    Expansion(ExpansionError),
+    /// The redirections could not be applied to the shell (`RedirectGuard`).
+    Apply(io::Error),
 }
 
 /// An expansion that can't be done (§2.8.1): `${x?}` with `x` unset,
 /// `${1=x}`, `${x=y}` with `x` readonly. The message, without `rush: `.
+// TODO: handled by the application's error handler (TODO.md §10).
 #[derive(Debug, Clone)]
 struct ExpansionError(String);
+
+/// An error that stops a command before it runs, sorted like §2.8.1, whose
+/// table decides what it does to a non-interactive shell
+/// (`Executor::command_error`).
+// TODO: handled by the application's error handler (TODO.md §10).
+#[derive(Debug)]
+enum CommandError {
+    /// Shall exit.
+    Expansion(ExpansionError),
+    /// A readonly variable assigned: shall exit.
+    Assignment(ReadonlyError),
+    /// Shall exit only for a special built-in.
+    Redirect(RedirectError),
+}
 
 impl fmt::Display for RedirectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Expansion(e) => write!(f, "{e}"),
+            Self::Apply(err) => write!(f, "{}", nix::error_message(err)),
             Self::Open { filename, err } => {
                 write!(f, "{filename}: {}", nix::error_message(err))
             }
@@ -505,17 +520,38 @@ impl RedirectController {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SyntaxError;
 
-/// Report a redirection that cannot be set up: the command does not run, its
-/// status is 1.
 impl fmt::Display for ExpansionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-fn redirection_failure(e: RedirectError) -> CommandRun {
-    eprintln!("rush: {e}");
-    CommandRun::Done(JobExit::Exited(1))
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Expansion(e) => write!(f, "{e}"),
+            Self::Assignment(e) => write!(f, "{e}"),
+            Self::Redirect(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<ExpansionError> for CommandError {
+    fn from(e: ExpansionError) -> Self {
+        Self::Expansion(e)
+    }
+}
+
+impl From<ReadonlyError> for CommandError {
+    fn from(e: ReadonlyError) -> Self {
+        Self::Assignment(e)
+    }
+}
+
+impl From<RedirectError> for CommandError {
+    fn from(e: RedirectError) -> Self {
+        Self::Redirect(e)
+    }
 }
 
 impl Fields {
@@ -626,6 +662,13 @@ impl RedirectGuard {
     /// of a pipeline command).
     fn none() -> Self {
         Self { saved: Vec::new() }
+    }
+
+    /// Open `redirections` and apply them to the shell, until the guard is
+    /// dropped. The files opened are closed once applied.
+    fn open(redirections: &[Redirection], shell: &mut Shell) -> Result<Self, RedirectError> {
+        let controller = RedirectController::from_redirects(redirections, &shell.internal_fds())?;
+        Self::apply(&controller, shell).map_err(RedirectError::Apply)
     }
 
     fn apply(redirections: &RedirectController, shell: &mut Shell) -> io::Result<Self> {
@@ -754,7 +797,7 @@ impl Executor {
             Kind::Special => {
                 for (name, value) in assignments {
                     if let Err(e) = self.shell.env.assign(name, value) {
-                        return Self::assignment_error(e, self.exits_on_assignment_error(false));
+                        return Self::fail(e, self.exits(false));
                     }
                 }
                 Vec::new()
@@ -770,10 +813,10 @@ impl Executor {
         let result = {
             // Restored when the block ends, before the result is carried out:
             // the shell code of `eval` doesn't see a regular built-in's prefixes.
-            let exit = self.exits_on_assignment_error(false);
+            let exit = self.exits(false);
             let mut shell = match self.shell.set_temporarily(temporary) {
                 Ok(shell) => shell,
-                Err(e) => return Self::assignment_error(e, exit),
+                Err(e) => return Self::fail(e, exit),
             };
 
             let bi = Builtin {
@@ -823,33 +866,50 @@ impl Executor {
     /// non-interactive shell (§2.8.1), which includes every forked child: there
     /// "the shell shall exit from the subshell environment", and the shell that
     /// started it goes on. Otherwise it is only the status.
+    // TODO: handled by the application's error handler (TODO.md §10).
     fn builtin_error(&self, kind: Kind, code: i32) -> JobExit {
-        if kind == Kind::Special && !self.shell.is_interactive {
+        if kind == Kind::Special && self.exits(false) {
             Self::exit_shell(code);
         }
         JobExit::Exited(code)
     }
 
-    /// An assignment to a readonly variable: a variable assignment error
-    /// (§2.8.1), which exits a non-interactive shell whatever the command
-    /// (`exit`, see [`Executor::exits_on_assignment_error`]). Otherwise the
-    /// command fails.
+    /// An error stopped a command before it ran: report it and carry out what
+    /// §2.8.1 says it does. An expansion or a variable assignment error exits a
+    /// non-interactive shell, a redirection error only on a special built-in
+    /// (`special_builtin`); see [`Executor::exits`] for `in_child`. Otherwise
+    /// the command fails with 1.
+    // TODO: handled by the application's error handler (TODO.md §10).
+    fn command_error(&self, e: CommandError, special_builtin: bool, in_child: bool) -> CommandRun {
+        let shall_exit = match e {
+            CommandError::Expansion(_) | CommandError::Assignment(_) => true,
+            CommandError::Redirect(_) => special_builtin,
+        };
+        CommandRun::Done(Self::fail(e, shall_exit && self.exits(in_child)))
+    }
+
+    /// An error that "shall exit" (§2.8.1) exits a non-interactive shell, but
+    /// not when the command runs in a subshell environment of its own
+    /// (`in_child`: a command of a pipeline, whose parent reports the error),
+    /// which only fails. A forked child is never interactive: the error ends
+    /// it, and the shell that started it goes on.
+    // TODO: handled by the application's error handler (TODO.md §10).
+    fn exits(&self, in_child: bool) -> bool {
+        !self.shell.is_interactive && !in_child
+    }
+
+    /// Report an error, then end the current process with 1 when `exit`, or
+    /// give the status 1.
     ///
-    /// Not a method: it is also called while a [`TempVarsGuard`](crate::shell::TempVarsGuard) borrows the
-    /// shell.
-    fn assignment_error(e: ReadonlyError, exit: bool) -> JobExit {
-        eprintln!("rush: {e}");
+    /// Not a method: it is also called while a
+    /// [`TempVarsGuard`](crate::shell::TempVarsGuard) borrows the shell.
+    // TODO: handled by the application's error handler (TODO.md §10).
+    fn fail(message: impl fmt::Display, exit: bool) -> JobExit {
+        eprintln!("rush: {message}");
         if exit {
             Self::exit_shell(1);
         }
         JobExit::Exited(1)
-    }
-
-    /// A variable assignment error exits a non-interactive shell, but not when
-    /// the shell only stands in for a child (`in_child`: a program of a pipeline
-    /// is in a subshell environment of its own), which then fails.
-    fn exits_on_assignment_error(&self, in_child: bool) -> bool {
-        !self.shell.is_interactive && !in_child
     }
 
     /// End the current process (the shell, or a forked child) with `code`.
@@ -865,7 +925,7 @@ impl Executor {
             match RedirectController::from_redirects(&cmd.redirections, &self.shell.internal_fds())
             {
                 Ok(controller) => controller,
-                Err(e) => return redirection_failure(e),
+                Err(e) => return self.command_error(e.into(), false, state.in_pipeline),
             };
 
         let mut command = process::Command::new(&cmd.program);
@@ -1047,7 +1107,7 @@ impl Executor {
         let PipelineState {
             stdin,
             stdout,
-            in_pipeline: _,
+            in_pipeline,
             is_foreground,
             pipeline_pgid,
         } = state;
@@ -1055,7 +1115,7 @@ impl Executor {
         let redirect_controller =
             match RedirectController::from_redirects(redirections, &self.shell.internal_fds()) {
                 Ok(controller) => controller,
-                Err(e) => return redirection_failure(e),
+                Err(e) => return self.command_error(e.into(), false, in_pipeline),
             };
 
         // Inside a pipeline the child writes to a new pipe, whose read end is the
@@ -1204,62 +1264,33 @@ impl Executor {
         self.shell.pgid = nix::getpgrp();
     }
 
-    /// `( list )`: run the list in a forked shell.
-    fn subshell(
-        &mut self,
-        subshell: &Subshell,
-        redirections: &[Redirect],
-        state: PipelineState,
-    ) -> CommandRun {
-        let redirections = match self.expand_redirects(redirections) {
-            Ok(redirections) => redirections,
-            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
-            Err(e) => return redirection_failure(e),
-        };
-
-        self.fork_child(SpawnType::Subshell, state, &redirections, |executor| {
-            executor.list(&subshell.seq_list)
-        })
-    }
-
-    /// A compound command with its redirections. A subshell always gets its own
-    /// process; the others run in the shell, so that what they change stays
-    /// (`if true; then X=1; fi`), unless they are part of a pipeline, where each
-    /// command has its own process.
+    /// A compound command with its redirections. A subshell has a process of
+    /// its own, and so does every command of a pipeline; the others run in the
+    /// shell, so that what they change stays (`if true; then X=1; fi`).
+    ///
+    /// A redirection error only fails the command, like in dash and bash
+    /// (§2.8.1: a non-interactive shell "may exit").
     fn compound(
         &mut self,
         command: &CompoundCommand,
         redirections: &[Redirect],
         state: PipelineState,
     ) -> CommandRun {
-        if let CompoundCommand::Subshell(subshell) = command {
-            return self.subshell(subshell, redirections, state);
-        }
-
         let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
-            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
-            Err(e) => return CommandRun::Done(self.compound_redirection_error(e)),
+            Err(e) => return self.command_error(e, false, state.in_pipeline),
         };
 
-        // Like a built-in in a pipeline: `fork_child` applies the redirections
-        // to the child, a redirection error ends it.
-        if state.in_pipeline {
+        // `fork_child` applies the redirections to the child.
+        if matches!(command, CompoundCommand::Subshell(_)) || state.in_pipeline {
             return self.fork_child(SpawnType::Subshell, state, &redirections, |executor| {
                 executor.compound_body(command)
             });
         }
 
-        let controller =
-            match RedirectController::from_redirects(&redirections, &self.shell.internal_fds()) {
-                Ok(controller) => controller,
-                Err(e) => return CommandRun::Done(self.compound_redirection_error(e)),
-            };
-        let guard = match RedirectGuard::apply(&controller, &mut self.shell) {
+        let guard = match RedirectGuard::open(&redirections, &mut self.shell) {
             Ok(guard) => guard,
-            Err(e) => {
-                return CommandRun::Done(self.compound_redirection_error(nix::error_message(&e)));
-            }
+            Err(e) => return self.command_error(e.into(), false, false),
         };
 
         let status = self.compound_body(command);
@@ -1270,24 +1301,13 @@ impl Executor {
     }
 
     /// Run a compound command in the current process, its redirections already
-    /// in place.
+    /// in place: the shell, or the child `compound` forked for it (the body of
+    /// a subshell).
     fn compound_body(&mut self, command: &CompoundCommand) -> ExecStatus {
         match command {
             CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
             CompoundCommand::If(clause) => self.if_clause(clause),
         }
-    }
-
-    /// A redirection of a compound command failed: an error that exits a
-    /// non-interactive shell (§2.8.1, "Redirection error with compound
-    /// commands"). The command doesn't run.
-    // TODO: one place for the consequences of every error (TODO.md §10).
-    fn compound_redirection_error(&self, message: impl fmt::Display) -> JobExit {
-        eprintln!("rush: {message}");
-        if !self.shell.is_interactive {
-            Self::exit_shell(1);
-        }
-        JobExit::Exited(1)
     }
 
     /// `if`: the body of the first condition that succeeds runs, or the `else`
@@ -1664,23 +1684,15 @@ impl Executor {
         Ok(())
     }
 
-    /// Report an expansion that failed (§2.8.1: an expansion error exits a
-    /// non-interactive shell). The command doesn't run.
-    // TODO: one place for the consequences of every error (TODO.md §10).
-    fn expansion_failure(&self, e: ExpansionError) -> JobExit {
-        eprintln!("rush: {e}");
-        if !self.shell.is_interactive {
-            Self::exit_shell(1);
-        }
-        JobExit::Exited(1)
-    }
-
     /// The redirections with their words expanded: the file names, and the fds
-    /// of `>&`/`<&`, which must be a number or `-`.
+    /// of `>&`/`<&`, which must be a number or `-`. The error is an expansion
+    /// or a redirection error, never an assignment error.
+    // TODO: handled by the application's error handler (TODO.md §10), which
+    // would give this function a narrower error type.
     fn expand_redirects(
         &mut self,
         redirects: &[Redirect],
-    ) -> Result<Vec<Redirection>, RedirectError> {
+    ) -> Result<Vec<Redirection>, CommandError> {
         redirects
             .iter()
             .map(|redirect| match redirect {
@@ -1698,7 +1710,7 @@ impl Executor {
                     let digits = !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit());
                     match target.parse() {
                         Ok(src) if digits => Ok(Redirection::Dup { fd: dup.fd, src }),
-                        _ => Err(RedirectError::BadTarget(target)),
+                        _ => Err(RedirectError::BadTarget(target).into()),
                     }
                 }
             })
@@ -1707,12 +1719,12 @@ impl Executor {
 
     /// The word of a redirection, which must give exactly one field (bash:
     /// `>$EMPTY` is an ambiguous redirect).
-    fn expand_target(&mut self, word: &Word) -> Result<String, RedirectError> {
-        let fields = self.expand_fields(word).map_err(RedirectError::Expansion)?;
+    fn expand_target(&mut self, word: &Word) -> Result<String, CommandError> {
+        let fields = self.expand_fields(word)?;
 
         match <[String; 1]>::try_from(fields) {
             Ok([field]) => Ok(field),
-            Err(_) => Err(RedirectError::BadTarget(word.to_string())),
+            Err(_) => Err(RedirectError::BadTarget(word.to_string()).into()),
         }
     }
 
@@ -1724,7 +1736,7 @@ impl Executor {
         for word in iter::once(&cmd.program).chain(&cmd.arguments) {
             match self.expand_fields(word) {
                 Ok(fields) => words.extend(fields),
-                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+                Err(e) => return self.command_error(e.into(), false, state.in_pipeline),
             }
         }
 
@@ -1737,26 +1749,20 @@ impl Executor {
         let arguments: Vec<String> = words.collect();
 
         let def = builtin::find(&program);
+        // A redirection error on a special built-in exits a non-interactive
+        // shell (§2.8.1).
+        let special = def.is_some_and(|def| def.kind == Kind::Special);
 
-        // A failed redirection of a special built-in in the shell itself exits a
-        // non-interactive shell (§2.8.1), like when it can't be applied below.
         let redirections = match self.expand_redirects(&cmd.redirections) {
             Ok(redirections) => redirections,
-            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
-            Err(e) => match def {
-                Some(def) if !state.in_pipeline => {
-                    eprintln!("rush: {e}");
-                    return CommandRun::Done(self.builtin_error(def.kind, 1));
-                }
-                _ => return redirection_failure(e),
-            },
+            Err(e) => return self.command_error(e, special, state.in_pipeline),
         };
 
         let mut envs = Vec::with_capacity(cmd.envs.len());
         for var in &cmd.envs {
             match self.expand_text(&var.value) {
                 Ok(value) => envs.push((var.key.to_string(), value)),
-                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+                Err(e) => return self.command_error(e.into(), special, state.in_pipeline),
             }
         }
 
@@ -1776,10 +1782,7 @@ impl Executor {
                     .iter()
                     .find_map(|(name, _)| self.shell.env.check_assignable(name).err());
                 match readonly {
-                    Some(e) => {
-                        let exit = self.exits_on_assignment_error(state.in_pipeline);
-                        CommandRun::Done(Self::assignment_error(e, exit))
-                    }
+                    Some(e) => self.command_error(e.into(), false, state.in_pipeline),
                     None => self.simple_command(&expanded, state),
                 }
             }
@@ -1798,30 +1801,11 @@ impl Executor {
                 },
             ),
             // Outside a pipeline the built-in runs in the shell: its redirections
-            // are applied to the shell while it runs. A redirection error on a
-            // special built-in exits a non-interactive shell (§2.8.1).
-            Some(def) => {
-                let redirections = match RedirectController::from_redirects(
-                    &expanded.redirections,
-                    &self.shell.internal_fds(),
-                ) {
-                    Ok(redirections) => redirections,
-                    Err(e) => {
-                        eprintln!("rush: {e}");
-                        return CommandRun::Done(self.builtin_error(def.kind, 1));
-                    }
-                };
-
-                let guard = match RedirectGuard::apply(&redirections, &mut self.shell) {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        eprintln!("rush: {}", nix::error_message(&e));
-                        return CommandRun::Done(self.builtin_error(def.kind, 1));
-                    }
-                };
-
-                CommandRun::Done(self.run_builtin(&expanded, def, guard))
-            }
+            // are applied to the shell while it runs.
+            Some(def) => match RedirectGuard::open(&expanded.redirections, &mut self.shell) {
+                Ok(guard) => CommandRun::Done(self.run_builtin(&expanded, def, guard)),
+                Err(e) => self.command_error(e.into(), special, false),
+            },
         }
     }
 
@@ -1849,13 +1833,12 @@ impl Executor {
         // closed when the controller is dropped.
         let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
-            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
-            Err(e) => return redirection_failure(e),
+            Err(e) => return self.command_error(e, false, state.in_pipeline),
         };
         if let Err(e) =
             RedirectController::from_redirects(&redirections, &self.shell.internal_fds())
         {
-            return redirection_failure(e);
+            return self.command_error(e.into(), false, state.in_pipeline);
         }
 
         // Each command of a pipeline runs in its own process: the assignment
@@ -1870,11 +1853,10 @@ impl Executor {
         for var in envs {
             let value = match self.expand_text(&var.value) {
                 Ok(value) => value,
-                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+                Err(e) => return self.command_error(e.into(), false, false),
             };
             if let Err(e) = self.shell.env.assign(var.key, value) {
-                let exit = self.exits_on_assignment_error(false);
-                return CommandRun::Done(Self::assignment_error(e, exit));
+                return self.command_error(e.into(), false, false);
             }
         }
 
