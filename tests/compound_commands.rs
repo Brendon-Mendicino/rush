@@ -149,3 +149,19 @@ fn an_if_without_fi_is_a_syntax_error() {
     assert!(stderr(&output).contains("rush: syntax error"));
     assert_eq!(stdout(&output), "after\n");
 }
+
+#[test]
+fn a_for_loop_is_not_implemented_yet() {
+    let output = run_shell("for x in a; do echo $x; done\necho status $?\n");
+
+    assert!(stderr(&output).contains("rush: for: not implemented yet"));
+    assert_eq!(stdout(&output), "status 1\n");
+}
+
+#[test]
+fn a_bad_for_loop_variable_is_a_syntax_error() {
+    let output = run_shell("for 1x in a; do echo x; done\necho after\n");
+
+    assert!(stderr(&output).contains("rush: syntax error"));
+    assert_eq!(stdout(&output), "after\n");
+}

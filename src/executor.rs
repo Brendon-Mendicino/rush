@@ -1306,6 +1306,11 @@ impl Executor {
     fn compound_body(&mut self, command: &CompoundCommand) -> ExecStatus {
         match command {
             CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
+            // TODO: run the loop (TODO.md).
+            CompoundCommand::For(_) => {
+                eprintln!("rush: for: not implemented yet");
+                ExecStatus::FAILURE
+            }
             CompoundCommand::If(clause) => self.if_clause(clause),
         }
     }

@@ -162,6 +162,7 @@ pub enum Command<'a> {
 #[derive(Debug, Clone)]
 pub enum CompoundCommand<'a> {
     Subshell(Subshell<'a>),
+    For(ForClause<'a>),
     If(IfClause<'a>),
 }
 
@@ -238,6 +239,18 @@ pub struct ElseClause<'a> {
 pub enum ElsePart<'a> {
     Elif(ElifClause<'a>),
     Else(ElseClause<'a>),
+}
+
+/// `for name [in word...]; do body; done` (§2.9.4.2).
+#[derive(Debug, Clone)]
+pub struct ForClause<'a> {
+    /// The loop variable: a valid name (rule 5).
+    pub name: &'a str,
+    /// The words after `in`. `None` without `in`: the loop goes over the
+    /// positional parameters (`"$@"`). Empty with `in` and no word
+    /// (`for x in; do`): the body never runs.
+    pub wordlist: Option<Vec<Word<'a>>>,
+    pub body: List<'a>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -448,14 +461,17 @@ impl<'a> ParamOp<'a> {
 /// The reserved word `word` is, if any: one unquoted literal with exactly its
 /// text. `'if'`, `\if` and `if'x'` are ordinary words.
 fn reserved(word: &Word<'_>) -> Option<ReservedWord> {
+    unquoted_literal(word).and_then(ReservedWord::parse)
+}
+
+/// The text of `word` when it is one unquoted literal: what a reserved word or
+/// the name of a `for` must be.
+fn unquoted_literal<'a>(word: &Word<'a>) -> Option<&'a str> {
     let [WordPart::Literal(token)] = word.parts.as_slice() else {
         return None;
     };
-    if token.t_type != TokenType::Literal {
-        return None;
-    }
 
-    ReservedWord::parse(token.value)
+    (token.t_type == TokenType::Literal).then_some(token.value)
 }
 
 // ------------------------------------
@@ -647,10 +663,27 @@ impl fmt::Display for ElsePart<'_> {
     }
 }
 
+/// `for x do` prints as `for x; do`.
+impl fmt::Display for ForClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "for {}", self.name)?;
+        if let Some(words) = &self.wordlist {
+            f.write_str(" in")?;
+            for word in words {
+                write!(f, " {word}")?;
+            }
+        }
+        f.write_str("; do ")?;
+        write_terminated(f, &self.body)?;
+        f.write_str("done")
+    }
+}
+
 impl fmt::Display for CompoundCommand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompoundCommand::Subshell(subshell) => write!(f, "{subshell}"),
+            CompoundCommand::For(clause) => write!(f, "{clause}"),
             CompoundCommand::If(clause) => write!(f, "{clause}"),
         }
     }
@@ -1071,10 +1104,14 @@ impl SyntaxTree {
         T: Tokenizer<'a>,
     {
         // TODO: try the other alternatives once they are implemented:
-        // `Self::brace_group`, `Self::for_clause`, `Self::case_clause`,
-        // `Self::while_clause`, `Self::until_clause`.
+        // `Self::brace_group`, `Self::case_clause`, `Self::while_clause`,
+        // `Self::until_clause`.
         if let Some(subshell) = Self::subshell(tok) {
             return Some(CompoundCommand::Subshell(subshell));
+        }
+
+        if let Some(clause) = Self::for_clause(tok) {
+            return Some(CompoundCommand::For(clause));
         }
 
         Self::if_clause(tok).map(CompoundCommand::If)
@@ -1192,18 +1229,45 @@ impl SyntaxTree {
     /// BNF:
     ///
     /// ```
-    /// for_clause ::= For name                                     do_group
+    /// for_clause ::= For name                                      do_group
     ///              | For name                       sequential_sep do_group
     ///              | For name linebreak in          sequential_sep do_group
     ///              | For name linebreak in wordlist sequential_sep do_group
     ///              ;
     /// ```
-    pub fn for_clause<'a, T>(_tok: &T) -> Option<()>
+    pub fn for_clause<'a, T>(tok: &T) -> Option<ForClause<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("for_clause: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::For)?;
+        let name = Self::name(&sub_tok)?;
+
+        // `linebreak in` only when an `in` follows: otherwise the newlines are
+        // the `sequential_sep` of `for x <newline> do`.
+        let in_tok = sub_tok.clone();
+        Self::linebreak(&in_tok);
+        let wordlist = if Self::r#in(&in_tok).is_some() {
+            sub_tok.merge(in_tok);
+            let words = Self::wordlist(&sub_tok);
+            Self::sequential_sep(&sub_tok)?;
+            Some(words)
+        } else {
+            // Optional: `for x do`.
+            Self::sequential_sep(&sub_tok);
+            None
+        };
+
+        let body = Self::do_group(&sub_tok)?;
+
+        tok.merge(sub_tok);
+
+        Some(ForClause {
+            name,
+            wordlist,
+            body,
+        })
     }
 
     /// BNF:
@@ -1212,11 +1276,22 @@ impl SyntaxTree {
     /// name ::= NAME                                   Apply rule 5
     ///        ;
     /// ```
-    pub fn name<'a, T>(_tok: &T) -> Option<Token<'a>>
+    ///
+    /// Rule 5: the word must be a valid name, unquoted (`for 1x` and `for 'x'`
+    /// are syntax errors, like in dash). A reserved word is one too
+    /// (`for do in a`).
+    pub fn name<'a, T>(tok: &T) -> Option<&'a str>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("name: not implemented")
+        let sub_tok = tok.clone();
+
+        let word = Self::word(&sub_tok)?;
+        let name = unquoted_literal(&word).filter(|name| is_valid_name(name))?;
+
+        tok.merge(sub_tok);
+
+        Some(name)
     }
 
     /// BNF:
@@ -1225,11 +1300,11 @@ impl SyntaxTree {
     /// in ::= In                                       Apply rule 6
     ///      ;
     /// ```
-    pub fn r#in<'a, T>(_tok: &T) -> Option<Token<'a>>
+    pub fn r#in<'a, T>(tok: &T) -> Option<()>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("in: not implemented")
+        Self::reserved_word(tok, ReservedWord::In)
     }
 
     /// BNF:
@@ -1239,11 +1314,19 @@ impl SyntaxTree {
     ///            |          WORD
     ///            ;
     /// ```
-    pub fn wordlist<'a, T>(_tok: &T) -> Vec<Word<'a>>
+    ///
+    /// Empty when there is no word: the caller tells `in` alone apart. Reserved
+    /// words are words here (`for x in in do`).
+    pub fn wordlist<'a, T>(tok: &T) -> Vec<Word<'a>>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("wordlist: not implemented")
+        let mut words = Vec::new();
+        while let Some(word) = Self::word(tok) {
+            words.push(word);
+        }
+
+        words
     }
 
     /// BNF:
@@ -1496,11 +1579,19 @@ impl SyntaxTree {
     /// do_group ::= Do compound_list Done              Apply rule 6
     ///            ;
     /// ```
-    pub fn do_group<'a, T>(_tok: &T) -> Option<List<'a>>
+    pub fn do_group<'a, T>(tok: &T) -> Option<List<'a>>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("do_group: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::Do)?;
+        let body = Self::compound_list(&sub_tok)?;
+        Self::reserved_word(&sub_tok, ReservedWord::Done)?;
+
+        tok.merge(sub_tok);
+
+        Some(body)
     }
 
     /// BNF:
@@ -1944,11 +2035,16 @@ impl SyntaxTree {
     ///                  | newline_list
     ///                  ;
     /// ```
-    pub fn sequential_sep<'a, T>(_tok: &T) -> Option<Token<'a>>
+    pub fn sequential_sep<'a, T>(tok: &T) -> Option<()>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("sequential_sep: not implemented")
+        if tok.next_if_type(TokenType::Semicolon).is_some() {
+            Self::linebreak(tok);
+            return Some(());
+        }
+
+        Self::newline_list(tok).then_some(())
     }
 
     /// The `WORD` terminal: one part, then every part glued to it (§2.3): plain
@@ -2579,6 +2675,93 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn for_clauses_print_back() {
+        for input in [
+            "for x in a b; do c; done",
+            "for x; do c; done",
+            "for x in; do c; done",
+            "for x in a; do for y in b; do c; done; done",
+            "for x in a; do b & done >f",
+            "for x in $(ls) \"a b\" ${y}; do echo $x; done | cat && d",
+            // Rule 5 asks for a name, a reserved word is one; rule 6 only
+            // applies to the third word.
+            "for do in a; do b; done",
+            "for x in in do; do b; done",
+        ] {
+            assert_eq!(reprint(input), input);
+        }
+        assert_eq!(reprint("for x do c; done"), "for x; do c; done");
+
+        for (lines, printed) in [
+            (
+                &["for x\n", "in a b\n", "do\n", "  c\n", "done\n"][..],
+                "for x in a b; do c; done",
+            ),
+            (&["for x\n", "do c\n", "done\n"][..], "for x; do c; done"),
+        ] {
+            let lines: Vec<String> = lines.iter().map(ToString::to_string).collect();
+            let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+            let program = SyntaxTree::program(&tok).unwrap();
+            assert!(tok.next_is_eof(), "{printed}");
+            assert_eq!(program.child.commands[0].to_string(), printed);
+        }
+    }
+
+    /// The `for` clause `input` is.
+    fn for_clause(input: &str) -> ForClause<'_> {
+        let tok = UnbufferedTokenizer::new(input);
+        let Some(Command::Compound {
+            command: CompoundCommand::For(clause),
+            ..
+        }) = SyntaxTree::command(&tok)
+        else {
+            panic!("{input}: a for expected");
+        };
+        assert!(tok.next_is_eof(), "{input}: not all of it");
+        clause
+    }
+
+    #[test]
+    fn for_clause_word_lists() {
+        let clause = for_clause("for x; do a; b; done");
+        assert_eq!(clause.name, "x");
+        assert!(clause.wordlist.is_none());
+        assert_eq!(clause.body.to_string(), "a; b");
+
+        let clause = for_clause("for x in; do a; done");
+        assert!(clause.wordlist.is_some_and(|words| words.is_empty()));
+
+        let clause = for_clause("for città in a 'b c'; do a; done");
+        assert_eq!(clause.name, "città");
+        let words: Vec<String> = clause
+            .wordlist
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(words, ["a", "'b c'"]);
+    }
+
+    #[test]
+    fn bad_for_clauses() {
+        for input in [
+            "for; do a; done",
+            "for 1x in a; do b; done",
+            "for 'x' in a; do b; done",
+            "for a\"b\" in c; do d; done",
+            "for x in a; do done",
+            "for x in a & do b; done",
+            // `do b` are words of the list: the `do` is missing.
+            "for x in a do b; done",
+            "for x in a; b; done",
+            "for x in a; do b",
+            "for x in a; do b; done done",
+        ] {
+            assert!(!parses(input), "{input}");
+        }
+    }
+
     /// The whole input is one program.
     fn parses(input: &str) -> bool {
         let lines = vec![format!("{input}\n")];
@@ -2612,6 +2795,7 @@ mod tests {
             "X=1 if",
             "iffy",
             "fi'x'",
+            "echo for in do done",
         ] {
             let tok = UnbufferedTokenizer::new(input);
             assert!(
