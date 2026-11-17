@@ -1,11 +1,18 @@
 use std::{
-    collections::BTreeMap,
-    env, fmt, io,
+    collections::{BTreeMap, BTreeSet},
+    env, fmt, fs, io,
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, RawFd},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::fs::MetadataExt,
+    },
+    path::PathBuf,
 };
 
-use crate::nix::{self, Pid, SigHandler, Signal};
+use crate::{
+    nix::{self, Pid, SigHandler, Signal},
+    syntax::{Parameter, Special},
+};
 
 /// The value of a shell variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +73,57 @@ pub struct ReadonlyError {
     pub name: String,
 }
 
+/// An option of `set` (and of the shell's invocation). The order is the one of
+/// the letters, for `$-`; the last three have only a long name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShellOption {
+    /// `-a`: export every variable that is assigned.
+    Allexport,
+    /// `-b`: report background jobs as soon as they change.
+    Notify,
+    /// `-C`: `>` doesn't overwrite an existing file.
+    Noclobber,
+    /// `-e`: exit when a command fails.
+    Errexit,
+    /// `-f`: no pathname expansion.
+    Noglob,
+    /// `-h`: remember where utilities are when functions are defined.
+    Hashall,
+    /// `-m`: job control. On in an interactive shell.
+    Monitor,
+    /// `-n`: read commands without running them.
+    Noexec,
+    /// `-u`: expanding an unset parameter is an error.
+    Nounset,
+    /// `-v`: write the input to stderr as it is read.
+    Verbose,
+    /// `-x`: write each command to stderr before running it.
+    Xtrace,
+    /// `-o ignoreeof`: an interactive shell doesn't exit at EOF.
+    Ignoreeof,
+    /// `-o nolog`: no function definitions in the history.
+    Nolog,
+    /// `-o vi`: vi-style line editing.
+    Vi,
+}
+
+/// What a trap is set on (`trap action condition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TrapCondition {
+    /// `EXIT` (`0`): when the shell exits.
+    Exit,
+    Signal(Signal),
+}
+
+/// What a trap does. A condition without a trap has the default action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrapAction {
+    /// `trap '' condition`.
+    Ignore,
+    /// The command to run, with `eval`.
+    Command(String),
+}
+
 #[derive(Debug)]
 pub struct Shell {
     pub pgid: Pid,
@@ -76,6 +134,33 @@ pub struct Shell {
     /// not interactive or they could not be read.
     pub tmodes: Option<libc::termios>,
     pub env: ShellEnv,
+    /// `$0`: how the shell was called, the script's path, or the name given
+    /// after `-c string`.
+    pub name: String,
+    /// `$1`, `$2`... (`$#`, `$@`, `$*`): the arguments of the shell, then the
+    /// ones of `set`.
+    pub positional: Vec<String>,
+    /// `$?`: the exit status of the most recent pipeline.
+    pub last_status: i32,
+    /// `$$`: the pid of the shell. A subshell keeps the one of its parent.
+    pub pid: Pid,
+    /// `$!`: the pid of the most recent background command, if any.
+    pub last_async: Option<Pid>,
+    /// The options that are on (`$-`, `set -o`). Only `Monitor` can be on for
+    /// now, in an interactive shell: the others have no behavior yet, so
+    /// turning them on is refused.
+    pub options: BTreeSet<ShellOption>,
+    /// The aliases (§2.3.1), by name.
+    // TODO: filled by `alias`, used by the tokenizer (BUILTINS.md Phase 3).
+    pub aliases: BTreeMap<String, String>,
+    /// The traps that are set; a missing condition has its default action.
+    // TODO: set by `trap`; a subshell resets the ones that are not ignored
+    // (BUILTINS.md Phase 3).
+    pub traps: BTreeMap<TrapCondition, TrapAction>,
+    /// Where utilities were found in `PATH`, by name.
+    // TODO: filled when a utility is looked up and by `hash`, cleared when
+    // `PATH` changes (BUILTINS.md `hash`).
+    pub hashed: BTreeMap<String, PathBuf>,
 }
 
 /// Variables set for the duration of a command (the `VAR=x` prefixes of a
@@ -116,6 +201,83 @@ impl Value {
         match self {
             Self::Unset => None,
             Self::Set(value) => Some(value),
+        }
+    }
+}
+
+impl ShellOption {
+    /// Every option, in the order of `$-`.
+    pub const ALL: [Self; 14] = [
+        Self::Allexport,
+        Self::Notify,
+        Self::Noclobber,
+        Self::Errexit,
+        Self::Noglob,
+        Self::Hashall,
+        Self::Monitor,
+        Self::Noexec,
+        Self::Nounset,
+        Self::Verbose,
+        Self::Xtrace,
+        Self::Ignoreeof,
+        Self::Nolog,
+        Self::Vi,
+    ];
+
+    /// The letter of `set -x`, if the option has one.
+    pub fn letter(self) -> Option<char> {
+        Some(match self {
+            Self::Allexport => 'a',
+            Self::Notify => 'b',
+            Self::Noclobber => 'C',
+            Self::Errexit => 'e',
+            Self::Noglob => 'f',
+            Self::Hashall => 'h',
+            Self::Monitor => 'm',
+            Self::Noexec => 'n',
+            Self::Nounset => 'u',
+            Self::Verbose => 'v',
+            Self::Xtrace => 'x',
+            Self::Ignoreeof | Self::Nolog | Self::Vi => return None,
+        })
+    }
+
+    /// The name of `set -o name`. `-h` has none in POSIX: `hashall` is bash's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Allexport => "allexport",
+            Self::Notify => "notify",
+            Self::Noclobber => "noclobber",
+            Self::Errexit => "errexit",
+            Self::Noglob => "noglob",
+            Self::Hashall => "hashall",
+            Self::Monitor => "monitor",
+            Self::Noexec => "noexec",
+            Self::Nounset => "nounset",
+            Self::Verbose => "verbose",
+            Self::Xtrace => "xtrace",
+            Self::Ignoreeof => "ignoreeof",
+            Self::Nolog => "nolog",
+            Self::Vi => "vi",
+        }
+    }
+
+    pub fn from_letter(letter: char) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|opt| opt.letter() == Some(letter))
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|opt| opt.name() == name)
+    }
+
+    /// How the option is written on a command line: `-e`, or `-o ignoreeof`.
+    pub fn flag(self, on: bool) -> String {
+        let sign = if on { '-' } else { '+' };
+        match self.letter() {
+            Some(letter) => format!("{sign}{letter}"),
+            None => format!("{sign}o {}", self.name()),
         }
     }
 }
@@ -226,6 +388,15 @@ impl ShellEnv {
             .filter_map(|(name, var)| Some((name, var.value.as_str()?)))
     }
 
+    /// What joins the parameters in `$*`: the first character of `IFS`, a
+    /// space when it is unset, nothing when it is empty (§2.5.2).
+    pub fn ifs_separator(&self) -> String {
+        match self.get("IFS") {
+            None => " ".to_string(),
+            Some(ifs) => ifs.chars().next().map(String::from).unwrap_or_default(),
+        }
+    }
+
     /// The variable, created unset and without attributes when missing. The
     /// caller gives it a value or an attribute right away.
     fn entry(&mut self, name: &str) -> &mut Var {
@@ -273,26 +444,108 @@ impl Shell {
         Ok(guard)
     }
 
-    /// Make sure the shell is running interactively as the foreground job
-    /// before proceeding.
-    pub fn new() -> Self {
+    /// The shell's state at startup. `name` is `$0` and `positional` the
+    /// arguments. It is interactive when it reads commands from a terminal
+    /// (`may_be_interactive`: not with `-c` or a script); then it makes sure it
+    /// runs as the foreground job before going on.
+    pub fn new(may_be_interactive: bool, name: String, positional: Vec<String>) -> Self {
         // See if we are running interactively.
         let terminal = io::stdin().as_raw_fd();
-        let is_interactive = nix::isatty(terminal);
+        let is_interactive = may_be_interactive && nix::isatty(terminal);
 
-        let mut shell = Self {
-            pgid: nix::getpgrp(),
-            terminal,
-            is_interactive,
-            tmodes: None,
-            env: ShellEnv::from_env(),
-        };
+        let mut shell = Self::with_env(ShellEnv::from_env(), name, positional);
+        shell.terminal = terminal;
+        shell.is_interactive = is_interactive;
+        shell.init_variables();
 
         if is_interactive {
+            shell.options.insert(ShellOption::Monitor);
             shell.init_job_control();
         }
 
         shell
+    }
+
+    /// A non-interactive shell with these variables, before any startup work
+    /// (no startup variables, no terminal): also for tests.
+    pub fn with_env(env: ShellEnv, name: String, positional: Vec<String>) -> Self {
+        Self {
+            pgid: nix::getpgrp(),
+            terminal: libc::STDIN_FILENO,
+            is_interactive: false,
+            tmodes: None,
+            env,
+            name,
+            positional,
+            last_status: 0,
+            pid: Pid::this(),
+            last_async: None,
+            options: BTreeSet::new(),
+            aliases: BTreeMap::new(),
+            traps: BTreeMap::new(),
+            hashed: BTreeMap::new(),
+        }
+    }
+
+    /// The variables the shell sets when it starts (sh, "Shell Variables").
+    /// None of them is readonly yet, so the assignments can't fail.
+    fn init_variables(&mut self) {
+        // The environment's IFS is ignored, like bash and dash do (and POSIX
+        // Issue 8): a script can't be fooled into splitting differently.
+        let _ = self.env.assign("IFS", " \t\n");
+        let _ = self.env.assign("PPID", Pid::parent().as_raw().to_string());
+        let _ = self.env.assign("OPTIND", "1");
+
+        // PWD: kept when it names the working directory the way `cd` would
+        // have set it, otherwise the real path.
+        let inherited = self.env.get("PWD").filter(|pwd| names_cwd(pwd)).is_some();
+        if !inherited && let Ok(cwd) = env::current_dir() {
+            let _ = self.env.assign("PWD", cwd.to_string_lossy());
+        }
+    }
+
+    /// The value of a parameter (§2.5), `None` when it is unset: a variable
+    /// without a value, a position past `$#`, `$@` and `$*` without positional
+    /// parameters, `$!` before any background command.
+    pub fn parameter(&self, param: &Parameter) -> Option<String> {
+        let positional = &self.positional;
+
+        match *param {
+            Parameter::Name(name) => self.env.get(name).map(String::from),
+            Parameter::Positional(n) => positional.get(n - 1).cloned(),
+            Parameter::Special(special) => match special {
+                Special::At => (!positional.is_empty()).then(|| positional.join(" ")),
+                Special::Star => {
+                    (!positional.is_empty()).then(|| positional.join(&self.env.ifs_separator()))
+                }
+                Special::Hash => Some(positional.len().to_string()),
+                Special::Question => Some(self.last_status.to_string()),
+                Special::Hyphen => Some(self.option_flags()),
+                Special::Dollar => Some(self.pid.as_raw().to_string()),
+                Special::Bang => self.last_async.map(|pid| pid.as_raw().to_string()),
+                Special::Zero => Some(self.name.clone()),
+            },
+        }
+    }
+
+    /// `$-`: the letters of the options that are on, `i` first when
+    /// interactive.
+    pub fn option_flags(&self) -> String {
+        let interactive = self.is_interactive.then_some('i');
+        let letters = self.options.iter().filter_map(|opt| opt.letter());
+
+        interactive.into_iter().chain(letters).collect()
+    }
+
+    /// Turn an option on or off (`set -e`, `set +e`, `rush -e`). None of them
+    /// has a behavior yet, so only a change that leaves it as it is succeeds
+    /// (`set +e`, `set -m` in an interactive shell): a script must not run on
+    /// believing `-e` or `-u` is on. The error is the message.
+    pub fn set_option(&mut self, opt: ShellOption, on: bool) -> Result<(), String> {
+        if self.options.contains(&opt) == on {
+            return Ok(());
+        }
+        Err(format!("{}: not implemented yet", opt.flag(on)))
     }
 
     /// The fds the shell opened for itself (the copy of the terminal). They are
@@ -403,6 +656,19 @@ impl fmt::Display for ReadonlyError {
     }
 }
 
+/// `pwd` is an absolute path to the working directory without `.` or `..`
+/// components: what `PWD` may be at startup (sh, "Shell Variables").
+fn names_cwd(pwd: &str) -> bool {
+    if !pwd.starts_with('/') || pwd.split('/').any(|c| c == "." || c == "..") {
+        return false;
+    }
+
+    match (fs::metadata(pwd), fs::metadata(".")) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// Quote a value so that the shell reads it back as it is: between single
 /// quotes, each `'` written as `'\''`. For the listings of `set`, `export -p`
 /// and `readonly -p`.
@@ -434,13 +700,47 @@ mod tests {
     }
 
     fn shell(env: ShellEnv) -> Shell {
-        Shell {
-            pgid: Pid::from_raw(0),
-            terminal: libc::STDIN_FILENO,
-            is_interactive: false,
-            tmodes: None,
-            env,
+        Shell::with_env(env, "rush".into(), Vec::new())
+    }
+
+    #[test]
+    fn option_letters_and_names_round_trip() {
+        for opt in ShellOption::ALL {
+            assert_eq!(ShellOption::from_name(opt.name()), Some(opt));
+            if let Some(letter) = opt.letter() {
+                assert_eq!(ShellOption::from_letter(letter), Some(opt));
+            }
         }
+        assert_eq!(ShellOption::from_letter('i'), None);
+        assert_eq!(ShellOption::Errexit.flag(false), "+e");
+        assert_eq!(ShellOption::Vi.flag(true), "-o vi");
+    }
+
+    #[test]
+    fn option_flags_in_the_order_of_the_letters() {
+        let mut shell = shell(ShellEnv::default());
+        assert_eq!(shell.option_flags(), "");
+
+        shell
+            .options
+            .extend([ShellOption::Xtrace, ShellOption::Errexit, ShellOption::Vi]);
+        shell.is_interactive = true;
+        assert_eq!(shell.option_flags(), "iex");
+    }
+
+    #[test]
+    fn pwd_must_name_the_cwd_without_dots() {
+        let cwd = env::current_dir().unwrap();
+        let cwd = cwd.to_str().unwrap();
+
+        assert!(names_cwd(cwd));
+        assert!(!names_cwd(&format!("{cwd}/.")));
+        assert!(!names_cwd(&format!(
+            "{cwd}/../{}",
+            cwd.rsplit('/').next().unwrap()
+        )));
+        assert!(!names_cwd("relative"));
+        assert!(!names_cwd("/"));
     }
 
     #[test]

@@ -90,7 +90,12 @@ Problems with this setup, found by reading the code:
   - A readonly variable is a *variable assignment error* (§2.8.1, `Executor::assignment_error`): in an assignment, in the prefix of a special or regular built-in and in the prefix of a program (§2.9.1: the program doesn't run). A non-interactive shell exits with 1, an interactive one fails with 1; for a program in a pipeline, only that command fails. `cd` with a readonly `PWD`/`OLDPWD` fails after changing directory.
   - `shell::quote` formats a value for reinput (`'...'` with `'\''`).
   - The `export`, `readonly` and `unset` built-ins use it; the assignment errors are tested end to end in `tests/builtins/readonly.rs`.
-- [ ] **0.9 Shell state that's missing:** positional parameters and `$#`/`$@`/`$*`; a last-status field for `$?` (the executor currently only passes it to the prompt); `$$`, `$!`; option flags (`set -e -u -x -C -f -n -v -a -b -m`, `-o name`); an alias table; a trap table; and a hash table. Also set `PWD` at startup (canonical cwd), which the `sh` spec requires.
+- [x] **0.9 Shell state.** `Shell` (`shell.rs`) holds what the special parameters read, and the executor expands them (`Executor::parameter`, `Parameter` in `syntax.rs`):
+  - `name` (`$0`), `positional` (`$1`…, `$#`, `$@`, `$*`), `last_status` (`$?`, set after each pipeline, 0 after `&`, 2 after a syntax error; a command without a command name gets the status of its last command substitution), `pid` (`$$`, kept by subshells), `last_async` (`$!`).
+  - `options: BTreeSet<ShellOption>` (`$-`, `set -o`/`+o`): **state only**. `Monitor` is on when interactive; turning any option on or off (`set -e`, `rush -e`) is refused with "not implemented yet" (status 1, nothing changes), so a script never runs believing `-e` is on. Asking for what is already so (`set +e`) works.
+  - `aliases`, `traps` (`TrapCondition` → `TrapAction`) and `hashed`: **empty tables**, for `alias`/`unalias`, `trap` and `hash`.
+  - At startup: `PWD` kept from the environment only when it is absolute, without `.`/`..`, and names the working directory, otherwise the real path; `PPID`; `OPTIND=1`; `IFS` set to space, tab, newline (the environment's is ignored).
+  - The shell's arguments (`invocation.rs`): `rush script args`, `rush -c string [name [args]]`, `rush -s args`, and the option letters. The exit status is `$?` at the end of the input.
 
 ### Phase 1: built-ins that need no new grammar
 `:` `true` `false` `pwd` `cd` `exit` `export` `readonly` `unset` `set` (listing + option flags) `umask` `ulimit` `times` `type` `command` `hash` `eval` `exec`
@@ -112,8 +117,7 @@ Still to do for job control:
 ### Phase 3: built-ins that need language features
 | Built-in | Needs |
 |---|---|
-| `shift`, `set -- args` | positional parameters |
-| `getopts` | positional parameters, `OPTIND`/`OPTARG` |
+| `getopts` | `OPTARG`, its own option parser (the positional parameters and `OPTIND=1` exist) |
 | `read` | IFS field splitting (§2.6.5). Its stdin is already unbuffered (`nix::FdReader`, 0.5), so it doesn't swallow the script lines after its own, as long as it reads byte by byte up to the newline. |
 | `.` (dot) | executing a file as a program in the current env (can return `Status::Eval(contents)`; `return` must stop it) |
 | `alias`, `unalias` | alias substitution in the tokenizer (§2.3.1), including "value ending in a blank ⇒ check the next word too" |
@@ -177,7 +181,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 
 #### `exit [n]`
 - [x] `exit n` ends the shell with status `n`
-- [ ] no `n` → status of the last command (`$?`), not 0
+- [x] no `n` → status of the last command (`$?`), not 0
 - [ ] unwind through a control-flow result instead of `std::process::exit`, flushing stdout
 - [x] in a subshell, exit only that subshell (`(exit 3)`: the subshell is a forked child)
 - [x] in a pipeline element, exit only that element (`exit 3 | cat` and `cat | exit 3` don't kill the shell)
@@ -209,9 +213,10 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] in a trap action, the "last command" is the one before the trap
 
 #### `set`
-- [ ] no arguments: print every shell variable as `name='value'`, sorted (locale collation; byte order is fine), quoted for reinput
-- [ ] `set -- a b c`: replace the positional parameters, update `$#`; a bare `set --` clears them
-- [ ] `set a b c` (first argument isn't an option) → set the positional parameters
+- [x] no arguments: print every shell variable as `name='value'`, sorted (locale collation; byte order is fine), quoted for reinput
+- [x] `set -- a b c`: replace the positional parameters, update `$#`; a bare `set --` clears them (a bare `-` ends the options too)
+- [x] `set a b c` (first argument isn't an option) → set the positional parameters
+- [x] parsed by hand (clap has no `+x`): `-x`/`+x` grouped, `-o name`/`+o name`; changing an option is refused for now ("not implemented yet", status 1), the flags below give each one its behavior
 - [ ] option flags in `-x`/`+x` form, groupable (`-eu`):
   - [ ] `-a` allexport: assignments get the export attribute
   - [ ] `-b` notify: report finished background jobs right away (`[%d]%c %s%s\n`)
@@ -225,13 +230,13 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
   - [ ] `-v` verbose: echo input lines to stderr as they're read
   - [ ] `-x` xtrace: print each expanded command to stderr before running it (`+ cmd args`)
 - [ ] `-o name` / `+o name`: allexport errexit ignoreeof monitor noclobber noglob noexec nolog notify nounset verbose vi xtrace (`ignoreeof`: Ctrl-D doesn't exit an interactive shell)
-- [ ] `set -o`: print the current settings (any format); `set +o`: print them as `set -o x`/`set +o x` commands
-- [ ] invalid option → >0 (special-built-in error)
+- [x] `set -o`: print the current settings (any format); `set +o`: print them as `set -o x`/`set +o x` commands
+- [x] invalid option → >0 (special-built-in error, status 2)
 
 #### `shift [n]`
-- [ ] needs positional parameters
-- [ ] `n` defaults to 1; `$1 ← $(1+n)` …; update `$#`; `n = 0` changes nothing
-- [ ] `n` > `$#` or invalid → error, status ≠ 0 (a non-interactive shell may exit)
+- [x] needs positional parameters
+- [x] `n` defaults to 1; `$1 ← $(1+n)` …; update `$#`; `n = 0` changes nothing
+- [x] `n` > `$#` or invalid → error, status ≠ 0 (a special built-in error: a non-interactive shell exits, like dash)
 
 #### `times`
 - [ ] call `times(2)` (add it to `nix.rs`) and print `"%dm%fs %dm%fs\n%dm%fs %dm%fs\n"`: shell user/sys, then children user/sys (divide by `sysconf(_SC_CLK_TCK)`)
@@ -318,7 +323,7 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [ ] an interruption (SIGINT) should stop the and-or list around `fg`, like for a foreground job
 
 #### `getopts optstring name [arg...]`
-- [ ] needs positional parameters; `OPTIND` initialized to 1 at shell startup, and OPTIND/OPTARG are not exported
+- [x] positional parameters exist; `OPTIND` is initialized to 1 at shell startup, not exported (OPTARG must not be either)
 - [ ] parse `$@` (or the `arg`s): grouped options, the option argument attached or as the next word, `--` ends the options
 - [ ] found option → `name=c`, status 0; an option that takes an argument sets OPTARG, otherwise OPTARG is unset
 - [ ] unknown option → `name=?`; with a leading `:` OPTARG=c and nothing printed, otherwise OPTARG unset and a diagnostic printed

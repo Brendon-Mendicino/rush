@@ -11,11 +11,16 @@ fn exits_the_shell_with_the_status() {
 }
 
 #[test]
-fn without_a_status_exits_with_0() {
+fn without_a_status_exits_with_the_last_one() {
     let output = run_shell("exit\necho after\n");
-
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "");
+
+    let output = run_shell("false\nexit\necho after\n");
+    assert_eq!(output.status.code(), Some(1));
+
+    let output = run_shell("(exit 7); exit\n");
+    assert_eq!(output.status.code(), Some(7));
 }
 
 #[test]

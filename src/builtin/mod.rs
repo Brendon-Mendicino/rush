@@ -505,13 +505,7 @@ mod tests {
 
     /// Build the `Builtin` like the executor does, and run `f` with it.
     fn run_builtin(f: FnBuiltin, args: &[&str]) -> Output {
-        let mut shell = Shell {
-            pgid: nix::getpgrp(),
-            terminal: 0,
-            is_interactive: false,
-            tmodes: None,
-            env: ShellEnv::default(),
-        };
+        let mut shell = Shell::with_env(ShellEnv::default(), "rush".into(), Vec::new());
         // TODO: for a future plan make the stdout redirect into a pipe so the shell can control
         // how to display it to the user (when in interactive mode)
         let mut stdin = io::empty();

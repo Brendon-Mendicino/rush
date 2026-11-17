@@ -338,3 +338,11 @@ fn ctrl_z_in_an_if_stops_only_the_command() {
 
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
+
+#[test]
+fn hyphen_shows_interactive_and_job_control() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("echo \"[$-]\"\n");
+    sh.stdout.expect("[im]\r\n");
+}

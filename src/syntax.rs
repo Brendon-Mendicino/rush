@@ -54,14 +54,79 @@ pub enum WordPart<'a> {
     SingleQuoted(Vec<Token<'a>>),
     /// Between double quotes: `DqText`, `Param`, `CmdSub` and `Backquoted`.
     DoubleQuoted(Vec<WordPart<'a>>),
-    /// `$name`, `${...}`, `$1`, `$?`...
-    Param(Token<'a>),
+    /// `$name`, `$1`, `$?`, `${name}`, `${x:-word}`...: parsed with the word,
+    /// so a `${...}` that isn't one is a syntax error, also where it would
+    /// never run.
+    Param(ParamExpansion<'a>),
     CmdSub(CmdSub<'a>),
     /// `` `...` ``, the token with its backquotes.
     Backquoted(Token<'a>),
 }
 
-/// A word: its parts, at least one.
+/// A parameter (§2.5): what `$name`, `$1`, `${10}`, `$?`... name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parameter<'a> {
+    /// A variable.
+    Name(&'a str),
+    /// `$1`, `${10}`: from 1.
+    Positional(usize),
+    Special(Special),
+}
+
+/// The special parameters (§2.5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Special {
+    /// `@`: the positional parameters, a field each.
+    At,
+    /// `*`: the positional parameters, joined.
+    Star,
+    /// `#`: how many positional parameters.
+    Hash,
+    /// `?`: the status of the most recent pipeline.
+    Question,
+    /// `-`: the option flags.
+    Hyphen,
+    /// `$`: the pid of the shell.
+    Dollar,
+    /// `!`: the pid of the most recent background command.
+    Bang,
+    /// `0`: the name of the shell or of the script.
+    Zero,
+}
+
+/// A parameter expansion (§2.6.2): `$x`, or `${...}` with what is inside.
+#[derive(Debug, Clone)]
+pub struct ParamExpansion<'a> {
+    pub param: Parameter<'a>,
+    /// Written `${x}` rather than `$x`, for printing it back.
+    pub braced: bool,
+    /// What to do with the value; `None` is the value itself.
+    pub op: Option<ParamOp<'a>>,
+}
+
+/// The operations of `${...}` (§2.6.2). `colon` (`${x:-w}` rather than
+/// `${x-w}`): a null value counts as unset. The words are expanded only when
+/// they are used.
+#[derive(Debug, Clone)]
+pub enum ParamOp<'a> {
+    /// `${#x}`: the length of the value.
+    Length,
+    /// `${x-word}`: `word` when `x` is unset.
+    Default { colon: bool, word: Word<'a> },
+    /// `${x=word}`: the same, and `x` is assigned `word`.
+    Assign { colon: bool, word: Word<'a> },
+    /// `${x?word}`: an error, with `word` as its message, when `x` is unset.
+    Error { colon: bool, word: Word<'a> },
+    /// `${x+word}`: `word` when `x` is set, nothing otherwise.
+    Alternative { colon: bool, word: Word<'a> },
+    /// `${x%pattern}`, `${x%%pattern}`: the value without the smallest, or the
+    /// largest, suffix the pattern matches.
+    RemoveSuffix { largest: bool, pattern: Word<'a> },
+    /// `${x#pattern}`, `${x##pattern}`: the same with a prefix.
+    RemovePrefix { largest: bool, pattern: Word<'a> },
+}
+
+/// A word: its parts. At least one, except the word of a `${x:-}`.
 #[derive(Debug, Clone)]
 pub struct Word<'a> {
     pub parts: Vec<WordPart<'a>>,
@@ -281,6 +346,105 @@ impl ReservedWord {
     }
 }
 
+impl<'a> Parameter<'a> {
+    /// The parameter named `text`, the name already lexed (`x`, `10`, `?`):
+    /// `None` when it is none, or for digits too big to be a position.
+    pub fn from_name(text: &'a str) -> Option<Self> {
+        if let Some(special) = Special::from_name(text) {
+            return Some(Self::Special(special));
+        }
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            return match text.parse().ok()? {
+                0 => Some(Self::Special(Special::Zero)),
+                n => Some(Self::Positional(n)),
+            };
+        }
+        is_valid_name(text).then_some(Self::Name(text))
+    }
+}
+
+impl Special {
+    const ALL: [Self; 8] = [
+        Self::At,
+        Self::Star,
+        Self::Hash,
+        Self::Question,
+        Self::Hyphen,
+        Self::Dollar,
+        Self::Bang,
+        Self::Zero,
+    ];
+
+    /// How it is written after `$`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::At => "@",
+            Self::Star => "*",
+            Self::Hash => "#",
+            Self::Question => "?",
+            Self::Hyphen => "-",
+            Self::Dollar => "$",
+            Self::Bang => "!",
+            Self::Zero => "0",
+        }
+    }
+
+    fn from_name(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|special| special.name() == text)
+    }
+}
+
+impl<'a> ParamOp<'a> {
+    /// The operation of the operator `op` (`:-`, `%%`...), with its word.
+    fn new(op: &str, word: Word<'a>) -> Option<Self> {
+        let (colon, op) = match op.strip_prefix(':') {
+            Some(op) => (true, op),
+            None => (false, op),
+        };
+
+        Some(match (op, colon) {
+            ("-", _) => Self::Default { colon, word },
+            ("=", _) => Self::Assign { colon, word },
+            ("?", _) => Self::Error { colon, word },
+            ("+", _) => Self::Alternative { colon, word },
+            ("%", false) => Self::RemoveSuffix {
+                largest: false,
+                pattern: word,
+            },
+            ("%%", false) => Self::RemoveSuffix {
+                largest: true,
+                pattern: word,
+            },
+            ("#", false) => Self::RemovePrefix {
+                largest: false,
+                pattern: word,
+            },
+            ("##", false) => Self::RemovePrefix {
+                largest: true,
+                pattern: word,
+            },
+            _ => return None,
+        })
+    }
+
+    /// The operator as written, and its word; `None` for the length.
+    fn operator(&self) -> Option<(&'static str, &Word<'a>)> {
+        let pick = |flag: bool, with: &'static str, without: &'static str| {
+            if flag { with } else { without }
+        };
+
+        Some(match self {
+            Self::Length => return None,
+            Self::Default { colon, word } => (pick(*colon, ":-", "-"), word),
+            Self::Assign { colon, word } => (pick(*colon, ":=", "="), word),
+            Self::Error { colon, word } => (pick(*colon, ":?", "?"), word),
+            Self::Alternative { colon, word } => (pick(*colon, ":+", "+"), word),
+            Self::RemoveSuffix { largest, pattern } => (pick(*largest, "%%", "%"), pattern),
+            Self::RemovePrefix { largest, pattern } => (pick(*largest, "##", "#"), pattern),
+        })
+    }
+}
+
 /// The reserved word `word` is, if any: one unquoted literal with exactly its
 /// text. `'if'`, `\if` and `if'x'` are ordinary words.
 fn reserved(word: &Word<'_>) -> Option<ReservedWord> {
@@ -322,9 +486,8 @@ impl fmt::Display for AssignmentWord<'_> {
 impl fmt::Display for WordPart<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WordPart::Literal(token) | WordPart::Param(token) | WordPart::Backquoted(token) => {
-                f.write_str(token.value)
-            }
+            WordPart::Param(param) => write!(f, "{param}"),
+            WordPart::Literal(token) | WordPart::Backquoted(token) => f.write_str(token.value),
             WordPart::SingleQuoted(texts) => {
                 f.write_str("'")?;
                 for text in texts {
@@ -340,6 +503,31 @@ impl fmt::Display for WordPart<'_> {
                 f.write_str("\"")
             }
             WordPart::CmdSub(cmd) => write!(f, "{cmd}"),
+        }
+    }
+}
+
+impl fmt::Display for Parameter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Parameter::Name(name) => f.write_str(name),
+            Parameter::Positional(n) => write!(f, "{n}"),
+            Parameter::Special(special) => f.write_str(special.name()),
+        }
+    }
+}
+
+impl fmt::Display for ParamExpansion<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let param = &self.param;
+        match &self.op {
+            _ if !self.braced => write!(f, "${param}"),
+            None => write!(f, "${{{param}}}"),
+            Some(ParamOp::Length) => write!(f, "${{#{param}}}"),
+            Some(op) => {
+                let (operator, word) = op.operator().expect("not the length");
+                write!(f, "${{{param}{operator}{word}}}")
+            }
         }
     }
 }
@@ -1796,18 +1984,14 @@ impl SyntaxTree {
         let part = match token.t_type {
             TokenType::Literal => WordPart::Literal(sub_tok.next_token()?),
             TokenType::IoNumber if !first => WordPart::Literal(sub_tok.next_token()?),
-            TokenType::Param => WordPart::Param(sub_tok.next_token()?),
+            TokenType::Param | TokenType::ParamOpen => {
+                WordPart::Param(Self::param_expansion(&sub_tok, Mode::Normal)?)
+            }
             TokenType::Backquoted => WordPart::Backquoted(sub_tok.next_token()?),
             TokenType::Andopen => WordPart::CmdSub(Self::cmdsub(&sub_tok)?),
             TokenType::SQuote => {
                 sub_tok.next_token()?;
-                let texts = std::iter::from_fn(|| {
-                    sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SqText)
-                })
-                .collect();
-                // An unterminated quote is a syntax error.
-                sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SQuote)?;
-                WordPart::SingleQuoted(texts)
+                WordPart::SingleQuoted(Self::single_quoted(&sub_tok)?)
             }
             TokenType::DQuote => {
                 sub_tok.next_token()?;
@@ -1818,6 +2002,126 @@ impl SyntaxTree {
 
         tok.merge(sub_tok);
         Some(part)
+    }
+
+    /// The text between single quotes, after the opening `'`, up to and with
+    /// the closing one: none for `''`, a token per line when it spans lines.
+    /// `None` when the closing quote is missing.
+    fn single_quoted<'a, T>(tok: &T) -> Option<Vec<Token<'a>>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sub_tok = tok.clone();
+
+        let texts =
+            std::iter::from_fn(|| sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SqText))
+                .collect();
+        sub_tok.next_if_type_in(Mode::SingleQuoted, TokenType::SQuote)?;
+
+        tok.merge(sub_tok);
+        Some(texts)
+    }
+
+    /// A parameter expansion (§2.6.2), read in `mode` (the context: outside or
+    /// inside double quotes, or in the word of another `${...}`):
+    ///
+    /// ```
+    /// param_expansion ::= PARAM                                 $x $1 $?
+    ///                   | '${' PARAM_NAME '}'
+    ///                   | '${' '#' PARAM_NAME '}'                the length
+    ///                   | '${' PARAM_NAME PARAM_OP param_word    up to the '}'
+    ///                   ;
+    /// ```
+    ///
+    /// `None` (a syntax error) for a `${` that doesn't name a parameter
+    /// (`${}`, `${a b}`), has no `}`, or a bad operator.
+    fn param_expansion<'a, T>(tok: &T, mode: Mode) -> Option<ParamExpansion<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let sub_tok = tok.clone();
+
+        if let Some(token) = sub_tok.next_if_type_in(mode, TokenType::Param) {
+            let param = Parameter::from_name(token.value.strip_prefix('$')?)?;
+            tok.merge(sub_tok);
+            return Some(ParamExpansion {
+                param,
+                braced: false,
+                op: None,
+            });
+        }
+
+        sub_tok.next_if_type_in(mode, TokenType::ParamOpen)?;
+        let length = sub_tok
+            .next_if_type_in(Mode::ParamName, TokenType::ParamHash)
+            .is_some();
+        let name = sub_tok.next_if_type_in(Mode::ParamName, TokenType::ParamName)?;
+        let param = Parameter::from_name(name.value)?;
+
+        let next = sub_tok.next_token_in(Mode::ParamOp)?;
+        let op = match next.t_type {
+            TokenType::CloseBrace if length => Some(ParamOp::Length),
+            TokenType::CloseBrace => None,
+            TokenType::ParamOp if !length => {
+                let quoted = matches!(mode, Mode::DoubleQuoted | Mode::ParamWordDq);
+                let word = Self::param_word(&sub_tok, quoted)?;
+                Some(ParamOp::new(next.value, word)?)
+            }
+            _ => return None,
+        };
+
+        tok.merge(sub_tok);
+        Some(ParamExpansion {
+            param,
+            braced: true,
+            op,
+        })
+    }
+
+    /// The word after the operator of a `${...}`, up to and with its `}`.
+    /// `quoted` inside double quotes, where `'` is an ordinary character. It
+    /// can be empty (`${x:-}`).
+    fn param_word<'a, T>(tok: &T, quoted: bool) -> Option<Word<'a>>
+    where
+        T: Tokenizer<'a>,
+    {
+        let mode = if quoted {
+            Mode::ParamWordDq
+        } else {
+            Mode::ParamWord
+        };
+        let sub_tok = tok.clone();
+        let mut parts = Vec::new();
+
+        loop {
+            let token = sub_tok.peek_in(mode)?;
+            let part = match token.t_type {
+                TokenType::CloseBrace => {
+                    sub_tok.next_token_in(mode)?;
+                    tok.merge(sub_tok);
+                    return Some(Word { parts });
+                }
+                TokenType::Literal | TokenType::DqText => {
+                    WordPart::Literal(sub_tok.next_token_in(mode)?)
+                }
+                TokenType::Param | TokenType::ParamOpen => {
+                    WordPart::Param(Self::param_expansion(&sub_tok, mode)?)
+                }
+                TokenType::Andopen => WordPart::CmdSub(Self::cmdsub(&sub_tok)?),
+                TokenType::Backquoted => WordPart::Backquoted(sub_tok.next_token_in(mode)?),
+                TokenType::SQuote => {
+                    sub_tok.next_token_in(mode)?;
+                    WordPart::SingleQuoted(Self::single_quoted(&sub_tok)?)
+                }
+                TokenType::DQuote => {
+                    sub_tok.next_token_in(mode)?;
+                    WordPart::DoubleQuoted(Self::double_quoted(&sub_tok)?)
+                }
+                // The end of the input: no `}`.
+                _ => return None,
+            };
+            parts.push(part);
+        }
     }
 
     /// The parts between double quotes, after the opening `"`, up to and with
@@ -1838,7 +2142,9 @@ impl SyntaxTree {
                     return Some(parts);
                 }
                 TokenType::DqText => WordPart::Literal(sub_tok.next_token_in(Mode::DoubleQuoted)?),
-                TokenType::Param => WordPart::Param(sub_tok.next_token_in(Mode::DoubleQuoted)?),
+                TokenType::Param | TokenType::ParamOpen => {
+                    WordPart::Param(Self::param_expansion(&sub_tok, Mode::DoubleQuoted)?)
+                }
                 TokenType::Backquoted => {
                     WordPart::Backquoted(sub_tok.next_token_in(Mode::DoubleQuoted)?)
                 }
@@ -1927,6 +2233,147 @@ mod tests {
         for name in ["", "1a", "a-b", "./x", "a b", "a=", "٣x", "x€"] {
             assert!(!is_valid_name(name), "{name}");
         }
+    }
+
+    /// The parameter expansion a word of one part is.
+    fn expansion(input: &str) -> ParamExpansion<'_> {
+        let tok = UnbufferedTokenizer::new(input);
+        let word = SyntaxTree::word(&tok).expect(input);
+        assert!(tok.next_is_eof(), "{input}: not all of it");
+
+        let [WordPart::Param(expansion)] = word.parts.as_slice() else {
+            panic!("{input}: {word:?}");
+        };
+        expansion.clone()
+    }
+
+    #[test]
+    fn parameters() {
+        use Parameter::*;
+
+        for (input, param) in [
+            ("$x", Name("x")),
+            ("${città}", Name("città")),
+            ("$1", Positional(1)),
+            ("${10}", Positional(10)),
+            ("$0", Special(super::Special::Zero)),
+            ("${00}", Special(super::Special::Zero)),
+            ("$@", Special(super::Special::At)),
+            ("${#}", Special(super::Special::Hash)),
+            ("$?", Special(super::Special::Question)),
+            ("${-}", Special(super::Special::Hyphen)),
+            ("$$", Special(super::Special::Dollar)),
+            ("$!", Special(super::Special::Bang)),
+            ("$*", Special(super::Special::Star)),
+        ] {
+            let expansion = expansion(input);
+            assert_eq!(expansion.param, param, "{input}");
+            assert!(expansion.op.is_none(), "{input}");
+            assert_eq!(expansion.to_string(), input.replace("00", "0"), "{input}");
+        }
+    }
+
+    #[test]
+    fn operators_and_their_words() {
+        let length = expansion("${#x}");
+        assert!(matches!(length.op, Some(ParamOp::Length)));
+        assert_eq!(length.param, Parameter::Name("x"));
+        // `${##}` is the length of `$#`.
+        assert_eq!(expansion("${##}").param, Parameter::Special(Special::Hash));
+
+        for (input, op) in [
+            ("${x-w}", "-"),
+            ("${x:-w}", ":-"),
+            ("${x=w}", "="),
+            ("${x:=w}", ":="),
+            ("${x?w}", "?"),
+            ("${x:?}", ":?"),
+            ("${x+w}", "+"),
+            ("${x:+w}", ":+"),
+            ("${x%w}", "%"),
+            ("${x%%*.c}", "%%"),
+            ("${x#w}", "#"),
+            ("${x##*/}", "##"),
+            ("${1:-a b}", ":-"),
+        ] {
+            let expansion = expansion(input);
+            let (operator, _) = expansion.op.as_ref().unwrap().operator().unwrap();
+            assert_eq!(operator, op, "{input}");
+            assert_eq!(expansion.to_string(), input);
+        }
+    }
+
+    /// The word inside the braces is parsed: what is inside quotes, `$(...)`
+    /// or another `${...}` doesn't end it.
+    #[test]
+    fn the_word_of_an_operator_is_parsed() {
+        for (input, parts) in [
+            ("${TEST:-$(echo hello)}", 1),
+            ("${x:-$(echo })}", 1),
+            ("${x:-'}'}", 1),
+            ("${x:-\"}\"}", 1),
+            ("${x:-a\\}b}", 1),
+            ("${a:-${b:-c}}", 1),
+            ("${x:-a $y `z`}", 4),
+            ("${x:-}", 0),
+        ] {
+            let expansion = expansion(input);
+            let Some(ParamOp::Default { colon: true, word }) = &expansion.op else {
+                panic!("{input}: {expansion:?}");
+            };
+            assert_eq!(word.parts.len(), parts, "{input}: {word:?}");
+            assert_eq!(expansion.to_string(), input);
+        }
+
+        let Some(ParamOp::Default { word, .. }) = expansion("${TEST:-$(echo hello)}").op else {
+            unreachable!();
+        };
+        assert!(matches!(word.parts.as_slice(), [WordPart::CmdSub(_)]));
+    }
+
+    /// Inside double quotes the word is too, but `'` is an ordinary character.
+    #[test]
+    fn the_word_inside_double_quotes() {
+        let tok = UnbufferedTokenizer::new("\"${x:-'a'}${y:-\"b c\"}\"");
+        let word = SyntaxTree::word(&tok).unwrap();
+        assert!(tok.next_is_eof());
+
+        let [WordPart::DoubleQuoted(inner)] = word.parts.as_slice() else {
+            panic!("{word:?}");
+        };
+        let [WordPart::Param(first), WordPart::Param(second)] = inner.as_slice() else {
+            panic!("{inner:?}");
+        };
+        let Some(ParamOp::Default { word: first, .. }) = &first.op else {
+            panic!("{first:?}");
+        };
+        assert!(matches!(first.parts.as_slice(), [WordPart::Literal(t)] if t.value == "'a'"));
+        let Some(ParamOp::Default { word: second, .. }) = &second.op else {
+            panic!("{second:?}");
+        };
+        assert!(matches!(
+            second.parts.as_slice(),
+            [WordPart::DoubleQuoted(_)]
+        ));
+    }
+
+    #[test]
+    fn a_bad_parameter_is_a_syntax_error() {
+        for input in [
+            "echo ${}",
+            "echo \"a${}\"",
+            "echo ${a b}",
+            "echo ${x!y}",
+            "echo ${#x:-y}",
+            "echo ${x:%y}",
+            "echo ${x:-a",
+            "echo ${x",
+            "echo ${99999999999999999999999}",
+            "if false; then echo ${x:-$(}; fi",
+        ] {
+            assert!(!parses(input), "{input}");
+        }
+        assert!(parses("if false; then echo ${x:-y}; fi"));
     }
 
     #[test]

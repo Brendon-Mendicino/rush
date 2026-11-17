@@ -1,7 +1,9 @@
 use crate::{
     builtin::{self, Builtin, BuiltinDef, Kind, Status},
+    invocation::{Invocation, Source},
     job::{Job, JobBuilder, JobExit, JobTable},
     nix::{self, ForkResult, Pid, SigHandler, Signal, close, dup2_raw},
+    pattern::Pattern,
     shell::{JOB_CONTROL_SIGNALS, ReadonlyError, Shell},
     syntax::*,
     tokenizer::{BufTokenizer, TokenType, Tokenizer, UnbufferedTokenizer},
@@ -10,7 +12,7 @@ use crate::{
 use std::{
     collections::HashMap,
     fmt,
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Write},
     iter,
     os::{
@@ -18,6 +20,7 @@ use std::{
         unix::{fs::OpenOptionsExt, process::CommandExt},
     },
     panic::{self, AssertUnwindSafe},
+    path::Path,
     process::{self, Stdio},
 };
 
@@ -179,10 +182,35 @@ fn join_continuations(input: &[String]) -> Vec<String> {
 
 #[derive(Debug)]
 pub struct Executor {
+    input: Input,
     input_buffer: Vec<String>,
     shell: Shell,
     /// The jobs that got stopped or that run in the background, by job number.
     jobs: JobTable,
+    /// The status of the last command substitution since the command being
+    /// expanded started: the status of a command without a command name
+    /// (`X=$(false)`, §2.9.1).
+    cmdsub_status: Option<ExecStatus>,
+}
+
+/// Where the shell reads its commands, a line at a time.
+#[derive(Debug)]
+enum Input {
+    Stdin,
+    /// A script, read whole when the shell starts; nothing for `-c`.
+    Lines(std::vec::IntoIter<String>),
+}
+
+/// The fields a word expands to (§2.6), built part by part.
+///
+/// TODO: review how the fields are represented
+#[derive(Debug, Default)]
+struct Fields {
+    done: Vec<String>,
+    current: String,
+    /// The current field holds quoted text: it stays even when it is empty
+    /// (`""`), where an unquoted expansion that gives nothing is removed.
+    keep: bool,
 }
 
 /// Where a command's stdout goes.
@@ -252,13 +280,23 @@ enum RedirectError {
         err: io::Error,
     },
     BadFd(RawFd),
-    /// The word of `>&`/`<&` is neither an fd nor `-`.
+    /// The word of `>&`/`<&` is neither an fd nor `-`, or a target word gives
+    /// no field or more than one (`>$EMPTY`).
     BadTarget(String),
+    /// The expansion of the word failed: not a redirection error, an
+    /// expansion error (`Executor::expansion_failure`).
+    Expansion(ExpansionError),
 }
+
+/// An expansion that can't be done (§2.8.1): `${x?}` with `x` unset,
+/// `${1=x}`, `${x=y}` with `x` readonly. The message, without `rush: `.
+#[derive(Debug, Clone)]
+struct ExpansionError(String);
 
 impl fmt::Display for RedirectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Expansion(e) => write!(f, "{e}"),
             Self::Open { filename, err } => {
                 write!(f, "{filename}: {}", nix::error_message(err))
             }
@@ -469,9 +507,81 @@ struct SyntaxError;
 
 /// Report a redirection that cannot be set up: the command does not run, its
 /// status is 1.
+impl fmt::Display for ExpansionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 fn redirection_failure(e: RedirectError) -> CommandRun {
     eprintln!("rush: {e}");
     CommandRun::Done(JobExit::Exited(1))
+}
+
+impl Fields {
+    /// Append to the current field. Quoted text keeps the field, also when it
+    /// is empty.
+    fn push(&mut self, text: &str, quoted: bool) {
+        self.current.push_str(text);
+        self.keep |= quoted;
+    }
+
+    /// End the current field and start a new one.
+    fn split(&mut self) {
+        let field = std::mem::take(&mut self.current);
+        if !field.is_empty() || self.keep {
+            self.done.push(field);
+        }
+        self.keep = false;
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.split();
+        self.done
+    }
+
+    /// The text where nothing was split (`expand_text`).
+    fn text(self) -> String {
+        self.current
+    }
+}
+
+impl Input {
+    /// A script file, read whole. The error is the message and the exit
+    /// status: 127 when it doesn't exist (sh, "Exit Status"), 126 otherwise.
+    fn script(path: &Path) -> Result<Self, (String, i32)> {
+        // TODO: this is completely wrong, a file cannot be read whole, but one line at the time,
+        // this will prevenet enermous memory usages in case the file is too long. Find another
+        // solution later
+        let shown = path.display();
+        let bytes = fs::read(path).map_err(|e| {
+            let code = if e.kind() == io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            (format!("{shown}: {}", nix::error_message(&e)), code)
+        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| (format!("{shown}: cannot execute binary file"), 126))?;
+
+        let lines: Vec<String> = text.split_inclusive('\n').map(String::from).collect();
+        Ok(Self::Lines(lines.into_iter()))
+    }
+
+    /// The next line, with its newline; `None` at the end.
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        match self {
+            Self::Stdin => {
+                let mut line = String::with_capacity(512);
+                match io::stdin().read_line(&mut line)? {
+                    0 => Ok(None),
+                    _ => Ok(Some(line)),
+                }
+            }
+            Self::Lines(lines) => Ok(lines.next()),
+        }
+    }
 }
 
 impl RedirectionApplyer {
@@ -573,12 +683,49 @@ impl Drop for RedirectGuard {
 }
 
 impl Executor {
-    pub fn new() -> Self {
-        Self {
+    /// Run the shell as invoked: a script, a `-c` string or the standard input,
+    /// to the end. The result is the shell's exit status, the one of its last
+    /// command (`$?`).
+    pub fn start(invocation: Invocation) -> i32 {
+        let (input, command) = match invocation.source {
+            Source::Stdin => (Input::Stdin, None),
+            Source::Command(command) => (Input::Lines(Vec::new().into_iter()), Some(command)),
+            Source::Script(path) => match Input::script(&path) {
+                Ok(input) => (input, None),
+                Err((message, code)) => {
+                    eprintln!("rush: {message}");
+                    return code;
+                }
+            },
+        };
+        let may_be_interactive = matches!(input, Input::Stdin);
+
+        let mut executor = Self {
+            input,
             input_buffer: Vec::new(),
-            shell: Shell::new(),
+            shell: Shell::new(may_be_interactive, invocation.name, invocation.positional),
             jobs: JobTable::default(),
+            cmdsub_status: None,
+        };
+
+        for (opt, on) in invocation.options {
+            if let Err(message) = executor.shell.set_option(opt, on) {
+                eprintln!("rush: {message}");
+                return 2;
+            }
         }
+
+        match command {
+            // The whole string at once, so a quote can span its lines.
+            Some(command) => {
+                if executor.execute_str(&command).is_err() {
+                    executor.shell.last_status = ExecStatus::SYNTAX_ERROR.code();
+                }
+            }
+            None => executor.run(),
+        }
+
+        executor.shell.last_status
     }
 
     /// Run a built-in in the current process: the shell, or the child a pipeline
@@ -1066,6 +1213,7 @@ impl Executor {
     ) -> CommandRun {
         let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
+            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
             Err(e) => return redirection_failure(e),
         };
 
@@ -1090,6 +1238,7 @@ impl Executor {
 
         let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
+            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
             Err(e) => return CommandRun::Done(self.compound_redirection_error(e)),
         };
 
@@ -1192,6 +1341,10 @@ impl Executor {
 
         match fork_result {
             CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
+                // `$!`, and `$?` is 0: the status of an asynchronous list.
+                self.shell.last_async = Some(pid);
+                self.shell.last_status = 0;
+
                 let job = JobBuilder::new().build(pgid, pid);
                 let number = self.jobs.insert(job, op_list.to_string());
 
@@ -1246,46 +1399,93 @@ impl Executor {
 
         // Not a job: it can't be stopped (see `SpawnType::CmdSub`), never goes
         // in the job table, and is waited until it completes.
-        if let CommandRun::Spawned(Spawned { pid, pgid, .. }) = run
-            && let Err(e) = Waiter::wait_completed(JobBuilder::new().build(pgid, pid))
-        {
-            eprintln!("rush: wait: {e}");
-        }
+        let exit = match run {
+            CommandRun::Spawned(Spawned { pid, pgid, .. }) => {
+                Waiter::wait_completed(JobBuilder::new().build(pgid, pid)).unwrap_or_else(|e| {
+                    eprintln!("rush: wait: {e}");
+                    JobExit::Exited(1)
+                })
+            }
+            CommandRun::Done(exit) => exit,
+        };
+        self.cmdsub_status = Some(exit.into());
 
         let output = String::from_utf8_lossy(&output);
         output.trim_end_matches('\n').to_string()
     }
 
-    /// The text of a word: its parts expanded (parameters, command
-    /// substitutions) and the quotes removed, glued together.
+    /// The fields of a word (§2.6): its parts expanded (parameters, command
+    /// substitutions), the quotes removed, glued together. `"$@"`, and `$@`
+    /// and `$*` unquoted, give a field per positional parameter; an unquoted
+    /// expansion that gives nothing removes its field (`cmd $EMPTY` has no
+    /// argument), unless the word has quotes (`""`).
     ///
-    /// TODO: one field per word for now: field splitting of the unquoted
-    /// expansions, and pathname, tilde and arithmetic expansion, are missing.
-    fn expand_word(&mut self, word: &Word) -> String {
-        let mut text = String::new();
-        for part in &word.parts {
-            self.expand_part(part, false, &mut text);
-        }
-        text
+    /// TODO: field splitting of the unquoted expansions by `IFS`, and
+    /// pathname, tilde and arithmetic expansion, are missing.
+    fn expand_fields(&mut self, word: &Word) -> Result<Vec<String>, ExpansionError> {
+        let mut fields = Fields::default();
+        self.expand_into(word, false, true, &mut fields)?;
+        Ok(fields.finish())
     }
 
-    /// Append the expansion of `part` to `text`; `quoted` inside double quotes.
-    fn expand_part(&mut self, part: &WordPart, quoted: bool, text: &mut String) {
+    /// The text of a word where there is no field splitting (the value of an
+    /// assignment, the message of `${x?word}`): `$@` is joined by spaces, `$*`
+    /// by the first character of `IFS`.
+    fn expand_text(&mut self, word: &Word) -> Result<String, ExpansionError> {
+        let mut fields = Fields::default();
+        self.expand_into(word, false, false, &mut fields)?;
+        Ok(fields.text())
+    }
+
+    /// Expand the parts of `word` into `fields`: `quoted` inside double quotes,
+    /// `split` when `$@` gives fields of its own.
+    fn expand_into(
+        &mut self,
+        word: &Word,
+        quoted: bool,
+        split: bool,
+        // TODO: i dont like the fields are passed mutably to this function
+        fields: &mut Fields,
+    ) -> Result<(), ExpansionError> {
+        for part in &word.parts {
+            self.expand_part(part, quoted, split, fields)?;
+        }
+        Ok(())
+    }
+
+    fn expand_part(
+        &mut self,
+        part: &WordPart,
+        quoted: bool,
+        split: bool,
+        fields: &mut Fields,
+    ) -> Result<(), ExpansionError> {
         match part {
             // The token type says which escapes apply (`Literal` or `DqText`).
-            WordPart::Literal(token) => text.push_str(&token.text()),
+            WordPart::Literal(token) => fields.push(&token.text(), quoted),
             WordPart::SingleQuoted(texts) => {
+                fields.push("", true);
                 for token in texts {
-                    text.push_str(token.value);
+                    fields.push(token.value, true);
                 }
             }
             WordPart::DoubleQuoted(parts) => {
+                // `""` is an empty field, `"$@"` without parameters is none.
+                if parts.is_empty() {
+                    fields.push("", true);
+                }
                 for part in parts {
-                    self.expand_part(part, true, text);
+                    // TODO: i dont like this recursion here
+                    self.expand_part(part, true, split, fields)?;
                 }
             }
-            WordPart::Param(token) => text.push_str(&self.parameter(token.value)),
-            WordPart::CmdSub(cmdsub) => text.push_str(&self.cmdsub(cmdsub)),
+            WordPart::Param(expansion) => {
+                self.expand_parameter(expansion, quoted, split, fields)?
+            }
+            WordPart::CmdSub(cmdsub) => {
+                let output = self.cmdsub(cmdsub);
+                fields.push(&output, quoted);
+            }
             WordPart::Backquoted(token) => {
                 let program = backquoted_program(token.value, quoted);
                 let output = self.command_output(|executor| {
@@ -1293,27 +1493,186 @@ impl Executor {
                         .execute_str(&program)
                         .unwrap_or(ExecStatus::SYNTAX_ERROR)
                 });
-                text.push_str(&output);
+                fields.push(&output, quoted);
             }
+        }
+        Ok(())
+    }
+
+    /// Expand a parameter expansion into `fields` (§2.6.2). The words of the
+    /// operators are expanded only when they are used.
+    fn expand_parameter(
+        &mut self,
+        expansion: &ParamExpansion,
+        quoted: bool,
+        split: bool,
+        fields: &mut Fields,
+    ) -> Result<(), ExpansionError> {
+        let param = expansion.param;
+        let value = self.shell.parameter(&param);
+
+        // Between double quotes the expansion is a field even when it gives
+        // nothing (`"${x:-}"`), but for `"$@"` without parameters.
+        if quoted && param != Parameter::Special(Special::At) {
+            fields.push("", true);
+        }
+
+        // Unset, or null too with the colon (`${x:-word}`).
+        let missing = |colon: bool| value.as_deref().is_none_or(|v| colon && v.is_empty());
+
+        match &expansion.op {
+            None => self.push_value(param, value, quoted, split, fields),
+            Some(ParamOp::Length) => {
+                let length = match param {
+                    Parameter::Special(Special::At | Special::Star) => self.shell.positional.len(),
+                    _ => value.unwrap_or_default().chars().count(),
+                };
+                fields.push(&length.to_string(), quoted);
+            }
+            Some(ParamOp::Default { colon, word }) => {
+                if missing(*colon) {
+                    self.expand_into(word, quoted, split, fields)?;
+                } else {
+                    self.push_value(param, value, quoted, split, fields);
+                }
+            }
+            Some(ParamOp::Assign { colon, word }) => {
+                if missing(*colon) {
+                    let Parameter::Name(name) = param else {
+                        return Err(ExpansionError(format!(
+                            "${param}: cannot assign in this way"
+                        )));
+                    };
+                    let text = self.expand_text(word)?;
+                    self.shell
+                        .env
+                        .assign(name, text.clone())
+                        .map_err(|e| ExpansionError(e.to_string()))?;
+                    fields.push(&text, quoted);
+                } else {
+                    self.push_value(param, value, quoted, split, fields);
+                }
+            }
+            Some(ParamOp::Error { colon, word }) => {
+                if missing(*colon) {
+                    let message = self.expand_text(word)?;
+                    let message = match message.as_str() {
+                        "" if *colon => "parameter null or not set",
+                        "" => "parameter not set",
+                        message => message,
+                    };
+                    return Err(ExpansionError(format!("{param}: {message}")));
+                }
+                self.push_value(param, value, quoted, split, fields);
+            }
+            Some(ParamOp::Alternative { colon, word }) => {
+                if !missing(*colon) {
+                    self.expand_into(word, quoted, split, fields)?;
+                }
+            }
+            // TODO: for `$@` and `$*` the pattern applies to each parameter.
+            Some(ParamOp::RemoveSuffix { largest, pattern }) => {
+                let pattern = Pattern::new(&self.expand_pattern(pattern)?);
+                let value = value.unwrap_or_default();
+                fields.push(pattern.strip_suffix(&value, *largest), quoted);
+            }
+            Some(ParamOp::RemovePrefix { largest, pattern }) => {
+                let pattern = Pattern::new(&self.expand_pattern(pattern)?);
+                let value = value.unwrap_or_default();
+                fields.push(pattern.strip_prefix(&value, *largest), quoted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Push the value of a parameter, empty when it is unset: `"$@"`, and `$@`
+    /// and `$*` unquoted, give a field per positional parameter, the first and
+    /// the last glued to the text around them (`"a$@b"`). `"$*"` is one field.
+    // TODO: `set -u` makes an unset parameter an error.
+    fn push_value(
+        &self,
+        param: Parameter,
+        value: Option<String>,
+        quoted: bool,
+        split: bool,
+        fields: &mut Fields,
+    ) {
+        let each = match param {
+            Parameter::Special(Special::At) => split,
+            Parameter::Special(Special::Star) => split && !quoted,
+            _ => false,
+        };
+
+        if !each {
+            fields.push(&value.unwrap_or_default(), quoted);
+            return;
+        }
+
+        for (i, value) in self.shell.positional.iter().enumerate() {
+            if i > 0 {
+                fields.split();
+            }
+            fields.push(value, quoted);
         }
     }
 
-    /// The value of `$name` or `${name}`: empty when unset.
-    ///
-    /// TODO: the special (`$?`, `$$`, `$!`, `$#`, `$@`, `$*`, `$-`, `$0`) and
-    /// positional parameters (0.9), and the `${...}` operators.
-    fn parameter(&self, raw: &str) -> String {
-        let name = raw.trim_start_matches('$');
-        let name = name
-            .strip_prefix('{')
-            .and_then(|name| name.strip_suffix('}'))
-            .unwrap_or(name);
-
-        if !is_valid_name(name) {
-            todo!("{raw}: not implemented");
+    /// The pattern of `${x%pattern}` and the like (§2.13.1), as `Pattern`
+    /// reads it: what was quoted gets a `\` before its pattern characters, so
+    /// that it matches itself (`${x#"*"}`); unquoted text keeps its own
+    /// backslashes, and what unquoted expansions give stays a pattern
+    /// (`p='*'; ${x#$p}`).
+    fn expand_pattern(&mut self, word: &Word) -> Result<String, ExpansionError> {
+        let mut pattern = String::new();
+        for part in &word.parts {
+            self.pattern_part(part, false, &mut pattern)?;
         }
+        Ok(pattern)
+    }
 
-        self.shell.env.get(name).unwrap_or_default().to_string()
+    fn pattern_part(
+        &mut self,
+        part: &WordPart,
+        quoted: bool,
+        pattern: &mut String,
+    ) -> Result<(), ExpansionError> {
+        match part {
+            WordPart::Literal(token) if !quoted && token.t_type == TokenType::Literal => {
+                pattern.push_str(token.value);
+            }
+            WordPart::DoubleQuoted(parts) => {
+                for part in parts {
+                    self.pattern_part(part, true, pattern)?;
+                }
+            }
+            part => {
+                let mut fields = Fields::default();
+                self.expand_part(part, quoted, false, &mut fields)?;
+                let text = fields.text();
+
+                if quoted || matches!(part, WordPart::SingleQuoted(_) | WordPart::Literal(_)) {
+                    for c in text.chars() {
+                        if matches!(c, '*' | '?' | '[' | '\\') {
+                            pattern.push('\\');
+                        }
+                        pattern.push(c);
+                    }
+                } else {
+                    pattern.push_str(&text);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Report an expansion that failed (§2.8.1: an expansion error exits a
+    /// non-interactive shell). The command doesn't run.
+    // TODO: one place for the consequences of every error (TODO.md §10).
+    fn expansion_failure(&self, e: ExpansionError) -> JobExit {
+        eprintln!("rush: {e}");
+        if !self.shell.is_interactive {
+            Self::exit_shell(1);
+        }
+        JobExit::Exited(1)
     }
 
     /// The redirections with their words expanded: the file names, and the fds
@@ -1328,10 +1687,10 @@ impl Executor {
                 Redirect::FileRedirect(file) => Ok(Redirection::File {
                     fd: file.redirect_fd,
                     kind: file.file_kind,
-                    path: self.expand_word(&file.filename),
+                    path: self.expand_target(&file.filename)?,
                 }),
                 Redirect::Dup(dup) => {
-                    let target = self.expand_word(&dup.target);
+                    let target = self.expand_target(&dup.target)?;
                     if target == "-" {
                         return Ok(Redirection::Close { fd: dup.fd });
                     }
@@ -1346,20 +1705,36 @@ impl Executor {
             .collect()
     }
 
+    /// The word of a redirection, which must give exactly one field (bash:
+    /// `>$EMPTY` is an ambiguous redirect).
+    fn expand_target(&mut self, word: &Word) -> Result<String, RedirectError> {
+        let fields = self.expand_fields(word).map_err(RedirectError::Expansion)?;
+
+        match <[String; 1]>::try_from(fields) {
+            Ok([field]) => Ok(field),
+            Err(_) => Err(RedirectError::BadTarget(word.to_string())),
+        }
+    }
+
     fn unsub_command(&mut self, cmd: &UnsubCommand, state: PipelineState) -> CommandRun {
-        let program = self.expand_word(&cmd.program);
+        self.cmdsub_status = None;
 
-        let arguments = cmd
-            .arguments
-            .iter()
-            .map(|word| self.expand_word(word))
-            .collect::<Vec<_>>();
+        // The words first, then the redirections, then the prefixes (§2.9.1).
+        let mut words = Vec::new();
+        for word in iter::once(&cmd.program).chain(&cmd.arguments) {
+            match self.expand_fields(word) {
+                Ok(fields) => words.extend(fields),
+                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+            }
+        }
 
-        let envs = cmd
-            .envs
-            .iter()
-            .map(|var| (var.key.to_string(), self.expand_word(&var.value)))
-            .collect();
+        // No command name is left (`$EMPTY`, `"$@"` without parameters): the
+        // prefixes and the redirections are handled like an assignment's.
+        let mut words = words.into_iter();
+        let Some(program) = words.next() else {
+            return self.assignments(&cmd.envs, &cmd.redirections, state);
+        };
+        let arguments: Vec<String> = words.collect();
 
         let def = builtin::find(&program);
 
@@ -1367,6 +1742,7 @@ impl Executor {
         // non-interactive shell (§2.8.1), like when it can't be applied below.
         let redirections = match self.expand_redirects(&cmd.redirections) {
             Ok(redirections) => redirections,
+            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
             Err(e) => match def {
                 Some(def) if !state.in_pipeline => {
                     eprintln!("rush: {e}");
@@ -1375,6 +1751,14 @@ impl Executor {
                 _ => return redirection_failure(e),
             },
         };
+
+        let mut envs = Vec::with_capacity(cmd.envs.len());
+        for var in &cmd.envs {
+            match self.expand_text(&var.value) {
+                Ok(value) => envs.push((var.key.to_string(), value)),
+                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+            }
+        }
 
         let expanded = SimpleCommand {
             program,
@@ -1447,11 +1831,25 @@ impl Executor {
         assignment: &SimpleAssignment,
         state: PipelineState,
     ) -> CommandRun {
+        self.cmdsub_status = None;
+        self.assignments(&assignment.envs, &assignment.redirections, state)
+    }
+
+    /// A command without a command name: the assignments go to the shell, the
+    /// redirections are performed. Its status is the one of the last command
+    /// substitution, 0 when there was none (§2.9.1: `X=$(false)` fails).
+    fn assignments(
+        &mut self,
+        envs: &[AssignmentWord],
+        redirections: &[Redirect],
+        state: PipelineState,
+    ) -> CommandRun {
         // The redirections are still performed (`a=1 >file` creates the file),
         // and when they fail the variables are left untouched. The files are
         // closed when the controller is dropped.
-        let redirections = match self.expand_redirects(&assignment.redirections) {
+        let redirections = match self.expand_redirects(redirections) {
             Ok(redirections) => redirections,
+            Err(RedirectError::Expansion(e)) => return CommandRun::Done(self.expansion_failure(e)),
             Err(e) => return redirection_failure(e),
         };
         if let Err(e) =
@@ -1469,15 +1867,19 @@ impl Executor {
         // An exported variable keeps the attribute: assigning it changes the
         // environment of the next commands. A readonly one stops the assignments
         // (the ones before stay).
-        for var in &assignment.envs {
-            let value = self.expand_word(&var.value);
+        for var in envs {
+            let value = match self.expand_text(&var.value) {
+                Ok(value) => value,
+                Err(e) => return CommandRun::Done(self.expansion_failure(e)),
+            };
             if let Err(e) = self.shell.env.assign(var.key, value) {
                 let exit = self.exits_on_assignment_error(false);
                 return CommandRun::Done(Self::assignment_error(e, exit));
             }
         }
 
-        CommandRun::Done(JobExit::Exited(0))
+        let status = self.cmdsub_status.unwrap_or(ExecStatus::SUCCESS);
+        CommandRun::Done(job_exit(status))
     }
 
     fn command(&mut self, command: &Command, state: PipelineState) -> CommandRun {
@@ -1576,11 +1978,15 @@ impl Executor {
             }
         };
 
-        if pipeline.negated {
+        let exec_status = if pipeline.negated {
             exec_status.not()
         } else {
             exec_status
-        }
+        };
+
+        // `$?`: the status of the most recent pipeline.
+        self.shell.last_status = exec_status.code();
+        exec_status
     }
 
     fn or_list(&mut self, orl: &OrList) -> ExecStatus {
@@ -1673,16 +2079,14 @@ impl Executor {
         )
     }
 
-    fn read_stdin(&mut self) -> io::Result<bool> {
-        let mut line = String::with_capacity(512);
+    /// Read one more line into the buffer; `false` at the end of the input.
+    fn read_line(&mut self) -> io::Result<bool> {
+        let Some(line) = self.input.read_line()? else {
+            return Ok(false);
+        };
 
-        match io::stdin().read_line(&mut line)? {
-            0 => Ok(false), // EOF
-            _ => {
-                self.input_buffer.push(line);
-                Ok(true)
-            }
-        }
+        self.input_buffer.push(line);
+        Ok(true)
     }
 
     /// Run the lines read from the input. A syntax error is reported and the
@@ -1691,8 +2095,10 @@ impl Executor {
     fn execute(&mut self) -> ExecStatus {
         let input = join_continuations(&self.input_buffer);
 
-        self.execute_lines(&input)
-            .unwrap_or(ExecStatus::SYNTAX_ERROR)
+        self.execute_lines(&input).unwrap_or_else(|SyntaxError| {
+            self.shell.last_status = ExecStatus::SYNTAX_ERROR.code();
+            ExecStatus::SYNTAX_ERROR
+        })
     }
 
     /// Run a program given as a string, like `eval` does.
@@ -1729,7 +2135,7 @@ impl Executor {
     }
 
     fn update(&mut self) -> Result<TerminalState, io::Error> {
-        if !self.read_stdin()? {
+        if !self.read_line()? {
             return Ok(TerminalState {
                 terminate_session: true,
                 ..Default::default()
@@ -1758,7 +2164,8 @@ impl Executor {
         })
     }
 
-    pub fn run(&mut self) {
+    /// Read and run the input to its end.
+    fn run(&mut self) {
         let mut state = TerminalState::default();
 
         while !state.terminate_session {

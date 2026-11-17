@@ -20,6 +20,8 @@ mod pipeline;
 mod pwd;
 mod readonly;
 mod redirections;
+mod set;
+mod shift;
 mod special;
 mod r#true;
 mod unset;

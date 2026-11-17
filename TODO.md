@@ -59,16 +59,21 @@ Reference implementation: `~/projects/testsh/src`. Tick items as they land.
 
 ## 8. Variable substitution
 - [x] `$NAME` / `${NAME}` → shell var value, empty if unset (`Executor::parameter`), also inside double quotes
-- [x] Substitution in program name, arguments, `VAR=x` values and redirection targets (`Executor::expand_word`, `expand_redirects`)
-- [ ] Special and positional parameters (`$?` `$$` `$!` `$#` `$@` `$*` `$-` `$0`–`$9`): still `todo!()`
-- [ ] `${...}` operators (`${x:-y}`, `${#x}`…) and nesting inside `${ }`
-- [ ] Field splitting of unquoted expansions (`IFS`), pathname expansion (`*`, `?`, `[`), tilde expansion, arithmetic `$(( ))`: today each word gives one field, as written
+- [x] Substitution in program name, arguments, `VAR=x` values and redirection targets (`Executor::expand_fields`, `expand_text`, `expand_redirects`)
+- [x] Special and positional parameters (`$?` `$$` `$!` `$#` `$@` `$*` `$-` `$0`–`$9`, `${10}`; `Parameter`, `Executor::parameter`); `"$@"` and unquoted `$@`/`$*` give a field per parameter, `"$*"` joins with the first character of `IFS`; an unquoted expansion that gives nothing removes its field (`cmd $EMPTY`), a target that isn't one field is an ambiguous redirect
+- [x] `${...}` operators (§2.6.2): `${#x}`, `${x-w}` `${x:-w}`, `${x=w}` `${x:=w}`, `${x?w}` `${x:?w}`, `${x+w}` `${x:+w}`, `${x%p}` `${x%%p}` `${x#p}` `${x##p}`; the word inside the braces is parsed like any word (`${x:-$(echo })}`, nested `${...}`); expansion errors (`ExpansionError`) exit a non-interactive shell
+- [ ] The pattern operators on `$@`/`$*` apply to the joined value, not to each parameter
+- [ ] `\}` inside `"${x:-...}"` keeps its backslash (`DqText` escapes); bash drops it
+- [ ] The syntax error of a bad `${...}` says only "syntax error": with the parser error type (see the REPL multi-line item) it should say "bad substitution" like dash
+- [ ] Pattern matching (`pattern.rs`): collating symbols `[.x.]`, equivalence classes `[=x=]`, and the pathname expansion rules (leading `.`, `/`)
+- [ ] Field splitting of unquoted expansions by `IFS` (inside a parameter, a `$(...)`), pathname expansion (`*`, `?`, `[`), tilde expansion, arithmetic `$(( ))`
+- [ ] `set -u`: an unset parameter is an error (the options are only state, see BUILTINS.md 0.9); `push_value` can return an `ExpansionError` for it
 
 ## 9. Builtins (`builtin.cpp`)
 The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this section only tracks parity with the C++ ones.
 - [x] Dispatch: builtins are checked before exec (`builtin::BUILTINS`); run in-process outside pipelines, in a forked child inside one
 - [x] `cd [dir|~]`: `$HOME` fallback, `too many arguments`, error message on failure (full POSIX `cd`, see `BUILTINS.md`)
-- [ ] `exit [n]` (returns `Status::Exit`, exits only a subshell or pipeline child; the `$?` default is still missing)
+- [x] `exit [n]` (returns `Status::Exit`, exits only a subshell or pipeline child; without `n` the status is `$?`)
 - [x] `exec cmd args…`: replace the shell process (`CommandExt::exec`) with the shell env (also `exec` without a command: permanent redirections)
 - [x] `jobs`: list the job table (`JobTable`) in the POSIX format
 - [x] `fg`: current job or `%` job ID → `Waiter::fg`; put back under the same number if it stops again
@@ -93,7 +98,7 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
     - command not found
   - Each error also carries its exit status (1, 2, 126, 127…) and the message, `rush: [<command>: ]<message>`, using the strerror text from `nix::error_message`.
   - `From` impls are the conversions, so `?` works across modules.
-  - One place decides the consequence: report, then exit (non-interactive, or a forked child) or go on with the status. It replaces `Executor::builtin_error`, `Executor::assignment_error`, `Executor::compound_redirection_error`, `redirection_failure` and the ~20 `eprintln!("rush: …")` calls in the executor.
+  - One place decides the consequence: report, then exit (non-interactive, or a forked child) or go on with the status. It replaces `Executor::builtin_error`, `Executor::assignment_error`, `Executor::compound_redirection_error`, `Executor::expansion_failure`, `redirection_failure` and the ~20 `eprintln!("rush: …")` calls in the executor.
 
 ## Beyond parity (not done in testsh either)
 - [ ] The grammar rules that are only `unimplemented!` stubs in `syntax.rs` (in the order of §2.10.2): `for_clause`/`name`/`in`/`wordlist`, `case_clause` and its items/`pattern`, `while_clause`/`until_clause`/`do_group`, `brace_group`, `function_definition`/`function_body`/`fname`, `io_here`/`here_end`, `sequential_sep`. They need the AST nodes and the reserved words (§2.4, recognized by the rules in §2.10.2), then wiring into `compound_command` (`CompoundCommand`) and the executor (`Executor::compound_body`). The reserved words are already recognized where a command starts (`ReservedWord`): `for`, `while`, `case`, `{`... are syntax errors there until their clause exists. The `;;`, `<<`, `<<-` and `>|` tokens exist (`>|` acts as `>` until noclobber, `set -C`).
@@ -102,7 +107,9 @@ The detailed plan and the per-built-in checklist are in `BUILTINS.md`; this sect
   - When the time comes, first look at how other shells handle it: bash (its yacc grammar, the PS2 prompt, "syntax error: unexpected end of file"), dash (`parser.c`, reading more input while a command is incomplete), and how they treat an incomplete `-c`/`eval` string.
 - [ ] A `#` right after `$(...)` starts a comment (`$(a)#b`), where POSIX keeps it in the word: the tokenizer can't tell the `)` of `$(...)` from the one of a subshell.
 - [ ] Heredocs `<<` / `<<-` (`io_here` is `unimplemented!` in both)
-- [ ] Special parameters `$?`, `$$`, `$!`
+- [x] Special parameters `$?`, `$$`, `$!` (and the rest, see §8)
+- [x] The shell's arguments (`invocation.rs`): `rush script args` (read whole: no fd for a redirection to clobber; 127 not found, 126 unreadable), `rush -c string [name [args]]`, `rush -s args`, the option letters (refused unless they change nothing), the usage and status 2 on a bad one; the exit status is the last command's
+- [ ] `rush -i` (forced interactive) and checking that stderr is a terminal too (POSIX), which the pty tests would need to follow
 - [x] `if` (§2.9.4): `if_clause`/`else_part`, the reserved words (§2.4, rule 7a); runs in the shell (assignments and `cd` stay) with its redirections, forked inside a pipeline
 - [x] Quoting (§2.2): `'...'`, `"..."` (with `$`, `$(...)` and backquotes inside), `\`; the parts of a word glued into one (`a'b'$(c)`), `# comments`, tabs as blanks
 - [x] `export` builtin / stage 4 envs (mark vars external): `export`, `readonly`, `unset` (see `BUILTINS.md`)

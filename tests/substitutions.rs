@@ -55,12 +55,13 @@ fn changes_stay_in_the_substitution() {
 }
 
 #[test]
-fn failing_command_gives_an_empty_word() {
-    let output = run_shell("echo $(nonexistent-rush-cmd) after\n");
+fn an_empty_output_gives_no_field_unless_quoted() {
+    let output = run_shell("echo $(nonexistent-rush-cmd) after\necho \"$(true)\" after\n");
 
     assert!(stderr(&output).contains("rush: nonexistent-rush-cmd: command not found"));
-    // `echo '' after`
-    assert_eq!(stdout(&output), " after\n");
+    // `echo after`, then `echo '' after` (§2.6.5: an unquoted expansion that
+    // gives nothing removes its field).
+    assert_eq!(stdout(&output), "after\n after\n");
 }
 
 #[test]

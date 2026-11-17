@@ -13,8 +13,9 @@ use crate::builtin::{Builtin, BuiltinResult, Status};
 
 /// Exit the shell.
 ///
-/// Exit the shell with status N, 0 without it. In a subshell, a command of a
-/// pipeline or a command substitution, only that subshell exits.
+/// Exit the shell with status N, or with the status of the last command ($?)
+/// without it. In a subshell, a command of a pipeline or a command
+/// substitution, only that subshell exits.
 #[derive(Debug, Parser)]
 #[command(verbatim_doc_comment, override_usage = "exit [n]")]
 pub(super) struct Args {
@@ -25,8 +26,7 @@ pub(super) struct Args {
 pub fn exit(bi: &mut Builtin) -> BuiltinResult {
     let args: Args = bi.parse()?;
 
-    // TODO: without N, the status of the last command (BUILTINS.md).
-    let code = args.n.unwrap_or(0);
+    let code = args.n.unwrap_or(bi.shell.last_status);
 
     // The executor leaves the process: the shell, or the child a pipeline
     // command or a subshell runs in.

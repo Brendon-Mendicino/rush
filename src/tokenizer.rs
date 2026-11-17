@@ -17,8 +17,21 @@ pub enum TokenType {
     /// Text between double quotes: `\` escapes only `$` `` ` `` `"` `\` and
     /// newline.
     DqText,
-    /// `$name`, `${...}`, `$1`, `$?`...
+    /// `$name`, `$1`, `$?`...: a parameter without braces, complete in itself.
     Param,
+    /// `${`: a parameter expansion, which the parser reads up to its `}`
+    /// (`ParamName`, then `ParamOp` and a word): the braces can hold quotes,
+    /// `$(...)` and other `${...}`.
+    ParamOpen,
+    /// `#` right after `${`, before a parameter: its length (`${#x}`).
+    ParamHash,
+    /// The parameter inside `${...}`: a name, digits, or a special parameter.
+    ParamName,
+    /// The operator after the parameter: `:-` `-` `:=` `=` `:?` `?` `:+` `+`
+    /// `%` `%%` `#` `##`.
+    ParamOp,
+    /// `}`, closing a `${`.
+    CloseBrace,
     /// `'`, opening or closing a single-quoted part.
     SQuote,
     /// `"`, opening or closing a double-quoted part.
@@ -50,12 +63,23 @@ pub enum TokenType {
     Eof,
 }
 
-/// Which token rules apply: inside quotes most characters lose their meaning.
+/// Which token rules apply: inside quotes most characters lose their meaning,
+/// and inside `${...}` the parser asks for each piece in turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     SingleQuoted,
     DoubleQuoted,
+    /// Right after `${`: `ParamHash`, `ParamName`, or `CloseBrace`.
+    ParamName,
+    /// After the parameter of a `${`: `ParamOp` or `CloseBrace`.
+    ParamOp,
+    /// The word after the operator, outside double quotes, up to the `}`: like
+    /// `Normal`, but blanks are part of it and only `}` ends it.
+    ParamWord,
+    /// The same inside double quotes (`"${x:-...}"`): `'` is an ordinary
+    /// character there, and `\` escapes like between double quotes.
+    ParamWordDq,
 }
 
 #[derive(Debug, Clone)]
@@ -135,9 +159,16 @@ pub trait Tokenizer<'a>: Iterator<Item = Token<'a>> + Clone {
     }
 }
 
-/// `$name` (the longest name, Unicode letters like `syntax::is_valid_name`),
-/// `${...}` (not nested yet), a digit or a special parameter.
-const PARAM: &str = r"^(\$(?:\{[^}]*\}|[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*|[0-9@*#?$!\-]))";
+/// A variable name: the longest one, with Unicode letters like
+/// `syntax::is_valid_name`.
+const NAME: &str = r"[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*";
+
+/// The special parameters but `0` (§2.5.2).
+const SPECIAL: &str = r"[@*#?$!\-]";
+
+/// `$name`, `$` and one digit, or `$` and a special parameter. With braces it
+/// is a `ParamOpen`, which the parser reads.
+static PARAM: LazyLock<String> = LazyLock::new(|| format!(r"^(\$(?:{NAME}|[0-9]|{SPECIAL}))"));
 
 /// `` `...` `` with its backslash escapes, on one line.
 const BACKQUOTED: &str = r"^(`(?:[^`\\]|\\.)*`)";
@@ -172,7 +203,8 @@ static NORMAL: LazyLock<Vec<Specification>> = LazyLock::new(|| {
         spec(r"^(!)(?:[ \t\r\n]|\z)", TokenType::Bang),
         // Word parts.
         spec(r"^(\$\()", TokenType::Andopen),
-        spec(PARAM, TokenType::Param),
+        spec(r"^(\$\{)", TokenType::ParamOpen),
+        spec(&PARAM, TokenType::Param),
         spec(r"^(')", TokenType::SQuote),
         spec(r#"^(")"#, TokenType::DQuote),
         spec(BACKQUOTED, TokenType::Backquoted),
@@ -204,9 +236,70 @@ static DOUBLE_QUOTED: LazyLock<Vec<Specification>> = LazyLock::new(|| {
     vec![
         spec(r#"^(")"#, TokenType::DQuote),
         spec(r"^(\$\()", TokenType::Andopen),
-        spec(PARAM, TokenType::Param),
+        spec(r"^(\$\{)", TokenType::ParamOpen),
+        spec(&PARAM, TokenType::Param),
         spec(BACKQUOTED, TokenType::Backquoted),
         spec(r#"^((?:[^"\\$`]|\\[\s\S])+)"#, TokenType::DqText),
+        spec(r"^(\$|\\)", TokenType::DqText),
+        spec(r"^(\z)", TokenType::Eof),
+    ]
+});
+
+/// Right after `${`. A `#` before the start of a parameter is the length
+/// (`${#x}`, `${##}`); otherwise it is the parameter `#` (`${#}`).
+static PARAM_NAME: LazyLock<Vec<Specification>> = LazyLock::new(|| {
+    vec![
+        spec(
+            &format!(r"^(#)(?:{NAME}|[0-9]|{SPECIAL})"),
+            TokenType::ParamHash,
+        ),
+        spec(
+            &format!(r"^({NAME}|[0-9]+|{SPECIAL})"),
+            TokenType::ParamName,
+        ),
+        spec(r"^(\})", TokenType::CloseBrace),
+        spec(r"^(\z)", TokenType::Eof),
+    ]
+});
+
+/// After the parameter of a `${`: an operator, the longest first, or the end.
+static PARAM_OP: LazyLock<Vec<Specification>> = LazyLock::new(|| {
+    vec![
+        spec(r"^(:[-=?+]|[-=?+]|%%|%|##|#)", TokenType::ParamOp),
+        spec(r"^(\})", TokenType::CloseBrace),
+        spec(r"^(\z)", TokenType::Eof),
+    ]
+});
+
+/// The word after the operator of a `${`, outside double quotes: quotes,
+/// parameters and command substitutions as in `Normal`, every other character
+/// (blanks too) is text, `}` ends it.
+static PARAM_WORD: LazyLock<Vec<Specification>> = LazyLock::new(|| {
+    vec![
+        spec(r"^(\})", TokenType::CloseBrace),
+        spec(r"^(\$\()", TokenType::Andopen),
+        spec(r"^(\$\{)", TokenType::ParamOpen),
+        spec(&PARAM, TokenType::Param),
+        spec(r"^(')", TokenType::SQuote),
+        spec(r#"^(")"#, TokenType::DQuote),
+        spec(BACKQUOTED, TokenType::Backquoted),
+        spec(r#"^((?:[^}$`'"\\]|\\[\s\S])+)"#, TokenType::Literal),
+        spec(r"^(\$|\\)", TokenType::Literal),
+        spec(r"^(\z)", TokenType::Eof),
+    ]
+});
+
+/// The same inside double quotes: `'` is text, `"` opens a nested quoted part.
+// TODO: `\}` keeps its backslash here (`DqText` escapes), bash drops it.
+static PARAM_WORD_DQ: LazyLock<Vec<Specification>> = LazyLock::new(|| {
+    vec![
+        spec(r"^(\})", TokenType::CloseBrace),
+        spec(r"^(\$\()", TokenType::Andopen),
+        spec(r"^(\$\{)", TokenType::ParamOpen),
+        spec(&PARAM, TokenType::Param),
+        spec(r#"^(")"#, TokenType::DQuote),
+        spec(BACKQUOTED, TokenType::Backquoted),
+        spec(r#"^((?:[^}$`"\\]|\\[\s\S])+)"#, TokenType::DqText),
         spec(r"^(\$|\\)", TokenType::DqText),
         spec(r"^(\z)", TokenType::Eof),
     ]
@@ -307,6 +400,10 @@ impl<'a> Tokenizer<'a> for UnbufferedTokenizer<'a> {
             Mode::Normal => &NORMAL,
             Mode::SingleQuoted => &SINGLE_QUOTED,
             Mode::DoubleQuoted => &DOUBLE_QUOTED,
+            Mode::ParamName => &PARAM_NAME,
+            Mode::ParamOp => &PARAM_OP,
+            Mode::ParamWord => &PARAM_WORD,
+            Mode::ParamWordDq => &PARAM_WORD_DQ,
         };
 
         let blank = mode == Mode::Normal && self.skip_blanks();
@@ -524,11 +621,84 @@ mod tests {
     fn a_param_ends_with_its_name() {
         use TokenType::*;
         assert_eq!(tokens("$HOME/x"), [(Param, "$HOME"), (Literal, "/x")]);
-        assert_eq!(tokens("${a}b"), [(Param, "${a}"), (Literal, "b")]);
         assert_eq!(tokens("$1x"), [(Param, "$1"), (Literal, "x")]);
         assert_eq!(tokens("$?$$"), [(Param, "$?"), (Param, "$$")]);
         assert_eq!(tokens("$città."), [(Param, "$città"), (Literal, ".")]);
         assert_eq!(tokens("a$"), [(Literal, "a"), (Literal, "$")]);
+        // With braces only the opening is a token: the parser reads the rest.
+        assert_eq!(tokens("${a}b"), [(ParamOpen, "${"), (Literal, "a}b")]);
+    }
+
+    /// The tokens of `input` in `mode`, up to the end of the input.
+    fn tokens_in(mode: Mode, input: &str) -> Vec<(TokenType, &str)> {
+        let tok = UnbufferedTokenizer::new(input);
+        std::iter::from_fn(|| tok.next_token_in(mode))
+            .take_while(|token| token.t_type != TokenType::Eof)
+            .map(|token| (token.t_type, token.value))
+            .collect()
+    }
+
+    #[test]
+    fn inside_braces_the_parser_picks_each_piece() {
+        use TokenType::*;
+
+        assert_eq!(
+            tokens_in(Mode::DoubleQuoted, "${x"),
+            [(ParamOpen, "${"), (DqText, "x")]
+        );
+
+        // The name: a `#` before a parameter is the length.
+        assert_eq!(
+            tokens_in(Mode::ParamName, "#x"),
+            [(ParamHash, "#"), (ParamName, "x")]
+        );
+        assert_eq!(
+            tokens_in(Mode::ParamName, "#}"),
+            [(ParamName, "#"), (CloseBrace, "}")]
+        );
+        assert_eq!(
+            tokens_in(Mode::ParamName, "##"),
+            [(ParamHash, "#"), (ParamName, "#")]
+        );
+        assert_eq!(
+            tokens_in(Mode::ParamName, "10}"),
+            [(ParamName, "10"), (CloseBrace, "}")]
+        );
+        assert_eq!(tokens_in(Mode::ParamName, "città"), [(ParamName, "città")]);
+
+        // The operator, the longest first.
+        for op in [
+            ":-", ":=", ":?", ":+", "-", "=", "?", "+", "%%", "%", "##", "#",
+        ] {
+            assert_eq!(tokens_in(Mode::ParamOp, op), [(ParamOp, op)], "{op}");
+        }
+        assert_eq!(tokens_in(Mode::ParamOp, "}"), [(CloseBrace, "}")]);
+        assert!(tokens_in(Mode::ParamOp, " b").is_empty(), "no operator");
+    }
+
+    #[test]
+    fn the_word_of_a_brace_keeps_blanks_and_ends_at_the_brace() {
+        use TokenType::*;
+
+        assert_eq!(
+            tokens_in(Mode::ParamWord, "a b\\}c}"),
+            [(Literal, "a b\\}c"), (CloseBrace, "}")]
+        );
+        assert_eq!(
+            tokens_in(Mode::ParamWord, "'}'$x${"),
+            [
+                (SQuote, "'"),
+                (CloseBrace, "}"),
+                (SQuote, "'"),
+                (Param, "$x"),
+                (ParamOpen, "${")
+            ]
+        );
+        // Inside double quotes a `'` is text.
+        assert_eq!(
+            tokens_in(Mode::ParamWordDq, "'a'\"}"),
+            [(DqText, "'a'"), (DQuote, "\""), (CloseBrace, "}")]
+        );
     }
 
     #[test]
