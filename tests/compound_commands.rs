@@ -165,3 +165,39 @@ fn a_bad_for_loop_variable_is_a_syntax_error() {
     assert!(stderr(&output).contains("rush: syntax error"));
     assert_eq!(stdout(&output), "after\n");
 }
+
+#[test]
+fn while_and_until_are_not_implemented_yet() {
+    // Neither body runs, so the test can't loop.
+    let output = run_shell(
+        "while true; do echo x; done\necho status $?\nuntil false; do echo y; done\necho status $?\n",
+    );
+
+    assert!(stderr(&output).contains("rush: while: not implemented yet"));
+    assert!(stderr(&output).contains("rush: until: not implemented yet"));
+    assert_eq!(stdout(&output), "status 1\nstatus 1\n");
+}
+
+#[test]
+fn a_while_without_do_is_a_syntax_error() {
+    let output = run_shell("while true do echo; done\necho after\n");
+
+    assert!(stderr(&output).contains("rush: syntax error"));
+    assert_eq!(stdout(&output), "after\n");
+}
+
+#[test]
+fn a_case_is_not_implemented_yet() {
+    let output = run_shell("case x in x) echo y;; esac\necho status $?\n");
+
+    assert!(stderr(&output).contains("rush: case: not implemented yet"));
+    assert_eq!(stdout(&output), "status 1\n");
+}
+
+#[test]
+fn a_bare_esac_pattern_is_a_syntax_error() {
+    let output = run_shell("case esac in esac) echo x;; esac\necho after\n");
+
+    assert!(stderr(&output).contains("rush: syntax error"));
+    assert_eq!(stdout(&output), "after\n");
+}

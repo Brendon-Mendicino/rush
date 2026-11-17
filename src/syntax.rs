@@ -163,7 +163,10 @@ pub enum Command<'a> {
 pub enum CompoundCommand<'a> {
     Subshell(Subshell<'a>),
     For(ForClause<'a>),
+    Case(CaseClause<'a>),
     If(IfClause<'a>),
+    While(WhileClause<'a>),
+    Until(UntilClause<'a>),
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +253,37 @@ pub struct ForClause<'a> {
     /// positional parameters (`"$@"`). Empty with `in` and no word
     /// (`for x in; do`): the body never runs.
     pub wordlist: Option<Vec<Word<'a>>>,
+    pub body: List<'a>,
+}
+
+/// `case word in pattern|pattern) list;; ... esac` (§2.9.4.3).
+#[derive(Debug, Clone)]
+pub struct CaseClause<'a> {
+    pub word: Word<'a>,
+    pub items: Vec<CaseItem<'a>>,
+}
+
+/// `(pattern|pattern) list ;;`: the `(` and the `;;` of the last item are
+/// optional, and not kept.
+#[derive(Debug, Clone)]
+pub struct CaseItem<'a> {
+    /// At least one.
+    pub patterns: Vec<Word<'a>>,
+    /// `None` for an empty body: `a) ;;`.
+    pub body: Option<List<'a>>,
+}
+
+/// `while condition; do body; done` (§2.9.4.4).
+#[derive(Debug, Clone)]
+pub struct WhileClause<'a> {
+    pub condition: List<'a>,
+    pub body: List<'a>,
+}
+
+/// `until condition; do body; done` (§2.9.4.5).
+#[derive(Debug, Clone)]
+pub struct UntilClause<'a> {
+    pub condition: List<'a>,
     pub body: List<'a>,
 }
 
@@ -679,11 +713,60 @@ impl fmt::Display for ForClause<'_> {
     }
 }
 
+impl fmt::Display for CaseClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "case {} in ", self.word)?;
+        for item in &self.items {
+            write!(f, "{item} ")?;
+        }
+        f.write_str("esac")
+    }
+}
+
+/// Always with its `;;`. The `(` only when the first pattern is `esac`, which
+/// would end the case without it (rule 4).
+impl fmt::Display for CaseItem<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.patterns.first().and_then(reserved) == Some(ReservedWord::Esac) {
+            f.write_str("(")?;
+        }
+        join(f, &self.patterns, "|")?;
+        f.write_str(") ")?;
+        if let Some(body) = &self.body {
+            write!(f, "{body}")?;
+        }
+        f.write_str(";;")
+    }
+}
+
+impl fmt::Display for WhileClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("while ")?;
+        write_terminated(f, &self.condition)?;
+        f.write_str("do ")?;
+        write_terminated(f, &self.body)?;
+        f.write_str("done")
+    }
+}
+
+impl fmt::Display for UntilClause<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("until ")?;
+        write_terminated(f, &self.condition)?;
+        f.write_str("do ")?;
+        write_terminated(f, &self.body)?;
+        f.write_str("done")
+    }
+}
+
 impl fmt::Display for CompoundCommand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompoundCommand::Subshell(subshell) => write!(f, "{subshell}"),
             CompoundCommand::For(clause) => write!(f, "{clause}"),
+            CompoundCommand::Case(clause) => write!(f, "{clause}"),
+            CompoundCommand::While(clause) => write!(f, "{clause}"),
+            CompoundCommand::Until(clause) => write!(f, "{clause}"),
             CompoundCommand::If(clause) => write!(f, "{clause}"),
         }
     }
@@ -1103,9 +1186,7 @@ impl SyntaxTree {
     where
         T: Tokenizer<'a>,
     {
-        // TODO: try the other alternatives once they are implemented:
-        // `Self::brace_group`, `Self::case_clause`, `Self::while_clause`,
-        // `Self::until_clause`.
+        // TODO: try `Self::brace_group` once it is implemented.
         if let Some(subshell) = Self::subshell(tok) {
             return Some(CompoundCommand::Subshell(subshell));
         }
@@ -1114,7 +1195,19 @@ impl SyntaxTree {
             return Some(CompoundCommand::For(clause));
         }
 
-        Self::if_clause(tok).map(CompoundCommand::If)
+        if let Some(clause) = Self::case_clause(tok) {
+            return Some(CompoundCommand::Case(clause));
+        }
+
+        if let Some(clause) = Self::if_clause(tok) {
+            return Some(CompoundCommand::If(clause));
+        }
+
+        if let Some(clause) = Self::while_clause(tok) {
+            return Some(CompoundCommand::While(clause));
+        }
+
+        Self::until_clause(tok).map(CompoundCommand::Until)
     }
 
     /// BNF:
@@ -1337,12 +1430,23 @@ impl SyntaxTree {
     ///               | Case WORD linebreak in linebreak              Esac
     ///               ;
     /// ```
-    pub fn case_clause<'a, T>(_tok: &T) -> Option<()>
+    pub fn case_clause<'a, T>(tok: &T) -> Option<CaseClause<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("case_clause: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::Case)?;
+        let word = Self::word(&sub_tok)?;
+        Self::linebreak(&sub_tok);
+        Self::r#in(&sub_tok)?;
+        Self::linebreak(&sub_tok);
+        let items = Self::case_list_ns(&sub_tok);
+        Self::reserved_word(&sub_tok, ReservedWord::Esac)?;
+
+        tok.merge(sub_tok);
+
+        Some(CaseClause { word, items })
     }
 
     /// BNF:
@@ -1352,12 +1456,20 @@ impl SyntaxTree {
     ///                |           case_item_ns
     ///                ;
     /// ```
-    pub fn case_list_ns<'a, T>(_tok: &T) -> Option<()>
+    ///
+    /// Read as the items with their `;;` (`case_list`), then an optional last
+    /// one without it, this covers the three alternatives of `case_clause`
+    /// (`case_list`, `case_list_ns` and no item). Every item is parsed once:
+    /// trying the alternatives one by one would parse them again, twice at
+    /// each level of nesting.
+    pub fn case_list_ns<'a, T>(tok: &T) -> Vec<CaseItem<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("case_list_ns: not implemented")
+        let mut items = Self::case_list(tok);
+        items.extend(Self::case_item_ns(tok));
+
+        items
     }
 
     /// BNF:
@@ -1367,12 +1479,18 @@ impl SyntaxTree {
     ///             |           case_item
     ///             ;
     /// ```
-    pub fn case_list<'a, T>(_tok: &T) -> Option<()>
+    ///
+    /// Empty when there is no item: the caller tells the alternatives apart.
+    pub fn case_list<'a, T>(tok: &T) -> Vec<CaseItem<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("case_list: not implemented")
+        let mut items = Vec::new();
+        while let Some(item) = Self::case_item(tok) {
+            items.push(item);
+        }
+
+        items
     }
 
     /// BNF:
@@ -1384,12 +1502,32 @@ impl SyntaxTree {
     ///                | '(' pattern ')' compound_list
     ///                ;
     /// ```
-    pub fn case_item_ns<'a, T>(_tok: &T) -> Option<()>
+    ///
+    /// Rule 4 is applied here: without the `(`, a word `esac` ends the case
+    /// instead of starting an item. After `(` it is a pattern, like in dash
+    /// and bash (`case esac in (esac)`).
+    pub fn case_item_ns<'a, T>(tok: &T) -> Option<CaseItem<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("case_item_ns: not implemented")
+        let sub_tok = tok.clone();
+
+        let paren = sub_tok.next_if_type(TokenType::OpenRound).is_some();
+        if !paren && Self::reserved_word(&sub_tok.clone(), ReservedWord::Esac).is_some() {
+            return None;
+        }
+
+        let patterns = Self::pattern(&sub_tok)?;
+        sub_tok.next_if_type(TokenType::CloseRound)?;
+
+        let body = Self::compound_list(&sub_tok);
+        if body.is_none() {
+            Self::linebreak(&sub_tok);
+        }
+
+        tok.merge(sub_tok);
+
+        Some(CaseItem { patterns, body })
     }
 
     /// BNF:
@@ -1401,12 +1539,19 @@ impl SyntaxTree {
     ///             | '(' pattern ')' compound_list DSEMI linebreak
     ///             ;
     /// ```
-    pub fn case_item<'a, T>(_tok: &T) -> Option<()>
+    pub fn case_item<'a, T>(tok: &T) -> Option<CaseItem<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("case_item: not implemented")
+        let sub_tok = tok.clone();
+
+        let item = Self::case_item_ns(&sub_tok)?;
+        sub_tok.next_if_type(TokenType::Dsemi)?;
+        Self::linebreak(&sub_tok);
+
+        tok.merge(sub_tok);
+
+        Some(item)
     }
 
     /// BNF:
@@ -1416,11 +1561,29 @@ impl SyntaxTree {
     ///           | pattern '|' WORD                Do not apply rule 4
     ///           ;
     /// ```
-    pub fn pattern<'a, T>(_tok: &T) -> Option<Vec<Word<'a>>>
+    ///
+    /// Rule 4 is applied by `case_item_ns`, which knows about the `(`.
+    pub fn pattern<'a, T>(tok: &T) -> Option<Vec<Word<'a>>>
     where
         T: Tokenizer<'a>,
     {
-        unimplemented!("pattern: not implemented")
+        let mut patterns = vec![Self::word(tok)?];
+
+        loop {
+            let sub_tok = tok.clone();
+
+            if sub_tok.next_if_type(TokenType::Pipe).is_none() {
+                break;
+            }
+            let Some(pattern) = Self::word(&sub_tok) else {
+                break;
+            };
+
+            patterns.push(pattern);
+            tok.merge(sub_tok);
+        }
+
+        Some(patterns)
     }
 
     /// BNF:
@@ -1495,12 +1658,19 @@ impl SyntaxTree {
     /// while_clause ::= While compound_list do_group
     ///                ;
     /// ```
-    pub fn while_clause<'a, T>(_tok: &T) -> Option<()>
+    pub fn while_clause<'a, T>(tok: &T) -> Option<WhileClause<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("while_clause: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::While)?;
+        let condition = Self::compound_list(&sub_tok)?;
+        let body = Self::do_group(&sub_tok)?;
+
+        tok.merge(sub_tok);
+
+        Some(WhileClause { condition, body })
     }
 
     /// BNF:
@@ -1509,12 +1679,19 @@ impl SyntaxTree {
     /// until_clause ::= Until compound_list do_group
     ///                ;
     /// ```
-    pub fn until_clause<'a, T>(_tok: &T) -> Option<()>
+    pub fn until_clause<'a, T>(tok: &T) -> Option<UntilClause<'a>>
     where
         T: Tokenizer<'a>,
     {
-        // TODO: the AST node, `()` until it exists.
-        unimplemented!("until_clause: not implemented")
+        let sub_tok = tok.clone();
+
+        Self::reserved_word(&sub_tok, ReservedWord::Until)?;
+        let condition = Self::compound_list(&sub_tok)?;
+        let body = Self::do_group(&sub_tok)?;
+
+        tok.merge(sub_tok);
+
+        Some(UntilClause { condition, body })
     }
 
     /// BNF:
@@ -2762,6 +2939,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn case_clauses_print_back() {
+        for input in [
+            "case x in esac",
+            "case x in a) b;; esac",
+            "case $1 in a|b) c; d;; *) e;; esac",
+            "case x in a) ;; esac",
+            "case x in a) b &;; esac",
+            "case x in \"a b\") c;; 'd'|$e) f;; esac",
+            // Any word: rule 4 only makes `esac` special.
+            "case in in in) a;; esac",
+            "case x in if) a;; esac",
+            "case x in a) case y in b) c;; esac;; esac",
+            "case x in a) b;; esac >f | c",
+            // The `(` is needed for `esac` to be a pattern.
+            "case esac in (esac) a;; esac",
+            "case esac in a|esac) b;; esac",
+        ] {
+            assert_eq!(reprint(input), input);
+        }
+
+        for (input, printed) in [
+            ("case x in (a|b) c;; esac", "case x in a|b) c;; esac"),
+            ("case x in a) b; esac", "case x in a) b;; esac"),
+            ("case x in a) esac", "case x in a) ;; esac"),
+        ] {
+            assert_eq!(reprint(input), printed);
+        }
+
+        let lines: Vec<String> = [
+            "case $x\n",
+            "in\n",
+            "  a)\n",
+            "    b\n",
+            "    ;;\n",
+            "  *) c;;\n",
+            "esac\n",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).unwrap();
+        assert!(tok.next_is_eof());
+        assert_eq!(
+            program.child.commands[0].to_string(),
+            "case $x in a) b;; *) c;; esac"
+        );
+    }
+
+    #[test]
+    fn case_items() {
+        let tok = UnbufferedTokenizer::new("case w in a|b) c;; d) ;; esac");
+        let Some(Command::Compound {
+            command: CompoundCommand::Case(clause),
+            ..
+        }) = SyntaxTree::command(&tok)
+        else {
+            panic!("a case expected");
+        };
+        assert!(tok.next_is_eof());
+
+        assert_eq!(clause.word.to_string(), "w");
+        let [first, second] = clause.items.as_slice() else {
+            panic!("two items expected: {:?}", clause.items);
+        };
+        let patterns: Vec<String> = first.patterns.iter().map(ToString::to_string).collect();
+        assert_eq!(patterns, ["a", "b"]);
+        assert_eq!(
+            first.body.as_ref().map(ToString::to_string).as_deref(),
+            Some("c")
+        );
+        assert!(second.body.is_none());
+    }
+
+    #[test]
+    fn bad_case_clauses() {
+        for input in [
+            // Rule 4: a bare `esac` ends the case.
+            "case x in esac) a;; esac",
+            "case x in ) a;; esac",
+            "case x in a) b;; ;; esac",
+            "case x; in a) ;; esac",
+            // `esac` is an argument of `d`.
+            "case x in a) b;; c) d esac",
+            "case x in a) b; esac esac",
+            "case x in a b) c;; esac",
+            "case in a) b;; esac",
+            "case x in a) b",
+            "case x in",
+        ] {
+            assert!(!parses(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn while_and_until_print_back() {
+        for input in [
+            "while a; do b; done",
+            "until a; do b; done",
+            "while a; b; do c; d; done",
+            "while a & do b & done",
+            "while while a; do b; done; do c; done",
+            "until a; do for x in y; do b; done; done >f",
+            "while a; do b; done | until c; do d; done && e",
+            "while a; do b; done &",
+        ] {
+            assert_eq!(reprint(input), input);
+        }
+
+        let lines: Vec<String> = ["while a\n", "do\n", "  b\n", "done\n"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let tok = crate::tokenizer::BufTokenizer::from_buffer(&lines);
+        let program = SyntaxTree::program(&tok).unwrap();
+        assert!(tok.next_is_eof());
+        assert_eq!(program.child.commands[0].to_string(), "while a; do b; done");
+    }
+
+    #[test]
+    fn while_and_until_parts() {
+        let tok = UnbufferedTokenizer::new("while a; b; do c; done");
+        let Some(Command::Compound {
+            command: CompoundCommand::While(clause),
+            ..
+        }) = SyntaxTree::command(&tok)
+        else {
+            panic!("a while expected");
+        };
+        assert_eq!(clause.condition.to_string(), "a; b");
+        assert_eq!(clause.body.to_string(), "c");
+
+        let tok = UnbufferedTokenizer::new("until x; do y; done");
+        let Some(Command::Compound {
+            command: CompoundCommand::Until(clause),
+            ..
+        }) = SyntaxTree::command(&tok)
+        else {
+            panic!("an until expected");
+        };
+        assert_eq!(clause.condition.to_string(), "x");
+        assert_eq!(clause.body.to_string(), "y");
+    }
+
+    #[test]
+    fn bad_while_and_until() {
+        for input in [
+            "while; do a; done",
+            "until; do a; done",
+            "while a; do done",
+            // `do b` are arguments of `a`: the `do` is missing.
+            "while a do b; done",
+            "while a; b; done",
+            "until a; do b",
+            "while a; do b; done done",
+        ] {
+            assert!(!parses(input), "{input}");
+        }
+    }
+
     /// The whole input is one program.
     fn parses(input: &str) -> bool {
         let lines = vec![format!("{input}\n")];
@@ -2796,6 +3134,8 @@ mod tests {
             "iffy",
             "fi'x'",
             "echo for in do done",
+            "echo while until",
+            "echo case in esac",
         ] {
             let tok = UnbufferedTokenizer::new(input);
             assert!(

@@ -104,6 +104,13 @@ fn job_exit(status: ExecStatus) -> JobExit {
     }
 }
 
+/// A compound command that is parsed but not run yet: reported like the
+/// built-in stubs, status 1.
+fn not_implemented(name: &str) -> ExecStatus {
+    eprintln!("rush: {name}: not implemented yet");
+    ExecStatus::FAILURE
+}
+
 /// Report a command that could not be spawned. The status follows other shells:
 /// 127 when the program does not exist, 126 when it cannot be executed.
 fn spawn_failure(program: &str, err: &io::Error) -> JobExit {
@@ -1306,12 +1313,12 @@ impl Executor {
     fn compound_body(&mut self, command: &CompoundCommand) -> ExecStatus {
         match command {
             CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
-            // TODO: run the loop (TODO.md).
-            CompoundCommand::For(_) => {
-                eprintln!("rush: for: not implemented yet");
-                ExecStatus::FAILURE
-            }
             CompoundCommand::If(clause) => self.if_clause(clause),
+            // TODO: run them (TODO.md).
+            CompoundCommand::For(_) => not_implemented("for"),
+            CompoundCommand::Case(_) => not_implemented("case"),
+            CompoundCommand::While(_) => not_implemented("while"),
+            CompoundCommand::Until(_) => not_implemented("until"),
         }
     }
 
