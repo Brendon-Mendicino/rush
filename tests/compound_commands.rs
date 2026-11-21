@@ -1,6 +1,7 @@
 //! Compound commands (§2.9.4) other than subshells, which have their own file:
-//! `if`, `for`. They run in the shell itself, or in a forked child inside a
-//! pipeline. `break` and `continue` are tested with the built-ins.
+//! `if`, `for`, `while`, `until`. They run in the shell itself, or in a forked
+//! child inside a pipeline. `break` and `continue` are tested with the
+//! built-ins.
 
 mod common;
 
@@ -226,16 +227,61 @@ fn a_bad_for_loop_variable_is_a_syntax_error() {
     assert_eq!(stdout(&output), "after\n");
 }
 
+// The `while`/`until` tests loop over the positional parameters with `shift`,
+// so a wrong condition ends the loop instead of hanging the test.
+
 #[test]
-fn while_and_until_are_not_implemented_yet() {
-    // Neither body runs, so the test can't loop.
+fn while_runs_the_body_while_the_condition_succeeds() {
+    let output = run_shell("set -- a b c; while [ $# -gt 0 ]; do echo $1; shift; done\n");
+
+    assert_eq!(stdout(&output), "a\nb\nc\n");
+}
+
+#[test]
+fn until_runs_the_body_while_the_condition_fails() {
+    let output = run_shell("set -- a b c; until [ $# -eq 0 ]; do echo $1; shift; done\n");
+
+    assert_eq!(stdout(&output), "a\nb\nc\n");
+}
+
+#[test]
+fn every_command_of_the_while_condition_runs() {
+    let output = run_shell("set -- a; while echo c; [ $# -gt 0 ]; do shift; done\n");
+
+    assert_eq!(stdout(&output), "c\nc\n");
+}
+
+#[test]
+fn while_status_is_the_last_body_status() {
     let output = run_shell(
-        "while true; do echo x; done\necho status $?\nuntil false; do echo y; done\necho status $?\n",
+        "set -- a; while [ $# -gt 0 ]; do shift; false; done; echo $?\n\
+         false; while false; do :; done; echo $?\n\
+         false; until true; do :; done; echo $?\n\
+         set -- a; until [ $# -eq 0 ]; do shift; sh -c 'exit 3'; done; echo $?\n",
     );
 
-    assert!(stderr(&output).contains("rush: while: not implemented yet"));
-    assert!(stderr(&output).contains("rush: until: not implemented yet"));
-    assert_eq!(stdout(&output), "status 1\nstatus 1\n");
+    assert_eq!(stdout(&output), "1\n0\n0\n3\n");
+}
+
+#[test]
+fn while_runs_in_the_shell() {
+    let output =
+        run_shell("set -- a b; while [ $# -gt 0 ]; do last=$1; shift; done\necho $# $last\n");
+
+    assert_eq!(stdout(&output), "0 b\n");
+}
+
+#[test]
+fn while_in_a_pipeline_and_redirected() {
+    let dir = test_dir("while_in_a_pipeline_and_redirected");
+    let output = run_shell_in(
+        "set -- a b\nwhile [ $# -gt 0 ]; do echo $1; shift; done | tr a-z A-Z\n\
+         echo $#\n\
+         until [ $# -eq 0 ]; do echo $1; shift; done >f\ncat f\n",
+        &dir,
+    );
+
+    assert_eq!(stdout(&output), "A\nB\n2\na\nb\n");
 }
 
 #[test]

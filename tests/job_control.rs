@@ -357,6 +357,33 @@ fn ctrl_c_stops_a_for_loop() {
 }
 
 #[test]
+fn ctrl_c_stops_a_while_loop() {
+    let mut sh = InteractiveShell::spawn();
+
+    sh.send("while true; do sleep 30; echo no; done\n");
+    sh.wait_foreground_job("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    assert!(!output.contains("no"), "the loop went on: {output:?}");
+    assert!(output.contains(RED), "the status is 130");
+}
+
+#[test]
+fn ctrl_c_in_the_condition_stops_until() {
+    let mut sh = InteractiveShell::spawn();
+
+    // An interrupted condition is not a failure that runs the body.
+    sh.send("until sleep 30; do echo no; done\n");
+    sh.wait_foreground_job("sleep");
+    sh.send("\x03");
+
+    let output = sh.expect_prompt();
+    assert!(!output.contains("no"), "the loop went on: {output:?}");
+    assert!(output.contains(RED), "the status is 130");
+}
+
+#[test]
 fn ctrl_z_in_an_if_stops_only_the_command() {
     let mut sh = InteractiveShell::spawn();
 

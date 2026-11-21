@@ -91,3 +91,25 @@ fn the_depth_goes_down_after_a_loop() {
 
     assert_eq!(stdout(&output), "a\nb\n");
 }
+
+#[test]
+fn leaves_while_and_until() {
+    let output = run_shell(
+        "while true; do echo once; break; done\n\
+         while true; do until false; do echo in; break 2; done; echo no; done; echo out\n",
+    );
+
+    assert_eq!(stdout(&output), "once\nin\nout\n");
+}
+
+#[test]
+fn in_the_condition_leaves_the_loop() {
+    // The condition is in the loop (§2.14): were it not, `break` would do
+    // nothing and the body would run once.
+    let output = run_shell(
+        "set -- a; while break; [ $# -gt 0 ]; do shift; echo no; done; echo while $?\n\
+         set -- a; until break; [ $# -eq 0 ]; do shift; echo no; done; echo until $?\n",
+    );
+
+    assert_eq!(stdout(&output), "while 0\nuntil 0\n");
+}

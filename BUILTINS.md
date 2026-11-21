@@ -145,12 +145,12 @@ Legend: `[x]` already works · `[ ]` to do. Spec page in brackets.
 - [x] a failed redirection exits a non-interactive shell (0.6)
 
 #### `break [n]` / `continue [n]`
-- [x] work in `for` loops (`while`/`until` are not run yet); tests in `tests/builtins/{break,continue}.rs`
+- [x] work in `for`, `while` and `until` loops, also from a `while`/`until` condition (`Executor::loop_step`); tests in `tests/builtins/{break,continue}.rs`
 - [x] `n` defaults to 1; if `n` > the number of enclosing loops, use the outermost one (`Executor::jump` clamps it to `loop_depth`, counted by `LoopGuard`); outside a loop they do nothing, status 0 (dash, bash)
 - [x] `n` not an integer ≥ 1 → a usage error, status 2, which exits a script (special-built-in error, like dash): `parse_loop_count`
 - [ ] "enclosing" means lexical: not across a function body, not from a dot script or trap. Moot until functions, `.` and traps exist; `eval break` leaves the loop around it, like in dash and bash. In a forked child (`(break)`, `break | cat`, `$(break)`) only the child stops, like dash
 - [x] `continue`: take the next `for` value
-- [ ] `continue`: re-run the `while`/`until` condition
+- [x] `continue`: re-run the `while`/`until` condition, also from the condition itself
 
 #### `.` (dot) `. file`
 - [ ] if `file` has no `/`, search PATH (the file doesn't need to be executable); never fall back to the cwd

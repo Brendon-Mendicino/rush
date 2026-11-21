@@ -55,6 +55,20 @@ pub enum LoopControl {
     Continue(usize),
 }
 
+/// What a loop does with the status of its body, or of a `while`/`until`
+/// condition ([`loop_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopStep {
+    /// The commands ran to their end, with this status.
+    Ran(ExecStatus),
+    /// `continue` for this loop: back to the top (the next `for` value, the
+    /// `while`/`until` condition again). Its status is 0.
+    Next,
+    /// `break` for this loop (status 0), a jump for an outer loop (one level
+    /// less), or Ctrl-C: the loop ends with this status.
+    Stop(ExecStatus),
+}
+
 impl ExecStatus {
     pub const SUCCESS: Self = Self::Exited(0);
     pub const FAILURE: Self = Self::Exited(1);
@@ -112,16 +126,6 @@ impl LoopControl {
             Self::Continue(n) => Self::Continue(n.min(depth)),
         }
     }
-
-    /// The jump a loop passes on after taking one level: `None` when it was
-    /// for this loop.
-    fn outer(self) -> Option<Self> {
-        match self {
-            Self::Break(1) | Self::Continue(1) => None,
-            Self::Break(n) => Some(Self::Break(n - 1)),
-            Self::Continue(n) => Some(Self::Continue(n - 1)),
-        }
-    }
 }
 
 impl From<JobExit> for ExecStatus {
@@ -144,6 +148,24 @@ fn job_exit(status: ExecStatus) -> JobExit {
         // The job that stopped is already in the background jobs. A jump never
         // gets here: every command of such a pipeline is forked.
         status @ (ExecStatus::Stopped(_) | ExecStatus::Jump(_)) => JobExit::Exited(status.code()),
+    }
+}
+
+/// Take a jump for a loop (§2.14 `break`, `continue`): the one for this loop
+/// ends here, one for an outer loop goes up one level less.
+fn loop_step(status: ExecStatus) -> LoopStep {
+    match status {
+        ExecStatus::Jump(LoopControl::Break(1)) => LoopStep::Stop(ExecStatus::SUCCESS),
+        ExecStatus::Jump(LoopControl::Continue(1)) => LoopStep::Next,
+        ExecStatus::Jump(LoopControl::Break(n)) => {
+            LoopStep::Stop(ExecStatus::Jump(LoopControl::Break(n - 1)))
+        }
+        ExecStatus::Jump(LoopControl::Continue(n)) => {
+            LoopStep::Stop(ExecStatus::Jump(LoopControl::Continue(n - 1)))
+        }
+        // Interrupted (Ctrl-C): the whole loop stops.
+        status if status.interrupted() => LoopStep::Stop(status),
+        status => LoopStep::Ran(status),
     }
 }
 
@@ -1404,11 +1426,11 @@ impl Executor {
         match command {
             CompoundCommand::Subshell(subshell) => self.list(&subshell.seq_list),
             CompoundCommand::If(clause) => self.if_clause(clause),
-            // TODO: run them (TODO.md).
             CompoundCommand::For(clause) => self.for_clause(clause),
+            // TODO: run it (TODO.md).
             CompoundCommand::Case(_) => not_implemented("case"),
-            CompoundCommand::While(_) => not_implemented("while"),
-            CompoundCommand::Until(_) => not_implemented("until"),
+            CompoundCommand::While(clause) => self.while_clause(clause),
+            CompoundCommand::Until(clause) => self.until_clause(clause),
         }
     }
 
@@ -1476,34 +1498,58 @@ impl Executor {
             // A readonly variable: a variable assignment error.
             // TODO: handled by the application's error handler (TODO.md §10).
             if let Err(e) = executor.shell.env.assign(clause.name, value) {
-                status = Self::fail(e, executor.exits(false));
-                break;
+                return Self::fail(e, executor.exits(false));
             }
 
-            status = executor.list(&clause.body);
-
-            match status {
-                ExecStatus::Jump(control) => match control.outer() {
-                    // For an outer loop: this one stops, the jump goes up.
-                    Some(outer) => {
-                        status = ExecStatus::Jump(outer);
-                        break;
-                    }
-                    // For this loop: `$?` is 0, the status of the built-in.
-                    None => {
-                        status = ExecStatus::SUCCESS;
-                        if matches!(control, LoopControl::Break(_)) {
-                            break;
-                        }
-                    }
-                },
-                // Interrupted (Ctrl-C): the whole loop stops.
-                status if status.interrupted() => break,
-                _ => {}
-            }
+            status = match loop_step(executor.list(&clause.body)) {
+                LoopStep::Ran(status) => status,
+                LoopStep::Next => ExecStatus::SUCCESS,
+                LoopStep::Stop(status) => return status,
+            };
         }
 
         status
+    }
+
+    /// `while condition; do body; done` (§2.9.4.4): the body runs as long as
+    /// the condition succeeds.
+    fn while_clause(&mut self, clause: &WhileClause) -> ExecStatus {
+        self.condition_loop(&clause.condition, &clause.body, false)
+    }
+
+    /// `until condition; do body; done` (§2.9.4.5): the body runs as long as
+    /// the condition fails.
+    fn until_clause(&mut self, clause: &UntilClause) -> ExecStatus {
+        self.condition_loop(&clause.condition, &clause.body, true)
+    }
+
+    /// The loop of `while` and `until`: the condition runs, then the body
+    /// while the condition succeeds (fails when `until`). The status is the
+    /// body's last one, 0 when it never ran.
+    fn condition_loop(&mut self, condition: &List, body: &List, until: bool) -> ExecStatus {
+        let mut status = ExecStatus::SUCCESS;
+        // Before the condition: a `break`/`continue` in it is for this loop
+        // too (§2.14 `break`, "enclosing").
+        let mut executor = self.enter_loop();
+
+        loop {
+            let tested = match loop_step(executor.list(condition)) {
+                LoopStep::Ran(tested) => tested,
+                // Back to the top: the condition again.
+                LoopStep::Next => continue,
+                LoopStep::Stop(status) => return status,
+            };
+
+            if tested.failure() != until {
+                return status;
+            }
+
+            status = match loop_step(executor.list(body)) {
+                LoopStep::Ran(status) => status,
+                LoopStep::Next => ExecStatus::SUCCESS,
+                LoopStep::Stop(status) => return status,
+            };
+        }
     }
 
     /// Count a loop in `loop_depth` while the returned guard lives.
@@ -2477,15 +2523,33 @@ mod tests {
 
     #[test]
     fn loop_control_levels() {
-        assert_eq!(LoopControl::Break(1).outer(), None);
-        assert_eq!(LoopControl::Continue(1).outer(), None);
-        assert_eq!(LoopControl::Break(3).outer(), Some(LoopControl::Break(2)));
-        assert_eq!(
-            LoopControl::Continue(2).outer(),
-            Some(LoopControl::Continue(1))
-        );
-
         assert_eq!(LoopControl::Break(5).clamp(2), LoopControl::Break(2));
         assert_eq!(LoopControl::Continue(1).clamp(2), LoopControl::Continue(1));
+    }
+
+    #[test]
+    fn loop_step_takes_the_jumps() {
+        use ExecStatus::Jump;
+
+        assert_eq!(
+            loop_step(Jump(LoopControl::Break(1))),
+            LoopStep::Stop(ExecStatus::SUCCESS)
+        );
+        assert_eq!(loop_step(Jump(LoopControl::Continue(1))), LoopStep::Next);
+        assert_eq!(
+            loop_step(Jump(LoopControl::Break(3))),
+            LoopStep::Stop(Jump(LoopControl::Break(2)))
+        );
+        assert_eq!(
+            loop_step(Jump(LoopControl::Continue(2))),
+            LoopStep::Stop(Jump(LoopControl::Continue(1)))
+        );
+
+        let interrupted = ExecStatus::Signaled(Signal::SIGINT);
+        assert_eq!(loop_step(interrupted), LoopStep::Stop(interrupted));
+        assert_eq!(
+            loop_step(ExecStatus::FAILURE),
+            LoopStep::Ran(ExecStatus::FAILURE)
+        );
     }
 }

@@ -39,3 +39,30 @@ fn an_invalid_count_exits_a_script() {
     assert_eq!(stdout(&output), "");
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn runs_the_while_condition_again() {
+    let output = run_shell(
+        "set -- a b c; while [ $# -gt 0 ]; do x=$1; shift; [ $x = b ] && continue; echo $x; done\n",
+    );
+
+    assert_eq!(stdout(&output), "a\nc\n");
+}
+
+#[test]
+fn in_the_condition_runs_it_again() {
+    // Like dash and bash: back to the top of the loop, not into the body.
+    let output = run_shell(
+        "set -- a b c; while shift; [ $# -gt 1 ] && continue; [ $# -gt 0 ]; do echo $#; done\n",
+    );
+
+    assert_eq!(stdout(&output), "1\n");
+}
+
+#[test]
+fn goes_on_with_a_for_around_a_while() {
+    let output =
+        run_shell("for i in a b; do while true; do echo $i; continue 2; done; echo no; done\n");
+
+    assert_eq!(stdout(&output), "a\nb\n");
+}
